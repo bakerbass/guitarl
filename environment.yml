@@ -1,4 +1,4 @@
-name: gen-audio-bench
+name: guitaRL_old
 channels:
   - pytorch
   - nvidia
