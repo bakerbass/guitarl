@@ -2,6 +2,7 @@
 OSC client wrapper for StringSim guitar simulator.
 
 Provides high-level interface to control the StringSim plugin via OSC messages.
+Supports both standard /fret (midi-based) and /rlfret (low-level RL) commands.
 """
 
 import time
@@ -9,6 +10,19 @@ import logging
 from typing import List, Optional, Tuple
 from pythonosc import udp_client
 import numpy as np
+
+from .action_space import (
+    RLFretAction, 
+    fret_to_mm, 
+    mm_to_fret,
+    PLAYABLE_STRINGS,
+    STRING_TO_PLUCKER,
+    FRET_MIN,
+    FRET_MAX,
+    TORQUE_MIN,
+    TORQUE_MAX,
+    HARMONIC_FRETS_IN_RANGE,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +43,8 @@ class StringSimOSCClient:
     # Motor ranges
     NUM_STRINGS = 6
     SLIDER_MM_RANGE = (0.0, 234.0)  # Fret position in mm
-    FORCE_RANGE = (0.0, 1.0)  # Normalized presser force
+    FORCE_RANGE = (0.0, 1.0)  # Normalized presser force (for /fret command)
+    TORQUE_RANGE = (TORQUE_MIN, TORQUE_MAX)  # Raw torque (for /rlfret command)
     
     # Fret positions (mm) for harmonics
     HARMONIC_FRETS = {
@@ -95,6 +110,67 @@ class StringSimOSCClient:
             logger.error(f"Failed to send /fret: {e}")
             return False
     
+    def send_rlfret(self, action: RLFretAction, timestamp: Optional[float] = None) -> bool:
+        """
+        Send /rlfret message for RL-based low-level control.
+        
+        This is the primary interface for RL agents. Uses fractional frets
+        internally but converts to mm for the OSC message.
+        
+        OSC Format: /rlfret <string_idx> <slider_mm> <torque>
+        
+        Args:
+            action: RLFretAction with string, fret position, and torque
+            timestamp: Optional timestamp
+            
+        Returns:
+            True if message sent successfully
+        """
+        string_idx, slider_mm, torque = action.to_osc_args()
+        
+        # Validate string is playable (has a plucker)
+        if string_idx not in PLAYABLE_STRINGS:
+            logger.error(f"String {string_idx} has no plucker. Use strings {PLAYABLE_STRINGS}")
+            return False
+        
+        # Build message
+        if timestamp is None:
+            message = [int(string_idx), float(slider_mm), float(torque)]
+        else:
+            message = [int(string_idx), float(slider_mm), float(torque), float(timestamp)]
+        
+        try:
+            self.client.send_message("/rlfret", message)
+            logger.debug(
+                f"Sent /rlfret: string={string_idx}, fret={action.fret_position:.2f}, "
+                f"mm={slider_mm:.1f}, torque={torque:.0f}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send /rlfret: {e}")
+            return False
+    
+    def send_rlfret_raw(self, string_idx: int, fret_position: float, 
+                        torque: float, timestamp: Optional[float] = None) -> bool:
+        """
+        Send /rlfret message with raw parameters (convenience wrapper).
+        
+        Args:
+            string_idx: String index (0, 2, or 4 - must have plucker)
+            fret_position: Fractional fret position (0.0 - 9.0)
+            torque: Fretting torque (0 - 1000)
+            timestamp: Optional timestamp
+            
+        Returns:
+            True if message sent successfully
+        """
+        try:
+            action = RLFretAction(string_idx, fret_position, torque)
+            return self.send_rlfret(action, timestamp)
+        except ValueError as e:
+            logger.error(f"Invalid rlfret parameters: {e}")
+            return False
+
     def reset(self, wait_time: float = 0.1) -> bool:
         """
         Reset all motors to neutral position.
@@ -196,11 +272,43 @@ class StringSimOSCClient:
             logger.error(f"Connection validation failed: {e}")
             return False
     
-    def fret_to_mm(self, fret: int) -> float:
+    def send_rl_harmonic(self, string_idx: int, fret: int, 
+                         torque: float = 100.0, wait_time: float = 0.05) -> bool:
         """
-        Convert fret number to mm position.
+        Convenience method to play a harmonic using /rlfret.
         
-        Uses the SLIDER_MM_PER_FRET lookup table from StringSim.
+        Uses light torque appropriate for harmonics.
+        
+        Args:
+            string_idx: String to play (0, 2, or 4 - must have plucker)
+            fret: Harmonic fret number (4, 5, or 7)
+            torque: Light torque for harmonic (default 100)
+            wait_time: Time to wait after sending command
+            
+        Returns:
+            True if successful
+        """
+        if fret not in HARMONIC_FRETS_IN_RANGE:
+            logger.error(f"Invalid harmonic fret: {fret}. Must be in {HARMONIC_FRETS_IN_RANGE}")
+            return False
+        
+        if string_idx not in PLAYABLE_STRINGS:
+            logger.error(f"String {string_idx} has no plucker. Use {PLAYABLE_STRINGS}")
+            return False
+        
+        action = RLFretAction(string_idx, float(fret), torque)
+        success = self.send_rlfret(action)
+        
+        if success and wait_time > 0:
+            time.sleep(wait_time)
+        
+        return success
+    
+    def fret_to_mm_legacy(self, fret: int) -> float:
+        """
+        Convert integer fret number to mm position (legacy method).
+        
+        For fractional fret support, use action_space.fret_to_mm().
         
         Args:
             fret: Fret number (0-9)
@@ -208,23 +316,8 @@ class StringSimOSCClient:
         Returns:
             Position in mm
         """
-        SLIDER_MM_PER_FRET = {
-            0: 0.0,    # Open string
-            1: 19.0,
-            2: 52.0,
-            3: 85.0,
-            4: 112.0,
-            5: 139.0,
-            6: 164.0,
-            7: 187.0,
-            8: 211.0,
-            9: 234.0,
-        }
-        
-        if fret < 0:
-            return -1.0  # Muted
-        
-        return SLIDER_MM_PER_FRET.get(fret, 234.0)  # Clamp to max
+        # Use the action_space version for consistency
+        return fret_to_mm(float(fret))
     
     def close(self):
         """Clean up resources."""

@@ -3,6 +3,8 @@ Audio-based reward calculation using HarmonicsClassifier.
 
 Wraps the pretrained harmonic classifier to provide reward signals
 for reinforcement learning based on audio quality.
+
+Uses FRACTIONAL FRETS for position to encode musical structure.
 """
 
 import sys
@@ -25,6 +27,12 @@ from osc_realtime_classifier import HarmonicsCNN
 
 
 logger = logging.getLogger(__name__)
+
+
+# Constants for reward calculation
+HARMONIC_FRETS = [4, 5, 7]
+TORQUE_OPTIMAL_HARMONIC = 100.0  # Light touch for harmonics
+TORQUE_MAX = 1000.0
 
 
 class HarmonicRewardCalculator:
@@ -221,17 +229,20 @@ class HarmonicRewardCalculator:
         }
     
     def compute_reward(self, 
-                       position_mm: float,
-                       force: float,
+                       fret_position: float,
+                       torque: float,
                        target_fret: int,
                        audio: Optional[np.ndarray] = None,
                        capture_audio: bool = True) -> Dict[str, float]:
         """
         Compute reward for RL based on harmonic quality and action correctness.
         
+        Uses FRACTIONAL FRETS for position - the agent learns that integer
+        frets 4, 5, 7 are harmonic nodes.
+        
         Args:
-            position_mm: Slider position in mm
-            force: Presser force (0-1)
+            fret_position: Fractional fret position (0.0 - 9.0)
+            torque: Fretter torque (0 - 1000)
             target_fret: Target harmonic fret (4, 5, or 7)
             audio: Pre-captured audio (if None and capture_audio=True, will capture)
             capture_audio: Whether to capture audio if not provided
@@ -239,28 +250,20 @@ class HarmonicRewardCalculator:
         Returns:
             Dictionary with reward components and total reward
         """
-        # Target positions for harmonics
-        HARMONIC_POSITIONS = {
-            4: 112.0,
-            5: 139.0,
-            7: 187.0,
-        }
+        if target_fret not in HARMONIC_FRETS:
+            raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
         
-        if target_fret not in HARMONIC_POSITIONS:
-            raise ValueError(f"Invalid target fret: {target_fret}")
+        # Fret position reward (Gaussian centered at target fret)
+        # Agent should learn to aim for exact integer fret positions
+        fret_error = abs(fret_position - float(target_fret))
+        fret_tolerance = 0.3  # ~1/3 of a fret is acceptable
+        fret_reward = np.exp(-(fret_error ** 2) / (2 * fret_tolerance ** 2))
         
-        target_position = HARMONIC_POSITIONS[target_fret]
-        
-        # Position reward (Gaussian centered at target)
-        position_error = abs(position_mm - target_position)
-        position_tolerance = 5.0  # mm tolerance
-        position_reward = np.exp(-(position_error ** 2) / (2 * position_tolerance ** 2))
-        
-        # Force reward (Gaussian centered at optimal harmonic force)
-        optimal_force = 0.3
-        force_tolerance = 0.15
-        force_error = abs(force - optimal_force)
-        force_reward = np.exp(-(force_error ** 2) / (2 * force_tolerance ** 2))
+        # Torque reward (Gaussian centered at optimal harmonic torque)
+        # Light touch is better for harmonics
+        torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
+        torque_tolerance = 100.0  # Within 100 units of optimal
+        torque_reward = np.exp(-(torque_error ** 2) / (2 * torque_tolerance ** 2))
         
         # Audio-based reward
         audio_reward = 0.0
@@ -274,19 +277,20 @@ class HarmonicRewardCalculator:
             audio_reward = classification['harmonic_prob']
         
         # Combine rewards (weighted sum)
+        # Audio quality is most important, but fret accuracy matters too
         total_reward = (
             0.5 * audio_reward +      # Harmonic quality (most important)
-            0.3 * position_reward +    # Position accuracy
-            0.2 * force_reward         # Force optimization
+            0.3 * fret_reward +        # Fret position accuracy
+            0.2 * torque_reward        # Torque optimization
         )
         
         return {
             'total_reward': total_reward,
             'audio_reward': audio_reward,
-            'position_reward': position_reward,
-            'force_reward': force_reward,
-            'position_error': position_error,
-            'force_error': force_error,
+            'fret_reward': fret_reward,
+            'torque_reward': torque_reward,
+            'fret_error': fret_error,
+            'torque_error': torque_error,
             'classification': classification,
         }
     
