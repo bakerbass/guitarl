@@ -10,10 +10,12 @@ The action space for the /rlfret command provides fine-grained control:
   - Fret position (continuous: 0.0 to 9.0 fractional frets)
   - Fretter torque (continuous: 0 to 1000)
 
-OSC Message Format: /rlfret <string_idx> <slider_mm> <torque>
-Example: /rlfret 0 139.5 400  (string 0, fret 5 position, normal press)
+OSC Message Format: /RLFret <string_idx> <fret_position> <torque> [pluck_velocity]
+Example: /RLFret 0 5.0 400  (string 0, fret 5, normal press)
+Example: /RLFret 2 4.5 100 80  (string 2, between frets 4-5, light touch, velocity 80)
 
-The agent works in fractional frets, which are converted to mm for OSC.
+The agent works in fractional frets, which are sent directly via OSC.
+The robot controller converts fret positions to mm internally.
 """
 
 from dataclasses import dataclass
@@ -41,9 +43,9 @@ SLIDER_MIN_MM = 0.0
 SLIDER_MAX_MM = max(SLIDER_MM_PER_FRET)  # 234.0
 
 # Torque constraints (encoder units, 1000 = 100% rated torque)
-TORQUE_MIN = 0      # No press / released
+TORQUE_MIN = -650      # No press / released
 TORQUE_MAX = 1000   # Maximum safe torque
-TORQUE_LIGHT = 100  # Light touch for harmonics
+TORQUE_LIGHT = 50  # Light touch for harmonics
 TORQUE_NORMAL = 400 # Normal fretting pressure
 TORQUE_HEAVY = 650  # Heavy press for bends
 
@@ -210,8 +212,8 @@ class RLFretAction:
         return enc
     
     def to_osc_args(self) -> Tuple[int, float, float]:
-        """Return args for /rlfret OSC message (string, mm, torque)."""
-        return (self.string_idx, self.slider_mm, self.torque)
+        """Return args for /RLFret OSC message (string_idx, fret_position, torque)."""
+        return (self.string_idx, self.fret_position, self.torque)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
@@ -445,7 +447,7 @@ if __name__ == "__main__":
     action = action_space.sample()
     print(f"Random action:")
     print(f"  {action}")
-    print(f"  -> OSC args: /rlfret {action.to_osc_args()}")
+    print(f"  -> OSC args: /RLFret {action.to_osc_args()}")
     print(f"  -> Encoder pos: {action.to_encoder_position()}")
     print(f"  -> At harmonic: {action.is_at_harmonic}")
     print()
