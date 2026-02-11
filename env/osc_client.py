@@ -12,7 +12,8 @@ from pythonosc import udp_client
 import numpy as np
 
 from .action_space import (
-    RLFretAction, 
+    RLFretAction,
+    PresserAction,
     fret_to_mm, 
     mm_to_fret,
     PLAYABLE_STRINGS,
@@ -21,6 +22,7 @@ from .action_space import (
     FRET_MAX,
     TORQUE_MIN,
     TORQUE_MAX,
+    TORQUE_SAFE_MIN,
     HARMONIC_FRETS_IN_RANGE,
 )
 
@@ -151,21 +153,24 @@ class StringSimOSCClient:
             return False
     
     def send_rlfret_raw(self, string_idx: int, fret_position: float, 
-                        torque: float, timestamp: Optional[float] = None) -> bool:
+                        torque: float, press: bool = True,
+                        timestamp: Optional[float] = None) -> bool:
         """
         Send /rlfret message with raw parameters (convenience wrapper).
         
         Args:
             string_idx: String index (0, 2, or 4 - must have plucker)
             fret_position: Fractional fret position (0.0 - 9.0)
-            torque: Fretting torque (0 - 1000)
+            torque: Fretting torque (TORQUE_SAFE_MIN - TORQUE_MAX)
+            press: If True, press the string; if False, release it
             timestamp: Optional timestamp
             
         Returns:
             True if message sent successfully
         """
         try:
-            action = RLFretAction(string_idx, fret_position, torque)
+            press_action = PresserAction.PRESS if press else PresserAction.UNPRESS
+            action = RLFretAction(string_idx, fret_position, press_action, torque)
             return self.send_rlfret(action, timestamp)
         except ValueError as e:
             logger.error(f"Invalid rlfret parameters: {e}")
@@ -296,7 +301,7 @@ class StringSimOSCClient:
             logger.error(f"String {string_idx} has no plucker. Use {PLAYABLE_STRINGS}")
             return False
         
-        action = RLFretAction(string_idx, float(fret), torque)
+        action = RLFretAction(string_idx, float(fret), PresserAction.PRESS, torque)
         success = self.send_rlfret(action)
         
         if success and wait_time > 0:

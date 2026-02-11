@@ -10,6 +10,7 @@ from gymnasium import spaces
 import numpy as np
 import logging
 import time
+import sys
 from typing import Dict, Tuple, Optional
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .osc_client import StringSimOSCClient
 from .action_space import (
     GuitarBotActionSpace,
     RLFretAction,
+    PresserAction,
     fret_to_mm,
     mm_to_fret,
     PLAYABLE_STRINGS,
@@ -25,12 +27,19 @@ from .action_space import (
     FRET_MAX,
     TORQUE_MIN,
     TORQUE_MAX,
+    TORQUE_SAFE_MIN,
     TORQUE_LIGHT,
     TORQUE_NORMAL,
     HARMONIC_FRETS_IN_RANGE,
     SLIDER_MAX_MM,
 )
-from ..utils.audio_reward import HarmonicRewardCalculator
+
+# Add parent directory to path for utils import
+_parent_dir = Path(__file__).parent.parent
+if str(_parent_dir) not in sys.path:
+    sys.path.insert(0, str(_parent_dir))
+
+from utils.audio_reward import HarmonicRewardCalculator
 
 
 logger = logging.getLogger(__name__)
@@ -54,10 +63,11 @@ class StringSimEnv(gym.Env):
         - torque_history: Last N torque values [3]
         Total: 11 dimensions
         
-    Action Space (normalized, shape=(5,)):
+    Action Space (normalized, shape=(6,)):
         - string_logits: String selection [3] (argmax -> 0, 2, 4)
         - fret: Fractional fret position [1] (scaled from [-1,1] to [0,9])
-        - torque: Fretting torque [1] (scaled from [-1,1] to [0,1000])
+        - press_decision: Press/Unpress [1] (>0 = press, <=0 = unpress)
+        - torque_magnitude: Fretting torque [1] (scaled from [-1,1] to [16,650])
         
     Reward:
         Combination of:
@@ -124,21 +134,21 @@ class StringSimEnv(gym.Env):
             capture_duration=capture_duration
         )
         
-        # Define action space: 5D normalized or 3D simple
+        # Define action space: 6D normalized or 4D simple
         if use_simple_action_space:
-            # [string_continuous, fret, torque] all in [-1, 1]
+            # [string_continuous, fret, press_decision, torque_magnitude] all in [-1, 1]
             self.action_space = spaces.Box(
                 low=-1.0,
                 high=1.0,
-                shape=(3,),
+                shape=(4,),
                 dtype=np.float32
             )
         else:
-            # [string_logits(3), fret, torque] all in [-1, 1]
+            # [string_logits(3), fret, press_decision, torque_magnitude] all in [-1, 1]
             self.action_space = spaces.Box(
                 low=-1.0,
                 high=1.0,
-                shape=(5,),
+                shape=(6,),
                 dtype=np.float32
             )
         
@@ -256,6 +266,7 @@ class StringSimEnv(gym.Env):
         rl_action = RLFretAction(
             string_idx=self.string_index,
             fret_position=rl_action.fret_position,
+            press_action=rl_action.press_action,
             torque=rl_action.torque
         )
         

@@ -8,6 +8,7 @@ that frets 4, 5, 7 are harmonic nodes.
 from .action_space import (
     GuitarBotActionSpace,
     RLFretAction,
+    PresserAction,
     fret_to_mm,
     mm_to_fret,
     PLAYABLE_STRINGS,
@@ -17,6 +18,8 @@ from .action_space import (
     FRET_MAX,
     TORQUE_MIN,
     TORQUE_MAX,
+    TORQUE_SAFE_MIN,
+    TORQUE_UNPRESSED,
     TORQUE_LIGHT,
     TORQUE_NORMAL,
     HARMONIC_FRETS_IN_RANGE,
@@ -34,6 +37,7 @@ __all__ = [
     # Action Space
     'GuitarBotActionSpace',
     'RLFretAction',
+    'PresserAction',
     'fret_to_mm',
     'mm_to_fret',
     
@@ -45,6 +49,8 @@ __all__ = [
     'FRET_MAX',
     'TORQUE_MIN',
     'TORQUE_MAX',
+    'TORQUE_SAFE_MIN',
+    'TORQUE_UNPRESSED',
     'TORQUE_LIGHT',
     'TORQUE_NORMAL',
     'HARMONIC_FRETS_IN_RANGE',

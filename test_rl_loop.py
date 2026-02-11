@@ -23,6 +23,7 @@ import sounddevice as sd
 import librosa
 import time
 from pythonosc import udp_client
+import matplotlib.pyplot as plt
 
 # Add HarmonicsClassifier to path
 HARMONICS_CLASSIFIER_PATH = Path(__file__).parent.parent / "HarmonicsClassifier"
@@ -31,11 +32,13 @@ sys.path.insert(0, str(HARMONICS_CLASSIFIER_PATH))
 from osc_realtime_classifier import HarmonicsCNN
 from env.action_space import (
     RLFretAction,
+    PresserAction,
     GuitarBotActionSpace,
     PLAYABLE_STRINGS,
     HARMONIC_FRETS_IN_RANGE,
     TORQUE_LIGHT,
     TORQUE_NORMAL,
+    TORQUE_SAFE_MIN,
 )
 
 
@@ -44,7 +47,7 @@ class RLTestLoop:
     
     def __init__(self, model_path, device, audio_device_id, 
                  osc_host='127.0.0.1', osc_port=12000,
-                 record_duration=3.0):
+                 record_duration=3.0, plot_enabled=False):
         """
         Initialize test loop.
         
@@ -55,10 +58,12 @@ class RLTestLoop:
             osc_host: OSC server host (GuitarBot receiver)
             osc_port: OSC server port
             record_duration: Audio recording duration in seconds
+            plot_enabled: Whether to plot audio waveforms and spectrograms
         """
         self.device = device
         self.audio_device_id = audio_device_id
         self.record_duration = record_duration
+        self.plot_enabled = plot_enabled
         self.model_sr = 22050  # Model's expected sample rate
         
         # Get audio device info
@@ -183,6 +188,35 @@ class RLTestLoop:
         
         return predicted_class, confidence, probabilities[0].cpu().numpy()
     
+    def plot_audio_and_spectrogram(self, audio, mel_spec_db, predicted_label, confidence):
+        """Plot audio waveform and mel spectrogram."""
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Plot waveform
+        time_axis = np.arange(len(audio)) / self.model_sr
+        axes[0].plot(time_axis, audio, linewidth=0.5)
+        axes[0].set_xlabel('Time (s)')
+        axes[0].set_ylabel('Amplitude')
+        axes[0].set_title(f'Audio Waveform - Classified as: {predicted_label.upper()} ({confidence*100:.1f}%)')
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot mel spectrogram
+        img = axes[1].imshow(
+            mel_spec_db,
+            aspect='auto',
+            origin='lower',
+            cmap='viridis',
+            extent=[0, self.record_duration, 0, self.n_mels]
+        )
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Mel Frequency Bin')
+        axes[1].set_title('Mel Spectrogram (dB)')
+        plt.colorbar(img, ax=axes[1], format='%+2.0f dB')
+        
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.1)
+    
     def compute_reward(self, action: RLFretAction, predicted_class, confidence, probabilities):
         """
         Compute reward based on action and classification.
@@ -252,6 +286,27 @@ class RLTestLoop:
         # Preprocess and classify
         audio_tensor = self.preprocess_audio(audio)
         predicted_class, confidence, probabilities = self.classify_audio(audio_tensor)
+        
+        # Plot if enabled
+        if self.plot_enabled:
+            # Get mel spectrogram for plotting
+            audio_trimmed, _ = librosa.effects.trim(audio, top_db=30)
+            if len(audio_trimmed) < self.model_sr * 0.1:
+                audio_trimmed = audio
+            target_length = int(self.model_sr * self.record_duration)
+            if len(audio_trimmed) < target_length:
+                audio_trimmed = np.pad(audio_trimmed, (0, target_length - len(audio_trimmed)))
+            else:
+                audio_trimmed = audio_trimmed[:target_length]
+            
+            mel_spec = librosa.feature.melspectrogram(
+                y=audio_trimmed, sr=self.model_sr, n_fft=self.n_fft,
+                hop_length=self.hop_length, n_mels=self.n_mels, fmin=80, fmax=8000
+            )
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            
+            predicted_label = self.class_names[predicted_class]
+            self.plot_audio_and_spectrogram(audio_trimmed, mel_spec_db, predicted_label, confidence)
         
         # Compute reward
         reward = self.compute_reward(action, predicted_class, confidence, probabilities)
@@ -440,6 +495,8 @@ def main():
     parser.add_argument('--target-harmonic', action='store_true', 
                         help='Target harmonic positions instead of random')
     parser.add_argument('--delay', type=float, default=4.0, help='Delay between tests (seconds)')
+    parser.add_argument('--plot', action='store_true',
+                        help='Plot audio waveforms and spectrograms')
     
     args = parser.parse_args()
     
@@ -468,7 +525,8 @@ def main():
         audio_device_id=audio_device_id,
         osc_host=args.osc_host,
         osc_port=args.osc_port,
-        record_duration=args.duration
+        record_duration=args.duration,
+        plot_enabled=args.plot
     )
     
     try:
@@ -482,8 +540,10 @@ def main():
         test_loop.print_summary()
         
     except KeyboardInterrupt:
+        test_loop.osc_client.send_message("/Reset", [])
         print("\n\nInterrupted by user")
     finally:
+        test_loop.osc_client.send_message("/Reset", [])
         print("\nTest complete!")
 
 
