@@ -41,6 +41,13 @@ from env.action_space import (
     TORQUE_SAFE_MIN,
 )
 
+# Shared reward function — single source of truth for both test & training
+from utils.reward import (
+    compute_reward_nearest_fret,
+    CLASS_NAMES as REWARD_CLASS_NAMES,
+    HARMONIC_FRETS,
+)
+
 
 class RLTestLoop:
     """Test loop for RL action -> audio -> reward pipeline."""
@@ -93,8 +100,8 @@ class RLTestLoop:
         # Action space
         self.action_space = GuitarBotActionSpace(use_normalized=True)
         
-        # Class names
-        self.class_names = ['harmonic', 'dead_note', 'general_note']
+        # Class names (from shared reward module)
+        self.class_names = list(REWARD_CLASS_NAMES)
         
         # Statistics
         self.test_results = []
@@ -188,16 +195,37 @@ class RLTestLoop:
         
         return predicted_class, confidence, probabilities[0].cpu().numpy()
     
-    def plot_audio_and_spectrogram(self, audio, mel_spec_db, predicted_label, confidence):
-        """Plot audio waveform and mel spectrogram."""
+    def plot_audio_and_spectrogram(self, audio, mel_spec_db, predicted_label, confidence,
+                                     reward=None, reward_components=None, action=None,
+                                     test_num=None):
+        """Plot audio waveform and mel spectrogram with classification + reward in title."""
         fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Build suptitle with classification and reward
+        title_parts = []
+        if test_num is not None:
+            title_parts.append(f'Test #{test_num}')
+        if action is not None:
+            title_parts.append(f'String {action.string_idx}  Fret {action.fret_position:.2f}  Torque {action.torque:.0f}')
+        suptitle = ' | '.join(title_parts) if title_parts else ''
+        
+        reward_str = ''
+        if reward is not None:
+            reward_str = f'  |  Reward: {reward:+.3f}'
+            if reward_components:
+                reward_str += (f'  (audio={reward_components["audio"]:.2f}'
+                               f'  fret={reward_components["fret"]:.2f}'
+                               f'  torque={reward_components["torque"]:.2f})')
+        
+        if suptitle:
+            fig.suptitle(suptitle, fontsize=11, fontweight='bold')
         
         # Plot waveform
         time_axis = np.arange(len(audio)) / self.model_sr
         axes[0].plot(time_axis, audio, linewidth=0.5)
         axes[0].set_xlabel('Time (s)')
         axes[0].set_ylabel('Amplitude')
-        axes[0].set_title(f'Audio Waveform - Classified as: {predicted_label.upper()} ({confidence*100:.1f}%)')
+        axes[0].set_title(f'Classified as: {predicted_label.upper()} ({confidence*100:.1f}%){reward_str}')
         axes[0].grid(True, alpha=0.3)
         
         # Plot mel spectrogram
@@ -219,44 +247,26 @@ class RLTestLoop:
     
     def compute_reward(self, action: RLFretAction, predicted_class, confidence, probabilities):
         """
-        Compute reward based on action and classification.
-        
-        Reward structure:
-        - Harmonic at harmonic fret with light torque: +1.0
-        - Harmonic at non-harmonic fret: +0.5 (still good tone)
-        - General note: 0.0 (neutral)
-        - Dead note: -1.0 (bad)
-        
-        Bonus/penalty for torque appropriateness:
-        - Harmonic fret with light torque: +0.2
-        - Harmonic fret with heavy torque: -0.3
+        Compute reward using the shared reward function (utils/reward.py).
         """
-        # Base reward from classification
-        reward = 0.0
+        harmonic_prob = float(probabilities[0])  # index 0 = harmonic
+        reward_info = compute_reward_nearest_fret(
+            fret_position=action.fret_position,
+            torque=action.torque,
+            harmonic_prob=harmonic_prob,
+        )
         
-        if predicted_class == 0:  # harmonic
-            # Check if at harmonic fret
-            is_harmonic_fret = action.is_at_harmonic
-            if is_harmonic_fret:
-                reward = 1.0
-            else:
-                reward = 0.5  # Still good, but not optimal position
-        elif predicted_class == 1:  # dead_note
-            reward = -1.0
-        else:  # general_note
-            reward = 0.0
+        # Store components for display / plotting
+        self._last_reward_components = {
+            'audio':  reward_info['audio_reward'],
+            'fret':   reward_info['fret_reward'],
+            'torque': reward_info['torque_reward'],
+            'fret_error':  reward_info['fret_error'],
+            'torque_error': reward_info['torque_error'],
+            'nearest_harmonic_fret': reward_info['nearest_harmonic_fret'],
+        }
         
-        # Torque bonus/penalty for harmonic frets
-        if action.is_at_harmonic:
-            if action.torque < 200:  # Light touch
-                reward += 0.2
-            elif action.torque > 600:  # Too heavy
-                reward -= 0.3
-        
-        # Confidence weighting
-        reward *= confidence
-        
-        return reward
+        return reward_info['total_reward']
     
     def run_test(self, action: RLFretAction, pluck_velocity=None, pre_delay=0.2):
         """
@@ -287,9 +297,26 @@ class RLTestLoop:
         audio_tensor = self.preprocess_audio(audio)
         predicted_class, confidence, probabilities = self.classify_audio(audio_tensor)
         
-        # Plot if enabled
+        # Compute reward
+        reward = self.compute_reward(action, predicted_class, confidence, probabilities)
+        reward_components = getattr(self, '_last_reward_components', None)
+        
+        # Display results
+        predicted_label = self.class_names[predicted_class]
+        print(f"\n→ Classification: {predicted_label.upper()} ({confidence*100:.1f}%)")
+        print(f"→ Probabilities:")
+        for i, (name, prob) in enumerate(zip(self.class_names, probabilities)):
+            marker = "★" if i == predicted_class else " "
+            print(f"   {marker} {name:12s}: {prob*100:5.1f}%")
+        print(f"→ Reward: {reward:+.3f}")
+        if reward_components:
+            print(f"   audio={reward_components['audio']:.3f}  "
+                  f"fret={reward_components['fret']:.3f} (err={reward_components['fret_error']:.2f}, "
+                  f"nearest={reward_components['nearest_harmonic_fret']})  "
+                  f"torque={reward_components['torque']:.3f} (err={reward_components['torque_error']:.1f})")
+        
+        # Plot individual test note (always unless --no-plot)
         if self.plot_enabled:
-            # Get mel spectrogram for plotting
             audio_trimmed, _ = librosa.effects.trim(audio, top_db=30)
             if len(audio_trimmed) < self.model_sr * 0.1:
                 audio_trimmed = audio
@@ -305,20 +332,12 @@ class RLTestLoop:
             )
             mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
             
-            predicted_label = self.class_names[predicted_class]
-            self.plot_audio_and_spectrogram(audio_trimmed, mel_spec_db, predicted_label, confidence)
-        
-        # Compute reward
-        reward = self.compute_reward(action, predicted_class, confidence, probabilities)
-        
-        # Display results
-        predicted_label = self.class_names[predicted_class]
-        print(f"\n→ Classification: {predicted_label.upper()} ({confidence*100:.1f}%)")
-        print(f"→ Probabilities:")
-        for i, (name, prob) in enumerate(zip(self.class_names, probabilities)):
-            marker = "★" if i == predicted_class else " "
-            print(f"   {marker} {name:12s}: {prob*100:5.1f}%")
-        print(f"→ Reward: {reward:+.3f}")
+            test_num = len(self.test_results) + 1
+            self.plot_audio_and_spectrogram(
+                audio_trimmed, mel_spec_db, predicted_label, confidence,
+                reward=reward, reward_components=reward_components,
+                action=action, test_num=test_num
+            )
         
         # Store results
         result = {
@@ -327,6 +346,7 @@ class RLTestLoop:
             'confidence': float(confidence),
             'probabilities': {name: float(prob) for name, prob in zip(self.class_names, probabilities)},
             'reward': float(reward),
+            'reward_components': reward_components,
             'is_harmonic_fret': action.is_at_harmonic,
         }
         self.test_results.append(result)
@@ -495,8 +515,8 @@ def main():
     parser.add_argument('--target-harmonic', action='store_true', 
                         help='Target harmonic positions instead of random')
     parser.add_argument('--delay', type=float, default=4.0, help='Delay between tests (seconds)')
-    parser.add_argument('--plot', action='store_true',
-                        help='Plot audio waveforms and spectrograms')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='Disable per-note plotting (plots shown by default)')
     
     args = parser.parse_args()
     
@@ -526,7 +546,7 @@ def main():
         osc_host=args.osc_host,
         osc_port=args.osc_port,
         record_duration=args.duration,
-        plot_enabled=args.plot
+        plot_enabled=not args.no_plot
     )
     
     try:

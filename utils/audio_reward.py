@@ -29,10 +29,22 @@ from osc_realtime_classifier import HarmonicsCNN
 logger = logging.getLogger(__name__)
 
 
-# Constants for reward calculation
-HARMONIC_FRETS = [4, 5, 7]
-TORQUE_OPTIMAL_HARMONIC = 100.0  # Light touch for harmonics
-TORQUE_MAX = 1000.0
+# Import shared reward constants and function
+from utils.reward import (
+    HARMONIC_FRETS,
+    TORQUE_OPTIMAL_HARMONIC,
+    TORQUE_MAX,
+    FRET_TOLERANCE,
+    TORQUE_TOLERANCE,
+    REWARD_WEIGHT_AUDIO,
+    REWARD_WEIGHT_FRET,
+    REWARD_WEIGHT_TORQUE,
+    CLASS_NAMES as _CLASS_NAMES,
+    HARMONIC_CLASS_IDX as _HARMONIC_CLASS_IDX,
+    SUCCESS_THRESHOLD,
+    compute_reward as _compute_reward,
+    is_success as _is_success,
+)
 
 
 class HarmonicRewardCalculator:
@@ -43,9 +55,9 @@ class HarmonicRewardCalculator:
     and returns reward signal for RL training.
     """
     
-    # Class labels from HarmonicsClassifier
-    CLASS_NAMES = ['dead_note', 'general_note', 'harmonic']
-    HARMONIC_CLASS_IDX = 2
+    # Class labels from HarmonicsClassifier (must match train_cnn.py label_map)
+    CLASS_NAMES = _CLASS_NAMES
+    HARMONIC_CLASS_IDX = _HARMONIC_CLASS_IDX
     
     def __init__(self, 
                  model_path: str,
@@ -224,8 +236,8 @@ class HarmonicRewardCalculator:
             'predicted_label': self.CLASS_NAMES[predicted_class],
             'confidence': confidence,
             'harmonic_prob': probs[self.HARMONIC_CLASS_IDX],
-            'dead_prob': probs[0],
-            'general_prob': probs[1],
+            'dead_prob': probs[1],
+            'general_prob': probs[2],
         }
     
     def compute_reward(self, 
@@ -250,54 +262,31 @@ class HarmonicRewardCalculator:
         Returns:
             Dictionary with reward components and total reward
         """
-        if target_fret not in HARMONIC_FRETS:
-            raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
-        
-        # Fret position reward (Gaussian centered at target fret)
-        # Agent should learn to aim for exact integer fret positions
-        fret_error = abs(fret_position - float(target_fret))
-        fret_tolerance = 0.3  # ~1/3 of a fret is acceptable
-        fret_reward = np.exp(-(fret_error ** 2) / (2 * fret_tolerance ** 2))
-        
-        # Torque reward (Gaussian centered at optimal harmonic torque)
-        # Light touch is better for harmonics
-        torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
-        torque_tolerance = 100.0  # Within 100 units of optimal
-        torque_reward = np.exp(-(torque_error ** 2) / (2 * torque_tolerance ** 2))
-        
-        # Audio-based reward
-        audio_reward = 0.0
+        # Audio-based classification
         classification = None
+        harmonic_prob = 0.0
         
         if audio is None and capture_audio:
             audio = self.capture_audio()
         
         if audio is not None:
             classification = self.classify_audio(audio)
-            audio_reward = classification['harmonic_prob']
+            harmonic_prob = classification['harmonic_prob']
         
-        # Combine rewards (weighted sum)
-        # Audio quality is most important, but fret accuracy matters too
-        total_reward = (
-            0.5 * audio_reward +      # Harmonic quality (most important)
-            0.3 * fret_reward +        # Fret position accuracy
-            0.2 * torque_reward        # Torque optimization
+        # Delegate to shared reward function
+        reward_info = _compute_reward(
+            fret_position=fret_position,
+            torque=torque,
+            target_fret=target_fret,
+            harmonic_prob=harmonic_prob,
         )
-        
-        return {
-            'total_reward': total_reward,
-            'audio_reward': audio_reward,
-            'fret_reward': fret_reward,
-            'torque_reward': torque_reward,
-            'fret_error': fret_error,
-            'torque_error': torque_error,
-            'classification': classification,
-        }
+        reward_info['classification'] = classification
+        return reward_info
     
     def get_success_threshold(self) -> float:
         """Get threshold for successful harmonic (harmonic_prob)."""
-        return 0.8
+        return SUCCESS_THRESHOLD
     
     def is_success(self, classification: Dict[str, float]) -> bool:
         """Check if classification indicates successful harmonic."""
-        return classification['harmonic_prob'] > self.get_success_threshold()
+        return _is_success(classification['harmonic_prob'])
