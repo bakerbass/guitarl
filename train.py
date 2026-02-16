@@ -22,7 +22,7 @@ from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 import torch
 
-from env.stringsim_env import StringSimEnv
+from env.harmonic_env import HarmonicEnv
 
 
 # Setup logging
@@ -41,8 +41,8 @@ class HarmonicProgressCallback(CallbackList):
         self.verbose = verbose
         self.episode_rewards = []
         self.episode_successes = []
-        self.episode_positions = []
-        self.episode_forces = []
+        self.episode_frets = []
+        self.episode_torques = []
         
     def _on_step(self) -> bool:
         # Check if episode ended
@@ -61,41 +61,44 @@ class HarmonicProgressCallback(CallbackList):
                         
                         self.episode_rewards.append(self.locals.get('rewards', [0])[idx])
                         self.episode_successes.append(float(success))
-                        self.episode_positions.append(info.get('position_mm', 0))
-                        self.episode_forces.append(info.get('force', 0))
+                        self.episode_frets.append(info.get('fret_position', 0))
+                        self.episode_torques.append(info.get('torque', 0))
                         
                         if self.verbose > 0:
                             logger.info(
                                 f"Episode end - Fret: {info['target_fret']}, "
                                 f"Harmonic prob: {harmonic_prob:.3f}, "
                                 f"Success: {success}, "
-                                f"Pos: {info['position_mm']:.1f}mm, "
-                                f"Force: {info['force']:.2f}"
+                                f"Fret pos: {info.get('fret_position', 0):.2f}, "
+                                f"Torque: {info.get('torque', 0):.0f}"
                             )
         
         # Log aggregated metrics every 100 episodes
         if len(self.episode_successes) >= 100:
             avg_success = np.mean(self.episode_successes[-100:])
             avg_reward = np.mean(self.episode_rewards[-100:])
-            avg_pos = np.mean(self.episode_positions[-100:])
-            avg_force = np.mean(self.episode_forces[-100:])
+            avg_fret = np.mean(self.episode_frets[-100:])
+            avg_torque = np.mean(self.episode_torques[-100:])
             
             logger.info(
                 f"\n=== Last 100 Episodes ===\n"
                 f"Success rate: {avg_success:.3f}\n"
                 f"Avg reward: {avg_reward:.3f}\n"
-                f"Avg position: {avg_pos:.1f}mm\n"
-                f"Avg force: {avg_force:.3f}\n"
+                f"Avg fret pos: {avg_fret:.2f}\n"
+                f"Avg torque: {avg_torque:.0f}\n"
             )
         
         return True
 
 
-def make_env(model_path: str, curriculum_mode: str, string_index: int = 3):
-    """Create and wrap StringSim environment."""
-    env = StringSimEnv(
+def make_env(model_path: str, curriculum_mode: str, string_index: int = 2,
+             osc_port: int = 12000, audio_device: str = "Scarlett"):
+    """Create and wrap HarmonicEnv."""
+    env = HarmonicEnv(
         model_path=model_path,
         string_index=string_index,
+        osc_port=osc_port,
+        audio_device=audio_device,
         curriculum_mode=curriculum_mode,
         max_steps=10,
         success_threshold=0.8
@@ -130,14 +133,18 @@ def train(args):
     env = make_env(
         model_path=args.model_path,
         curriculum_mode=args.curriculum,
-        string_index=args.string_index
+        string_index=args.string_index,
+        osc_port=args.osc_port,
+        audio_device=args.audio_device
     )
     
     # Create evaluation environment
     eval_env = make_env(
         model_path=args.model_path,
         curriculum_mode="random",  # Evaluate on all frets
-        string_index=args.string_index
+        string_index=args.string_index,
+        osc_port=args.osc_port,
+        audio_device=args.audio_device
     )
     
     # Configure SAC agent
@@ -210,6 +217,9 @@ def train(args):
         logger.info("Model saved")
     
     finally:
+        # Send reset to return robot to neutral before closing
+        logger.info("Sending /Reset to robot...")
+        env.unwrapped.osc_client.reset(wait_time=0.5)
         env.close()
         eval_env.close()
 
@@ -219,16 +229,21 @@ def main():
     
     # Environment arguments
     parser.add_argument('--model-path', required=True, help='Path to HarmonicsClassifier model')
-    parser.add_argument('--string-index', type=int, default=3, help='String to train on (default: 3=D)')
+    parser.add_argument('--string-index', type=int, default=2,
+                        help='String to train on (0, 2, or 4 — must have plucker; default: 2=D)')
+    parser.add_argument('--osc-port', type=int, default=12000,
+                        help='OSC port (default: 12000 for GuitarBot, 8000 for StringSim)')
+    parser.add_argument('--audio-device', type=str, default='Scarlett',
+                        help='Audio input device name substring (default: Scarlett)')
     parser.add_argument('--curriculum', type=str, default='easy_to_hard',
                         choices=['random', 'easy_to_hard', 'fixed_fret'],
                         help='Curriculum learning mode')
     
     # Training arguments
-    parser.add_argument('--total-timesteps', type=int, default=50000, help='Total training timesteps')
+    parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
     parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--buffer-size', type=int, default=100000, help='Replay buffer size')
-    parser.add_argument('--learning-starts', type=int, default=1000, help='Steps before learning starts')
+    parser.add_argument('--learning-starts', type=int, default=500, help='Steps before learning starts')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
     parser.add_argument('--tau', type=float, default=0.005, help='Target network update rate')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')

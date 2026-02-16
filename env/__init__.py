@@ -1,5 +1,5 @@
 """
-Gymnasium environment for StringSim guitar simulator.
+Gymnasium environment for GuitarBot harmonic RL training.
 
 Uses fractional frets for position encoding to help agents learn
 that frets 4, 5, 7 are harmonic nodes.
@@ -24,15 +24,15 @@ from .action_space import (
     TORQUE_NORMAL,
     HARMONIC_FRETS_IN_RANGE,
 )
-from .osc_client import StringSimOSCClient
-from .stringsim_env import StringSimEnv
+from .osc_client import GuitarBotOSCClient
+from .harmonic_env import HarmonicEnv
 
 __all__ = [
     # Environment
-    'StringSimEnv',
+    'HarmonicEnv',
     
     # OSC Client
-    'StringSimOSCClient',
+    'GuitarBotOSCClient',
     
     # Action Space
     'GuitarBotActionSpace',

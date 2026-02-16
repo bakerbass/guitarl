@@ -15,7 +15,7 @@ from typing import List, Dict
 import sys
 
 from stable_baselines3 import SAC
-from env.stringsim_env import StringSimEnv
+from env.harmonic_env import HarmonicEnv
 
 
 logging.basicConfig(level=logging.INFO)
@@ -238,7 +238,7 @@ def main():
     
     # Create environment
     curriculum_mode = 'random' if args.target_fret is None else 'fixed_fret'
-    env = StringSimEnv(
+    env = HarmonicEnv(
         model_path=str(classifier_path),
         string_index=args.string_index,
         curriculum_mode=curriculum_mode,

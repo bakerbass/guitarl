@@ -1,5 +1,5 @@
 """
-Gymnasium environment for StringSim guitar simulator.
+Gymnasium environment for GuitarBot harmonic RL training.
 
 Provides reinforcement learning interface for learning to play natural harmonics.
 Uses FRACTIONAL FRETS for position encoding to help the agent learn musical structure.
@@ -14,7 +14,7 @@ import sys
 from typing import Dict, Tuple, Optional
 from pathlib import Path
 
-from .osc_client import StringSimOSCClient
+from .osc_client import GuitarBotOSCClient
 from .action_space import (
     GuitarBotActionSpace,
     RLFretAction,
@@ -45,9 +45,9 @@ from utils.audio_reward import HarmonicRewardCalculator
 logger = logging.getLogger(__name__)
 
 
-class StringSimEnv(gym.Env):
+class HarmonicEnv(gym.Env):
     """
-    Gymnasium environment for learning guitar harmonics on StringSim.
+    Gymnasium environment for learning guitar harmonics.
     
     The agent learns to find the correct fret position and torque to produce
     clear natural harmonics at frets 4, 5, and 7.
@@ -63,17 +63,17 @@ class StringSimEnv(gym.Env):
         - torque_history: Last N torque values [3]
         Total: 11 dimensions
         
-    Action Space (normalized, shape=(6,)):
+    Action Space (normalized, shape=(5,) with always_press=True):
         - string_logits: String selection [3] (argmax -> 0, 2, 4)
         - fret: Fractional fret position [1] (scaled from [-1,1] to [0,9])
-        - press_decision: Press/Unpress [1] (>0 = press, <=0 = unpress)
         - torque_magnitude: Fretting torque [1] (scaled from [-1,1] to [16,650])
+        When always_press=False, adds press_decision [1] (shape=(6,)).
         
     Reward:
         Combination of:
-        - Harmonic classifier confidence (0-1) [weight: 0.5]
+        - Harmonic classifier confidence (0-1) [weight: 0.2]
         - Fret position accuracy (Gaussian) [weight: 0.3]
-        - Torque optimization (Gaussian) [weight: 0.2]
+        - Torque optimization (shifted Gaussian, [-1,+1]) [weight: 0.5]
     """
     
     metadata = {'render_modes': ['human']}
@@ -81,21 +81,22 @@ class StringSimEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 0.1  # Time to wait after each action (seconds)
+    ACTION_DURATION = 3.0  # Time to wait after each action (seconds)
     
     def __init__(self,
                  model_path: str,
                  string_index: int = 2,  # Default to D string (plucker 1 -> string 2)
                  osc_host: str = "127.0.0.1",
-                 osc_port: int = 8000,
-                 audio_device: str = "VB-Audio Virtual Cable",
+                 osc_port: int = 12000,
+                 audio_device: str = "Scarlett",
                  capture_duration: float = 0.8,
                  max_steps: int = MAX_STEPS_PER_EPISODE,
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
-                 use_simple_action_space: bool = False):
+                 use_simple_action_space: bool = False,
+                 always_press: bool = True):
         """
-        Initialize StringSim environment.
+        Initialize HarmonicEnv.
         
         Args:
             model_path: Path to HarmonicsClassifier model
@@ -108,6 +109,7 @@ class StringSimEnv(gym.Env):
             success_threshold: Harmonic probability threshold for success
             curriculum_mode: "random", "easy_to_hard", or "fixed_fret"
             use_simple_action_space: If True, use 3D continuous space instead of 5D
+            always_press: If True, remove press_decision from action space (always PRESS)
         """
         super().__init__()
         
@@ -120,12 +122,13 @@ class StringSimEnv(gym.Env):
         self.success_threshold = success_threshold
         self.curriculum_mode = curriculum_mode
         self.use_simple_action_space = use_simple_action_space
+        self.always_press = always_press
         
         # Initialize action space helper
         self.action_space_helper = GuitarBotActionSpace(use_normalized=True)
         
         # Initialize OSC client
-        self.osc_client = StringSimOSCClient(host=osc_host, port=osc_port)
+        self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)
         
         # Initialize reward calculator
         self.reward_calc = HarmonicRewardCalculator(
@@ -134,23 +137,21 @@ class StringSimEnv(gym.Env):
             capture_duration=capture_duration
         )
         
-        # Define action space: 6D normalized or 4D simple
+        # Define action space dimensions
+        # When always_press=True, press_decision is removed (always PRESS)
         if use_simple_action_space:
-            # [string_continuous, fret, press_decision, torque_magnitude] all in [-1, 1]
-            self.action_space = spaces.Box(
-                low=-1.0,
-                high=1.0,
-                shape=(4,),
-                dtype=np.float32
-            )
+            # [string_continuous, fret, (press_decision), torque_magnitude]
+            action_dim = 3 if self.always_press else 4
         else:
-            # [string_logits(3), fret, press_decision, torque_magnitude] all in [-1, 1]
-            self.action_space = spaces.Box(
-                low=-1.0,
-                high=1.0,
-                shape=(6,),
-                dtype=np.float32
-            )
+            # [string_logits(3), fret, (press_decision), torque_magnitude]
+            action_dim = 5 if self.always_press else 6
+        
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(action_dim,),
+            dtype=np.float32
+        )
         
         # Define observation space
         # [target_fret_one_hot(3), current_fret, current_torque_norm, fret_history(3), torque_history(3)]
@@ -175,8 +176,8 @@ class StringSimEnv(gym.Env):
         self.episode_count = 0
         self.curriculum_fret_idx = 0  # Start with easiest (fret 7)
         
-        logger.info(f"StringSimEnv initialized: string={string_index}, max_steps={max_steps}, "
-                    f"action_space={'3D simple' if use_simple_action_space else '5D full'}")
+        logger.info(f"HarmonicEnv initialized: string={string_index}, max_steps={max_steps}, "
+                    f"action_dim={action_dim}, always_press={always_press}")
     
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
@@ -227,9 +228,6 @@ class StringSimEnv(gym.Env):
         """Reset environment for new episode."""
         super().reset(seed=seed)
         
-        # Reset StringSim
-        self.osc_client.reset(wait_time=0.15)
-        
         # Select target fret
         self.target_fret = self._get_target_fret()
         
@@ -255,6 +253,16 @@ class StringSimEnv(gym.Env):
     
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """Execute one step in environment."""
+        # When always_press=True, inject press_decision=1.0 into the action
+        # so from_normalized() always creates a PRESS action with valid torque
+        if self.always_press:
+            if self.use_simple_action_space:
+                # [string, fret, torque] -> [string, fret, press=1.0, torque]
+                action = np.insert(action, 2, 1.0)
+            else:
+                # [logits(3), fret, torque] -> [logits(3), fret, press=1.0, torque]
+                action = np.insert(action, 4, 1.0)
+        
         # Convert normalized action to RLFretAction
         if self.use_simple_action_space:
             rl_action = self.action_space_helper.from_simple_normalized(action)
@@ -262,7 +270,6 @@ class StringSimEnv(gym.Env):
             rl_action = self.action_space_helper.from_normalized(action)
         
         # Override string with environment's fixed string (for single-string training)
-        # If you want agent to learn string selection, remove this override
         rl_action = RLFretAction(
             string_idx=self.string_index,
             fret_position=rl_action.fret_position,
@@ -288,6 +295,27 @@ class StringSimEnv(gym.Env):
         )
         
         reward = reward_info['total_reward']
+        
+        # Log per-step classifier results
+        cls = reward_info.get('classification')
+        if cls is not None:
+            label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
+            logger.info(
+                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
+                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
+                f"D={cls.get('dead_note_prob', 0):.3f}  G={cls.get('general_note_prob', 0):.3f}\n"
+                f"    reward={reward:+.3f}  "
+                f"(audio={reward_info['audio_reward']:+.3f}  "
+                f"fret={reward_info['fret_reward']:+.3f}  "
+                f"torque={reward_info['torque_reward']:+.3f})"
+            )
+        else:
+            logger.info(
+                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
+                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"    no classification | reward={reward:+.3f}"
+            )
         
         # Update state
         self.current_fret = fret_position
@@ -340,4 +368,4 @@ class StringSimEnv(gym.Env):
     def close(self):
         """Clean up resources."""
         self.osc_client.close()
-        logger.info("StringSimEnv closed")
+        logger.info("HarmonicEnv closed")

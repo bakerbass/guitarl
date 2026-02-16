@@ -1,7 +1,7 @@
 """
 Shared reward function for RL harmonic training.
 
-Both the training pipeline (audio_reward.py / stringsim_env.py) and the
+Both the training pipeline (audio_reward.py / harmonic_env.py) and the
 diagnostic test loop (test_rl_loop.py) import from here so the reward
 logic is defined in exactly one place.
 """
@@ -18,9 +18,9 @@ TORQUE_MAX = 650.0
 FRET_TOLERANCE = 0.3             # ~1/3 of a fret is acceptable
 TORQUE_TOLERANCE = 75.0          # Within 75 units of optimal
 
-REWARD_WEIGHT_AUDIO  = 0.4
-REWARD_WEIGHT_FRET   = 0.4
-REWARD_WEIGHT_TORQUE = 0.2
+REWARD_WEIGHT_AUDIO  = 0.2
+REWARD_WEIGHT_FRET   = 0.3
+REWARD_WEIGHT_TORQUE = 0.5
 
 # Classifier label order (must match train_cnn.py label_map)
 CLASS_NAMES = ['harmonic', 'dead_note', 'general_note']
@@ -42,7 +42,10 @@ def compute_reward(
 
     Reward = w_audio * harmonic_prob
            + w_fret  * exp(-fret_error² / 2σ_fret²)
-           + w_torque* exp(-torque_error² / 2σ_torque²)
+           + w_torque* (2·exp(-torque_error² / 2σ_torque²) - 1)
+
+    The torque component is shifted to [-1, +1] so excessive torque
+    actively penalises the reward rather than merely contributing zero.
 
     Args:
         fret_position: Fractional fret position the agent chose (0.0 – 9.0)
@@ -65,9 +68,12 @@ def compute_reward(
     fret_error = abs(fret_position - float(target_fret))
     fret_reward = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
 
-    # Torque reward: Gaussian centred on optimal torque
+    # Torque reward: shifted Gaussian, range [-1, +1]
+    #   optimal (error=0) → +1 (bonus)
+    #   moderate error    →  0 (neutral)
+    #   extreme torque    → -1 (penalty — harmonics are physically impossible)
     torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
-    torque_reward = np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2))
+    torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
 
     # Weighted combination
     total_reward = (

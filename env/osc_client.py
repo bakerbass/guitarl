@@ -1,7 +1,7 @@
 """
-OSC client wrapper for StringSim guitar simulator.
+OSC client for GuitarBot control.
 
-Provides high-level interface to control the StringSim plugin via OSC messages.
+Provides high-level interface to control the GuitarBot via OSC messages.
 Supports both standard /fret (midi-based) and /rlfret (low-level RL) commands.
 """
 
@@ -30,11 +30,11 @@ from .action_space import (
 logger = logging.getLogger(__name__)
 
 
-class StringSimOSCClient:
+class GuitarBotOSCClient:
     """
-    OSC client for controlling StringSim guitar simulator.
+    OSC client for controlling the GuitarBot.
     
-    Communicates with StringSim on port 8000 using OSC protocol.
+    Communicates via OSC protocol using /fret and /rlfret messages.
     Supports motor control, state queries, and chord/note commands.
     """
     
@@ -114,12 +114,11 @@ class StringSimOSCClient:
     
     def send_rlfret(self, action: RLFretAction, timestamp: Optional[float] = None) -> bool:
         """
-        Send /rlfret message for RL-based low-level control.
+        Send /RLFret message for RL-based low-level control.
         
-        This is the primary interface for RL agents. Uses fractional frets
-        internally but converts to mm for the OSC message.
+        This is the primary interface for RL agents.
         
-        OSC Format: /rlfret <string_idx> <slider_mm> <torque>
+        OSC Format: /RLFret <string_idx> <fret_position> <torque>
         
         Args:
             action: RLFretAction with string, fret position, and torque
@@ -128,7 +127,7 @@ class StringSimOSCClient:
         Returns:
             True if message sent successfully
         """
-        string_idx, slider_mm, torque = action.to_osc_args()
+        string_idx, fret_pos, torque = action.to_osc_args()
         
         # Validate string is playable (has a plucker)
         if string_idx not in PLAYABLE_STRINGS:
@@ -137,19 +136,19 @@ class StringSimOSCClient:
         
         # Build message
         if timestamp is None:
-            message = [int(string_idx), float(slider_mm), float(torque)]
+            message = [int(string_idx), float(fret_pos), float(torque)]
         else:
-            message = [int(string_idx), float(slider_mm), float(torque), float(timestamp)]
+            message = [int(string_idx), float(fret_pos), float(torque), float(timestamp)]
         
         try:
-            self.client.send_message("/rlfret", message)
-            logger.debug(
-                f"Sent /rlfret: string={string_idx}, fret={action.fret_position:.2f}, "
-                f"mm={slider_mm:.1f}, torque={torque:.0f}"
+            self.client.send_message("/RLFret", message)
+            logger.info(
+                f"Sent /RLFret: string={string_idx}, fret={action.fret_position:.2f}, "
+                f"torque={torque:.0f}"
             )
             return True
         except Exception as e:
-            logger.error(f"Failed to send /rlfret: {e}")
+            logger.error(f"Failed to send /RLFret: {e}")
             return False
     
     def send_rlfret_raw(self, string_idx: int, fret_position: float, 
@@ -187,12 +186,12 @@ class StringSimOSCClient:
             True if reset successful
         """
         try:
-            self.client.send_message("/reset", [])
-            logger.info("Sent /reset command")
+            self.client.send_message("/Reset", [])
+            logger.info("Sent /Reset command")
             time.sleep(wait_time)
             return True
         except Exception as e:
-            logger.error(f"Failed to send /reset: {e}")
+            logger.error(f"Failed to send /Reset: {e}")
             return False
     
     def get_state(self) -> bool:

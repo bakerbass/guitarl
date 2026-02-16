@@ -6,8 +6,8 @@ RL environment for learning to play natural harmonics on the StringSim guitar si
 
 1. **Install dependencies**:
 ```bash
-conda env update -f environment.yml -n gen-audio-bench
-conda activate gen-audio-bench
+conda env create -f environment.yml
+conda activate guitaRL
 ```
 
 2. **Setup VB-CABLE**:
@@ -23,29 +23,47 @@ conda activate gen-audio-bench
 guitaRL/
 ├── env/
 │   ├── __init__.py
-│   ├── osc_client.py           # OSC communication with StringSim
-│   └── stringsim_env.py        # Gymnasium environment
+│   ├── action_space.py          # RLFretAction, PresserAction, GuitarBotActionSpace
+│   ├── osc_client.py            # OSC communication with GuitarBot
+│   └── harmonic_env.py          # Gymnasium environment (HarmonicEnv)
 ├── utils/
 │   ├── __init__.py
-│   └── audio_reward.py         # Audio-based reward using HarmonicsClassifier
-├── train.py                     # Training script
-├── evaluate.py                  # Evaluation script
-├── environment.yml              # Conda dependencies
+│   ├── reward.py                # Shared reward constants & function (single source of truth)
+│   └── audio_reward.py          # Audio capture + classifier → calls reward.py
+├── train.py                      # SAC training script
+├── test_rl_loop.py               # Diagnostic: action → OSC → audio → classify → reward
+├── evaluate.py                   # Evaluation script
+├── environment.yml               # Conda dependencies (env name: guitaRL)
 └── README.md
 ```
 
 ## Usage
+### Test Loop
+
+Diagnostic script that runs the full action → OSC → audio → classify → reward
+pipeline one note at a time, plotting each note with classification and reward:
+
+```bash
+conda run -n guitaRL python test_rl_loop.py \
+    --model ../HarmonicsClassifier/models/best_model.pt \
+    --num-tests 5 \
+    --target-harmonic
+```
+
+Plots are shown by default; pass `--no-plot` to disable.
 
 ### Training
 
 Train agent to learn natural harmonics at frets 4, 5, and 7:
 
 ```bash
-# Basic training with curriculum learning (easy to hard)
-python train.py --model-path ../HarmonicsClassifier/models/best_model.pt
+# Basic training (uses guitaRL conda env)
+conda activate guitaRL
+python train.py \
+    --model-path ../HarmonicsClassifier/models/best_model.pt
 
 # Custom training parameters
-python train.py \
+conda run -n guitaRL python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
     --curriculum easy_to_hard \
     --total-timesteps 50000 \
@@ -57,6 +75,8 @@ python train.py \
 - `easy_to_hard`: Start with fret 7, progress to 5, then 4
 - `random`: Random fret each episode
 - `fixed_fret`: Always train on fret 7
+
+
 
 ### Evaluation
 
@@ -93,15 +113,24 @@ python evaluate.py \
 **Total: 11 dimensions**
 
 ### Action Space
-- Position (continuous, 0-234 mm)
-- Force (continuous, 0-1)
+- Fret position (continuous, fractional frets 0.0 – 9.0)
+- Torque (continuous, 0 – 650)
 
 ### Reward Function
-- **Audio reward (50%)**: Harmonic classifier confidence
-- **Position reward (30%)**: Gaussian centered at target harmonic position
-- **Force reward (20%)**: Gaussian centered at optimal force (0.3)
 
-**Success bonus**: +1.0 when harmonic_prob > 0.8
+Defined once in `utils/reward.py` and imported by both the training env and the test loop.
+
+$$r = 0.2 \cdot r_{\text{audio}} + 0.3 \cdot r_{\text{fret}} + 0.5 \cdot r_{\text{torque}}$$
+
+| Component | Formula | Range | Purpose |
+|-----------|---------|-------|---------|
+| Audio     | `harmonic_prob` from CNN classifier | [0, 1] | Does it *sound* like a harmonic? |
+| Fret      | $\exp\!\left(-\frac{e_f^2}{2 \cdot 0.3^2}\right)$ | [0, 1] | Gaussian at target fret (σ = 0.3) |
+| Torque    | $2\exp\!\left(-\frac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal torque 30; **penalises** excessive force |
+
+- Optimal torque: **30** (light touch for harmonics)
+- Torque tolerance (σ): **75**
+- **Success bonus**: +1.0 when `harmonic_prob > 0.8`
 
 ### Target Harmonics
 | Fret | Position (mm) | Harmonic |
@@ -115,7 +144,8 @@ python evaluate.py \
 1. **Start with curriculum learning**: `--curriculum easy_to_hard` helps agent learn progressively
 2. **Monitor tensorboard**: `tensorboard --logdir runs/harmonic_sac_TIMESTAMP/logs`
 3. **Adjust episode length**: Default 10 steps, increase for exploration
-4. **Force range**: Harmonics require light touch (0.15-0.5), optimal ~0.3
+4. **Torque range**: Harmonics require light touch; optimal torque ≈ 30, max safe 650
+5. **Tune reward weights**: Edit `utils/reward.py` — both training and test scripts pick up changes automatically
 
 ## Troubleshooting
 
