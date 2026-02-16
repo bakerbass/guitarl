@@ -147,9 +147,8 @@ $$r = 0.2 \cdot r_{\text{audio}} + 0.3 \cdot r_{\text{fret}} + 0.5 \cdot r_{\tex
 4. **Torque range**: Harmonics require light touch; optimal torque ≈ 30, max safe 650
 5. **Tune reward weights**: Edit `utils/reward.py` — both training and test scripts pick up changes automatically
 
-## Troubleshooting
+## Todo:
+TODO:
 
-- **No audio captured**: Check VB-CABLE routing in Windows Sound settings
-- **Low success rate**: Try `--curriculum fixed_fret` to master one position first
-- **Slow training**: Reduce `--capture-duration` in audio reward (default 0.8s)
-- **OSC connection failed**: Ensure StringSim is running and listening on port 8000
+filtration layer: actively penalize totally wrong choices (high torque, 0 torque) or nonsensicle audio output (no onset detected). This layer can allow for a more physics based reward, while the main layer prioritizes the audio reward
+refactor for clarity: we are actually changing the presser position, not the torque
