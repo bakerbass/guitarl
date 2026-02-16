@@ -116,17 +116,36 @@ python evaluate.py \
 - Fret position (continuous, fractional frets 0.0 – 9.0)
 - Torque (continuous, 0 – 650)
 
-### Reward Function
+### Reward Function — Two-Layer Architecture
 
 Defined once in `utils/reward.py` and imported by both the training env and the test loop.
 
-$$r = 0.2 \cdot r_{\text{audio}} + 0.3 \cdot r_{\text{fret}} + 0.5 \cdot r_{\text{torque}}$$
+#### Layer 1: Filtration (physics gate)
+
+Before running the CNN classifier, a fast physics check rejects obviously
+bad actions with a flat **−1.0 penalty**.  The classifier is never called,
+saving inference time and giving the agent an immediate, unambiguous signal.
+
+| Check | Threshold | Rationale |
+|-------|-----------|-----------|
+| Torque too high | > 500 | Harmonics are physically impossible with heavy fretting |
+| Torque too low | < 10 | Presser barely touching the string — no useful sound |
+| Fret too far | > 3 frets from target | Not even in the right neighbourhood |
+| Silence | RMS < 0.005 | No audible onset detected — nothing to classify |
+
+#### Layer 2: Audio (classifier reward)
+
+Only reached when the filtration layer passes.  The CNN harmonic
+probability is the primary reward signal, with small shaping bonuses
+for fret accuracy and torque optimality.
+
+$$r = 0.6 \cdot r_{\text{audio}} + 0.2 \cdot r_{\text{fret}} + 0.2 \cdot r_{\text{torque}}$$
 
 | Component | Formula | Range | Purpose |
 |-----------|---------|-------|---------|
 | Audio     | `harmonic_prob` from CNN classifier | [0, 1] | Does it *sound* like a harmonic? |
 | Fret      | $\exp\!\left(-\frac{e_f^2}{2 \cdot 0.3^2}\right)$ | [0, 1] | Gaussian at target fret (σ = 0.3) |
-| Torque    | $2\exp\!\left(-\frac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal torque 30; **penalises** excessive force |
+| Torque    | $2\exp\!\left(-\frac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal torque 30 |
 
 - Optimal torque: **30** (light touch for harmonics)
 - Torque tolerance (σ): **75**
@@ -151,4 +170,6 @@ $$r = 0.2 \cdot r_{\text{audio}} + 0.3 \cdot r_{\text{fret}} + 0.5 \cdot r_{\tex
 TODO:
 
 filtration layer: actively penalize totally wrong choices (high torque, 0 torque) or nonsensicle audio output (no onset detected). This layer can allow for a more physics based reward, while the main layer prioritizes the audio reward
+
+(low priority, mainly for paper clarity)
 refactor for clarity: we are actually changing the presser position, not the torque

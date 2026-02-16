@@ -17,6 +17,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 import numpy as np
 import torch
 import sounddevice as sd
@@ -245,15 +246,18 @@ class RLTestLoop:
         plt.show(block=False)
         plt.pause(0.1)
     
-    def compute_reward(self, action: RLFretAction, predicted_class, confidence, probabilities):
+    def compute_reward(self, action: RLFretAction, predicted_class, confidence, probabilities,
+                       audio: Optional[np.ndarray] = None):
         """
-        Compute reward using the shared reward function (utils/reward.py).
+        Compute reward using the shared two-layer reward function (utils/reward.py).
         """
         harmonic_prob = float(probabilities[0])  # index 0 = harmonic
+        audio_rms = float(np.sqrt(np.mean(audio ** 2))) if audio is not None else None
         reward_info = compute_reward_nearest_fret(
             fret_position=action.fret_position,
             torque=action.torque,
             harmonic_prob=harmonic_prob,
+            audio_rms=audio_rms,
         )
         
         # Store components for display / plotting
@@ -264,6 +268,8 @@ class RLTestLoop:
             'fret_error':  reward_info['fret_error'],
             'torque_error': reward_info['torque_error'],
             'nearest_harmonic_fret': reward_info['nearest_harmonic_fret'],
+            'filtered': reward_info.get('filtered', False),
+            'filter_reason': reward_info.get('filter_reason', ''),
         }
         
         return reward_info['total_reward']
@@ -298,22 +304,27 @@ class RLTestLoop:
         predicted_class, confidence, probabilities = self.classify_audio(audio_tensor)
         
         # Compute reward
-        reward = self.compute_reward(action, predicted_class, confidence, probabilities)
+        reward = self.compute_reward(action, predicted_class, confidence, probabilities, audio=audio)
         reward_components = getattr(self, '_last_reward_components', None)
         
         # Display results
         predicted_label = self.class_names[predicted_class]
-        print(f"\n→ Classification: {predicted_label.upper()} ({confidence*100:.1f}%)")
-        print(f"→ Probabilities:")
-        for i, (name, prob) in enumerate(zip(self.class_names, probabilities)):
-            marker = "★" if i == predicted_class else " "
-            print(f"   {marker} {name:12s}: {prob*100:5.1f}%")
-        print(f"→ Reward: {reward:+.3f}")
-        if reward_components:
-            print(f"   audio={reward_components['audio']:.3f}  "
-                  f"fret={reward_components['fret']:.3f} (err={reward_components['fret_error']:.2f}, "
-                  f"nearest={reward_components['nearest_harmonic_fret']})  "
-                  f"torque={reward_components['torque']:.3f} (err={reward_components['torque_error']:.1f})")
+        
+        if reward_components and reward_components.get('filtered'):
+            print(f"\n→ FILTERED: {reward_components['filter_reason']}")
+            print(f"→ Reward: {reward:+.3f} (filtration penalty)")
+        else:
+            print(f"\n→ Classification: {predicted_label.upper()} ({confidence*100:.1f}%)")
+            print(f"→ Probabilities:")
+            for i, (name, prob) in enumerate(zip(self.class_names, probabilities)):
+                marker = "★" if i == predicted_class else " "
+                print(f"   {marker} {name:12s}: {prob*100:5.1f}%")
+            print(f"→ Reward: {reward:+.3f}")
+            if reward_components:
+                print(f"   audio={reward_components['audio']:.3f}  "
+                      f"fret={reward_components['fret']:.3f} (err={reward_components['fret_error']:.2f}, "
+                      f"nearest={reward_components['nearest_harmonic_fret']})  "
+                      f"torque={reward_components['torque']:.3f} (err={reward_components['torque_error']:.1f})")
         
         # Plot individual test note (always unless --no-plot)
         if self.plot_enabled:

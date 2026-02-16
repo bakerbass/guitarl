@@ -265,22 +265,26 @@ class HarmonicRewardCalculator:
         # Audio-based classification
         classification = None
         harmonic_prob = 0.0
+        audio_rms = None
         
         if audio is None and capture_audio:
             audio = self.capture_audio()
         
         if audio is not None:
+            audio_rms = float(np.sqrt(np.mean(audio ** 2)))
             classification = self.classify_audio(audio)
             harmonic_prob = classification['harmonic_prob']
         
-        # Delegate to shared reward function
+        # Delegate to shared two-layer reward function
         reward_info = _compute_reward(
             fret_position=fret_position,
             torque=torque,
             target_fret=target_fret,
             harmonic_prob=harmonic_prob,
+            audio_rms=audio_rms,
         )
         reward_info['classification'] = classification
+        reward_info['audio_rms'] = audio_rms
         return reward_info
     
     def get_success_threshold(self) -> float:

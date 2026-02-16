@@ -297,8 +297,18 @@ class HarmonicEnv(gym.Env):
         reward = reward_info['total_reward']
         
         # Log per-step classifier results
+        filtered = reward_info.get('filtered', False)
+        filter_reason = reward_info.get('filter_reason', '')
         cls = reward_info.get('classification')
-        if cls is not None:
+
+        if filtered:
+            logger.info(
+                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
+                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"    FILTERED: {filter_reason}\n"
+                f"    reward={reward:+.3f}"
+            )
+        elif cls is not None:
             label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
             logger.info(
                 f"\n  Step {self.current_step + 1}/{self.max_steps} | "
@@ -355,6 +365,9 @@ class HarmonicEnv(gym.Env):
             'torque_reward': reward_info['torque_reward'],
             'fret_error': reward_info['fret_error'],
             'classification': reward_info['classification'],
+            'filtered': reward_info.get('filtered', False),
+            'filter_reason': reward_info.get('filter_reason', ''),
+            'audio_rms': reward_info.get('audio_rms'),
             'step': self.current_step,
             'is_at_harmonic': rl_action.is_at_harmonic,
         }
