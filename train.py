@@ -217,9 +217,6 @@ def train(args):
         logger.info("Model saved")
     
     finally:
-        # Send reset to return robot to neutral before closing
-        logger.info("Sending /Reset to robot...")
-        env.unwrapped.osc_client.reset(wait_time=0.5)
         env.close()
         eval_env.close()
 

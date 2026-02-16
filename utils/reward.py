@@ -11,7 +11,7 @@ from typing import Dict, Optional
 
 
 # ── Reward constants ──────────────────────────────────────────────────
-HARMONIC_FRETS = [4, 5, 7]
+HARMONIC_FRETS = [4, 5, 7, 9]
 TORQUE_OPTIMAL_HARMONIC = 30.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
 
