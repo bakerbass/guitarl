@@ -42,7 +42,7 @@ SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 TORQUE_HARD_MAX   = 350.0   # Anything above this is too aggressive for harmonics
 TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
 FRET_MAX_ERROR    = 3.0     # More than 3 frets away? Not even trying
-RMS_SILENCE_THRESH = 0.005  # RMS below this = no audible onset
+RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
 FILTRATION_PENALTY = -1.0   # Flat penalty when filtration rejects an action
 
@@ -51,6 +51,15 @@ REWARD_WEIGHT_AUDIO  = 0.6  # Classifier is the primary signal
 REWARD_WEIGHT_FRET   = 0.2  # Small shaping bonus for fret accuracy
 REWARD_WEIGHT_TORQUE = 0.2  # Small shaping bonus for light torque
 
+# Ablation: no-audio mode — fret + torque shaping only, rebalanced
+ABLATION_NO_AUDIO_FRET_WEIGHT   = 0.5
+ABLATION_NO_AUDIO_TORQUE_WEIGHT = 0.5
+
+# Reward mode strings
+REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
+REWARD_MODE_NO_FILTRATION = 'no_filtration'  # Layer 2 only — bypass physics gate
+REWARD_MODE_NO_AUDIO      = 'no_audio'       # Layer 1 + fret/torque shaping only
+
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
 
@@ -58,11 +67,14 @@ def compute_filtration(
     fret_position: float,
     torque: float,
     target_fret: int,
-    audio_rms: Optional[float] = None,
+    audio_rms: Optional[float] = None,  # retained for API compat; no longer used
 ) -> Dict[str, object]:
     """
     Physics-based gate.  Returns whether the action is sane enough to
     bother running the classifier on.
+
+    Checks: torque range, fret distance from target.
+    Silence detection (RMS) was removed — too inconsistent in practice.
 
     Returns:
         Dict with:
@@ -92,14 +104,6 @@ def compute_filtration(
         return {
             'passed': False,
             'reason': f'fret_too_far ({fret_position:.2f}, err={fret_error:.2f} > {FRET_MAX_ERROR})',
-            'penalty': FILTRATION_PENALTY,
-        }
-
-    # Check: silence (no onset detected)
-    if audio_rms is not None and audio_rms < RMS_SILENCE_THRESH:
-        return {
-            'passed': False,
-            'reason': f'silence (rms={audio_rms:.4f} < {RMS_SILENCE_THRESH})',
             'penalty': FILTRATION_PENALTY,
         }
 
@@ -222,6 +226,89 @@ def compute_reward_nearest_fret(
     result = compute_reward(fret_position, torque, nearest_fret, harmonic_prob, audio_rms)
     result['nearest_harmonic_fret'] = nearest_fret
     return result
+
+
+# ── Ablation variants ────────────────────────────────────────────────
+
+def compute_reward_no_filtration(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    harmonic_prob: float,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Ablation: Layer 1 (filtration) is fully bypassed.
+
+    Every action — no matter how extreme — proceeds to the classifier-
+    based Layer 2 reward.  Use this to isolate whether the physics gate
+    helps or hurts learning.  Expensive actions are still distinguishable
+    by Layer 2's torque/fret shaping terms, but there is no hard penalty.
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    reward_info = compute_audio_reward(fret_position, torque, target_fret, harmonic_prob)
+    reward_info['target_fret']   = target_fret
+    reward_info['filtered']      = False
+    reward_info['filter_reason'] = ''
+    return reward_info
+
+
+def compute_reward_no_audio(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Ablation: Layer 2 audio signal (CNN classifier) is removed.
+
+    Layer 1 (filtration) still runs (torque + fret checks).
+    Silence detection was removed from filtration as it was inconsistent.  When it passes, reward is the fret +
+    torque shaping terms only, rebalanced to equal weights (0.5 / 0.5).
+
+    Use this to measure how much of the policy's performance comes from
+    the CNN signal vs. pure mechanical guidance.
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
+    if not filt['passed']:
+        return {
+            'total_reward':  filt['penalty'],
+            'audio_reward':  0.0,
+            'fret_reward':   0.0,
+            'torque_reward': 0.0,
+            'fret_error':    abs(fret_position - float(target_fret)),
+            'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
+            'target_fret':   target_fret,
+            'filtered':      True,
+            'filter_reason': filt['reason'],
+        }
+
+    fret_error    = abs(fret_position - float(target_fret))
+    fret_reward   = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
+    torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
+    torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
+
+    total_reward = (
+        ABLATION_NO_AUDIO_FRET_WEIGHT   * fret_reward
+        + ABLATION_NO_AUDIO_TORQUE_WEIGHT * torque_reward
+    )
+
+    return {
+        'total_reward':  total_reward,
+        'audio_reward':  0.0,         # no CNN
+        'fret_reward':   fret_reward,
+        'torque_reward': torque_reward,
+        'fret_error':    fret_error,
+        'torque_error':  torque_error,
+        'target_fret':   target_fret,
+        'filtered':      False,
+        'filter_reason': '',
+    }
 
 
 def is_success(harmonic_prob: float) -> bool:

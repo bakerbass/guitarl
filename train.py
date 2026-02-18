@@ -92,7 +92,8 @@ class HarmonicProgressCallback(CallbackList):
 
 
 def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_index: int = 2,
-             osc_port: int = 12000, audio_device: str = "Scarlett"):
+             osc_port: int = 12000, audio_device: str = "Scarlett",
+             reward_mode: str = 'full'):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -102,7 +103,8 @@ def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_
         audio_device=audio_device,
         curriculum_mode=curriculum_mode,
         max_steps=10,
-        success_threshold=0.8
+        success_threshold=0.8,
+        reward_mode=reward_mode,
     )
     env = Monitor(env)
     return env
@@ -114,10 +116,20 @@ def train(args):
     logger.info("Starting harmonic RL training")
     logger.info("=" * 60)
     
-    # Create output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ── Output directory ──────────────────────────────────────────────
+    # When resuming, reuse the existing run directory so logs/checkpoints
+    # stay together.  When starting fresh, create a timestamped subdirectory.
+    if args.resume:
+        resume_dir = Path(args.resume)
+        if not resume_dir.exists():
+            logger.error(f"Resume directory not found: {resume_dir}")
+            sys.exit(1)
+        output_dir = resume_dir
+        logger.info(f"Resuming from: {output_dir}")
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
     
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -128,6 +140,7 @@ def train(args):
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
+    logger.info(f"Reward mode: {args.reward_mode}")
     
     # Resolve string pool: --string-indices takes precedence, else fall back to --string-index
     string_indices = args.string_indices if args.string_indices else [args.string_index]
@@ -140,7 +153,8 @@ def train(args):
         curriculum_mode=args.curriculum,
         string_indices=string_indices,
         osc_port=args.osc_port,
-        audio_device=args.audio_device
+        audio_device=args.audio_device,
+        reward_mode=args.reward_mode,
     )
     
     # Create evaluation environment
@@ -149,7 +163,8 @@ def train(args):
         curriculum_mode="random",  # Evaluate on all frets
         string_indices=string_indices,
         osc_port=args.osc_port,
-        audio_device=args.audio_device
+        audio_device=args.audio_device,
+        reward_mode=args.reward_mode,
     )
     
     # Configure SAC agent
@@ -175,6 +190,38 @@ def train(args):
         device=args.device
     )
     
+    # ── Resume: load weights + replay buffer ──────────────────────────
+    if args.resume:
+        def _latest_checkpoint(ckpt_dir: Path):
+            """Return the .zip with the highest timestep number, or None."""
+            zips = sorted(ckpt_dir.glob("harmonic_sac_*_steps.zip"))
+            return zips[-1].with_suffix('') if zips else None
+
+        if args.resume_checkpoint:
+            model_file = Path(args.resume_checkpoint)
+        elif (output_dir / "interrupted_model.zip").exists():
+            model_file = output_dir / "interrupted_model"
+        else:
+            model_file = _latest_checkpoint(checkpoint_dir)
+
+        if model_file is None:
+            logger.error("No checkpoint found in resume directory. Cannot resume.")
+            sys.exit(1)
+
+        logger.info(f"Loading weights from: {model_file}")
+        model = SAC.load(model_file, env=env, device=args.device)
+
+        buffer_file = Path(str(model_file) + "_replay_buffer.pkl")
+        if buffer_file.exists():
+            logger.info(f"Loading replay buffer from: {buffer_file}")
+            model.load_replay_buffer(buffer_file)
+            logger.info(f"  Buffer size restored: {model.replay_buffer.size()} transitions")
+        else:
+            logger.warning(
+                f"Replay buffer not found at {buffer_file}. "
+                "Resuming with an empty buffer — learning_starts warmup will apply again."
+            )
+
     # Configure logger
     new_logger = configure(str(log_dir), ["stdout", "csv", "tensorboard"])
     model.set_logger(new_logger)
@@ -183,7 +230,9 @@ def train(args):
     checkpoint_callback = CheckpointCallback(
         save_freq=args.checkpoint_freq,
         save_path=str(checkpoint_dir),
-        name_prefix="harmonic_sac"
+        name_prefix="harmonic_sac",
+        save_replay_buffer=True,   # saves <name>_replay_buffer.pkl alongside each .zip
+        save_vecnormalize=False,
     )
     
     eval_callback = EvalCallback(
@@ -208,7 +257,8 @@ def train(args):
             total_timesteps=args.total_timesteps,
             callback=callbacks,
             log_interval=10,
-            progress_bar=True
+            progress_bar=True,
+            reset_num_timesteps=not args.resume,  # preserve timestep counter when resuming
         )
         
         # Save final model
@@ -219,7 +269,8 @@ def train(args):
     except KeyboardInterrupt:
         logger.info("Training interrupted by user")
         model.save(output_dir / "interrupted_model")
-        logger.info("Model saved")
+        model.save_replay_buffer(output_dir / "interrupted_model_replay_buffer")
+        logger.info("Model and replay buffer saved")
     
     finally:
         # NOTE: /Reset is NOT sent automatically on exit.
@@ -288,6 +339,16 @@ def main():
     parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency')
     parser.add_argument('--eval-freq', type=int, default=2000, help='Evaluation frequency')
     
+    # Resume
+    parser.add_argument('--resume', type=str, default=None, metavar='RUN_DIR',
+                        help='Path to a previous run directory to resume from '
+                             '(e.g. ./runs/harmonic_sac_20260218_134500). '
+                             'Loads the latest checkpoint (or interrupted_model) '
+                             'and its replay buffer, then continues training.')
+    parser.add_argument('--resume-checkpoint', type=str, default=None, metavar='CKPT',
+                        help='Explicit checkpoint file to resume from (without .zip extension). '
+                             'Overrides the automatic latest-checkpoint search within --resume.')
+    
     # Robot safety
     parser.add_argument('--reset-on-exit', action='store_true', default=True,
                         help='Send /Reset to GuitarBot when training stops. '
@@ -295,8 +356,14 @@ def main():
                              'actively running on the robot — the GuitarBot '
                              'serialises the reset behind any active trajectory, '
                              'but premature resets can still cause mechanical issues. '
-                             'Default: ON (robot resets on exit).')
-    
+                             'Default: ON (robot resets on exit).')    
+    # Reward / ablation
+    parser.add_argument('--reward-mode', type=str, default='full',
+                        choices=['full', 'no_filtration', 'no_audio'],
+                        help='Reward function variant for ablation studies. '
+                             '"full" (default): two-layer reward (filtration + CNN). '
+                             '"no_filtration": skip physics gate, all actions reach the CNN. '
+                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights).')    
     # Device
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],

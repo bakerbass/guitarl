@@ -40,6 +40,7 @@ if str(_parent_dir) not in sys.path:
     sys.path.insert(0, str(_parent_dir))
 
 from utils.audio_reward import HarmonicRewardCalculator
+from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO
 
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,8 @@ class HarmonicEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 3.0  # Time to wait after each action (seconds)
+    ACTION_DURATION = 3.0       # Time to wait after each action (seconds)
+    STRING_SWITCH_WAIT = 10.0   # Seconds to pause after a /Reset between strings
     
     def __init__(self,
                  model_path: str,
@@ -100,7 +102,8 @@ class HarmonicEnv(gym.Env):
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
                  use_simple_action_space: bool = False,
-                 always_press: bool = True):
+                 always_press: bool = True,
+                 reward_mode: str = REWARD_MODE_FULL):
         """
         Initialize HarmonicEnv.
         
@@ -120,6 +123,7 @@ class HarmonicEnv(gym.Env):
             curriculum_mode: "random", "easy_to_hard", or "fixed_fret"
             use_simple_action_space: If True, use 3D continuous space instead of 5D
             always_press: If True, remove press_decision from action space (always PRESS)
+            reward_mode: 'full', 'no_filtration', or 'no_audio' (see reward.py)
         """
         super().__init__()
         
@@ -152,7 +156,8 @@ class HarmonicEnv(gym.Env):
         self.reward_calc = HarmonicRewardCalculator(
             model_path=model_path,
             device_name=audio_device,
-            capture_duration=capture_duration
+            capture_duration=capture_duration,
+            reward_mode=reward_mode,
         )
         
         # Define action space dimensions
@@ -190,12 +195,16 @@ class HarmonicEnv(gym.Env):
         self.torque_history = []
         self.episode_rewards = []
         
+        # Track previous string to detect switches between episodes
+        self._prev_string_index = None
+        
         # Curriculum learning state
         self.episode_count = 0
         self.curriculum_fret_idx = 0  # Start with easiest (fret 7)
         
         logger.info(f"HarmonicEnv initialized: strings={self.string_indices}, max_steps={max_steps}, "
-                    f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}")
+                    f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}, "
+                    f"reward_mode={reward_mode}")
     
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
@@ -250,7 +259,20 @@ class HarmonicEnv(gym.Env):
         super().reset(seed=seed)
         
         # Sample active string for this episode
-        self.string_index = int(np.random.choice(self.string_indices))
+        new_string_index = int(np.random.choice(self.string_indices))
+        
+        # If the string changed, reset the robot and wait for it to home safely
+        if self._prev_string_index is not None and new_string_index != self._prev_string_index:
+            logger.info(
+                f"String switch: {self._prev_string_index} -> {new_string_index}. "
+                f"Sending /Reset and waiting {self.STRING_SWITCH_WAIT:.0f}s..."
+            )
+            self.osc_client.reset(wait_time=0.5)
+            time.sleep(self.STRING_SWITCH_WAIT)
+            logger.info("String switch complete. Starting new episode.")
+        
+        self.string_index = new_string_index
+        self._prev_string_index = new_string_index
         
         # Select target fret
         self.target_fret = self._get_target_fret()

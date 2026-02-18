@@ -42,7 +42,12 @@ from utils.reward import (
     CLASS_NAMES as _CLASS_NAMES,
     HARMONIC_CLASS_IDX as _HARMONIC_CLASS_IDX,
     SUCCESS_THRESHOLD,
+    REWARD_MODE_FULL,
+    REWARD_MODE_NO_FILTRATION,
+    REWARD_MODE_NO_AUDIO,
     compute_reward as _compute_reward,
+    compute_reward_no_filtration as _compute_reward_no_filtration,
+    compute_reward_no_audio as _compute_reward_no_audio,
     is_success as _is_success,
 )
 
@@ -64,7 +69,8 @@ class HarmonicRewardCalculator:
                  device_name: str = "VB-Audio Virtual Cable",
                  capture_duration: float = 1.0,
                  model_sr: int = 22050,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu"):
+                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
+                 reward_mode: str = REWARD_MODE_FULL):
         """
         Initialize reward calculator.
         
@@ -74,6 +80,10 @@ class HarmonicRewardCalculator:
             capture_duration: Audio capture duration in seconds
             model_sr: Sample rate expected by model
             device: Torch device (cuda/cpu)
+            reward_mode: One of 'full', 'no_filtration', 'no_audio'.
+                         'full'           — two-layer reward (default)
+                         'no_filtration'  — bypass physics gate, Layer 2 only
+                         'no_audio'       — Layer 1 + fret/torque shaping, no CNN
         """
         self.model_path = Path(model_path)
         self.device_name = device_name
@@ -101,7 +111,8 @@ class HarmonicRewardCalculator:
         
         # Load model
         self.model = self._load_model()
-        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}")
+        self.reward_mode = reward_mode
+        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
     
     def _find_audio_device(self) -> Optional[int]:
         """Find audio input device by name."""
@@ -262,27 +273,49 @@ class HarmonicRewardCalculator:
         Returns:
             Dictionary with reward components and total reward
         """
-        # Audio-based classification
+        # Audio-based classification (skipped entirely in no_audio mode)
         classification = None
         harmonic_prob = 0.0
         audio_rms = None
         
-        if audio is None and capture_audio:
+        needs_audio = self.reward_mode != REWARD_MODE_NO_AUDIO
+        
+        if audio is None and capture_audio and needs_audio:
             audio = self.capture_audio()
         
-        if audio is not None:
+        if audio is not None and needs_audio:
             audio_rms = float(np.sqrt(np.mean(audio ** 2)))
             classification = self.classify_audio(audio)
             harmonic_prob = classification['harmonic_prob']
+        elif audio is not None and not needs_audio:
+            # Still compute RMS for the silence filtration check
+            audio_rms = float(np.sqrt(np.mean(audio ** 2)))
         
-        # Delegate to shared two-layer reward function
-        reward_info = _compute_reward(
-            fret_position=fret_position,
-            torque=torque,
-            target_fret=target_fret,
-            harmonic_prob=harmonic_prob,
-            audio_rms=audio_rms,
-        )
+        # Dispatch to the appropriate reward function
+        if self.reward_mode == REWARD_MODE_NO_FILTRATION:
+            reward_info = _compute_reward_no_filtration(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=target_fret,
+                harmonic_prob=harmonic_prob,
+                audio_rms=audio_rms,
+            )
+        elif self.reward_mode == REWARD_MODE_NO_AUDIO:
+            reward_info = _compute_reward_no_audio(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=target_fret,
+                audio_rms=audio_rms,
+            )
+        else:  # REWARD_MODE_FULL (default)
+            reward_info = _compute_reward(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=target_fret,
+                harmonic_prob=harmonic_prob,
+                audio_rms=audio_rms,
+            )
+        
         reward_info['classification'] = classification
         reward_info['audio_rms'] = audio_rms
         return reward_info
