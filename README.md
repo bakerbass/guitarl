@@ -167,9 +167,5 @@ $$r = 0.6 \cdot r_{\text{audio}} + 0.2 \cdot r_{\text{fret}} + 0.2 \cdot r_{\tex
 5. **Tune reward weights**: Edit `utils/reward.py` — both training and test scripts pick up changes automatically
 
 ## Todo:
-TODO:
 
-filtration layer: actively penalize totally wrong choices (high torque, 0 torque) or nonsensicle audio output (no onset detected). This layer can allow for a more physics based reward, while the main layer prioritizes the audio reward
-
-(low priority, mainly for paper clarity)
-refactor for clarity: we are actually changing the presser position, not the torque
+- (low priority, mainly for paper clarity) refactor for clarity: we are actually changing the presser position, not the torque

@@ -29,7 +29,7 @@ TORQUE_OPTIMAL_HARMONIC = 30.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
 TORQUE_SAFE_MIN = 16.0
 
-FRET_TOLERANCE = 0.3             # ~1/3 of a fret is acceptable
+FRET_TOLERANCE = 0.35             # ~1/3 of a fret is acceptable
 TORQUE_TOLERANCE = 75.0          # Within 75 units of optimal
 
 # Classifier label order (must match train_cnn.py label_map)
@@ -39,8 +39,8 @@ HARMONIC_CLASS_IDX = 0
 SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 
 # ── Filtration layer thresholds ───────────────────────────────────────
-TORQUE_HARD_MAX   = 500.0   # Anything above this is too aggressive for harmonics
-TORQUE_HARD_MIN   = 10.0    # Below this the presser barely touches the string
+TORQUE_HARD_MAX   = 350.0   # Anything above this is too aggressive for harmonics
+TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
 FRET_MAX_ERROR    = 3.0     # More than 3 frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RMS below this = no audible onset
 
