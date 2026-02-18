@@ -57,11 +57,16 @@ class HarmonicEnv(gym.Env):
     
     Observation Space:
         - target_fret_one_hot: Which harmonic to play (4, 5, or 7) [3]
+        - string_one_hot: Which string is active this episode (0, 2, 4) [3]
         - current_fret: Last commanded fret position [1]
         - current_torque: Last commanded torque (normalized) [1]
         - fret_history: Last N fret positions [3]
         - torque_history: Last N torque values [3]
-        Total: 11 dimensions
+        Total: 14 dimensions
+
+        Adding string context lets a single policy learn string-specific
+        fret/torque mappings while episodes rotate across strings to
+        distribute motor wear.
         
     Action Space (normalized, shape=(5,) with always_press=True):
         - string_logits: String selection [3] (argmax -> 0, 2, 4)
@@ -85,7 +90,8 @@ class HarmonicEnv(gym.Env):
     
     def __init__(self,
                  model_path: str,
-                 string_index: int = 2,  # Default to D string (plucker 1 -> string 2)
+                 string_index: int = 2,  # Default to D string — used when string_indices is None
+                 string_indices=None,    # List of strings to rotate across (e.g. [0,2,4])
                  osc_host: str = "127.0.0.1",
                  osc_port: int = 12000,
                  audio_device: str = "Scarlett",
@@ -100,7 +106,11 @@ class HarmonicEnv(gym.Env):
         
         Args:
             model_path: Path to HarmonicsClassifier model
-            string_index: Which string to use (0, 2, or 4 - must have plucker)
+            string_index: Fallback single string (0, 2, or 4). Ignored when string_indices is set.
+            string_indices: List of strings to rotate across each episode (e.g. [0, 2, 4]).
+                            Sampled uniformly at each reset(). Distributes motor wear while
+                            keeping the policy string-aware via the observation one-hot.
+                            Defaults to [string_index] (single-string mode, backward compat).
             osc_host: StringSim OSC host
             osc_port: StringSim OSC port
             audio_device: VB-CABLE device name
@@ -113,11 +123,19 @@ class HarmonicEnv(gym.Env):
         """
         super().__init__()
         
-        # Validate string has a plucker
-        if string_index not in PLAYABLE_STRINGS:
-            raise ValueError(f"string_index must be in {PLAYABLE_STRINGS} (strings with pluckers)")
+        # Resolve string pool — validate every entry has a plucker
+        if string_indices is not None:
+            for s in string_indices:
+                if s not in PLAYABLE_STRINGS:
+                    raise ValueError(f"string_indices contains {s}, must be in {PLAYABLE_STRINGS}")
+            self.string_indices = list(string_indices)
+        else:
+            if string_index not in PLAYABLE_STRINGS:
+                raise ValueError(f"string_index must be in {PLAYABLE_STRINGS} (strings with pluckers)")
+            self.string_indices = [string_index]
         
-        self.string_index = string_index
+        # Active string for the current episode (set at reset)
+        self.string_index = self.string_indices[0]
         self.max_steps = max_steps
         self.success_threshold = success_threshold
         self.curriculum_mode = curriculum_mode
@@ -154,8 +172,8 @@ class HarmonicEnv(gym.Env):
         )
         
         # Define observation space
-        # [target_fret_one_hot(3), current_fret, current_torque_norm, fret_history(3), torque_history(3)]
-        obs_dim = 3 + 1 + 1 + 3 + 3  # = 11
+        # [target_fret_one_hot(3), string_one_hot(3), current_fret, current_torque_norm, fret_history(3), torque_history(3)]
+        obs_dim = 3 + 3 + 1 + 1 + 3 + 3  # = 14
         self.observation_space = spaces.Box(
             low=-1.0,
             high=10.0,  # frets go up to 9
@@ -176,8 +194,8 @@ class HarmonicEnv(gym.Env):
         self.episode_count = 0
         self.curriculum_fret_idx = 0  # Start with easiest (fret 7)
         
-        logger.info(f"HarmonicEnv initialized: string={string_index}, max_steps={max_steps}, "
-                    f"action_dim={action_dim}, always_press={always_press}")
+        logger.info(f"HarmonicEnv initialized: strings={self.string_indices}, max_steps={max_steps}, "
+                    f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}")
     
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
@@ -195,11 +213,15 @@ class HarmonicEnv(gym.Env):
             return np.random.choice(self.HARMONIC_FRETS)
     
     def _get_observation(self) -> np.ndarray:
-        """Construct observation vector."""
-        # One-hot encode target fret
+        """Construct observation vector (14-dim)."""
+        # One-hot encode target fret (frets 4, 5, 7)
         target_one_hot = np.zeros(3, dtype=np.float32)
         fret_idx = self.HARMONIC_FRETS.index(self.target_fret)
         target_one_hot[fret_idx] = 1.0
+        
+        # One-hot encode active string (strings 0, 2, 4)
+        string_one_hot = np.zeros(3, dtype=np.float32)
+        string_one_hot[PLAYABLE_STRINGS.index(self.string_index)] = 1.0
         
         # Current state (fret position and normalized torque)
         torque_normalized = self.current_torque / TORQUE_MAX
@@ -216,17 +238,19 @@ class HarmonicEnv(gym.Env):
             torque_history.insert(0, 0.0)
         
         fret_history = np.array(fret_history, dtype=np.float32)
-        # Normalize torque history
         torque_history = np.array(torque_history, dtype=np.float32) / TORQUE_MAX
         
-        # Concatenate all observations
-        obs = np.concatenate([target_one_hot, current_state, fret_history, torque_history])
+        # [target_fret_one_hot(3), string_one_hot(3), current_fret, current_torque_norm, fret_history(3), torque_history(3)]
+        obs = np.concatenate([target_one_hot, string_one_hot, current_state, fret_history, torque_history])
         
         return obs
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """Reset environment for new episode."""
         super().reset(seed=seed)
+        
+        # Sample active string for this episode
+        self.string_index = int(np.random.choice(self.string_indices))
         
         # Select target fret
         self.target_fret = self._get_target_fret()
@@ -247,7 +271,7 @@ class HarmonicEnv(gym.Env):
             'episode': self.episode_count,
         }
         
-        logger.debug(f"Episode {self.episode_count} reset: target_fret={self.target_fret}")
+        logger.debug(f"Episode {self.episode_count} reset: target_fret={self.target_fret}, string={self.string_index}")
         
         return obs, info
     
@@ -301,18 +325,21 @@ class HarmonicEnv(gym.Env):
         filter_reason = reward_info.get('filter_reason', '')
         cls = reward_info.get('classification')
 
+        step_header = (
+            f"Step {self.current_step + 1}/{self.max_steps} | "
+            f"str={self.string_index} target={self.target_fret} "
+            f"fret={fret_position:.2f} torque={torque:.0f}"
+        )
         if filtered:
             logger.info(
-                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
-                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"\n  {step_header}\n"
                 f"    FILTERED: {filter_reason}\n"
                 f"    reward={reward:+.3f}"
             )
         elif cls is not None:
             label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
             logger.info(
-                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
-                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"\n  {step_header}\n"
                 f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
                 f"D={cls.get('dead_note_prob', 0):.3f}  G={cls.get('general_note_prob', 0):.3f}\n"
                 f"    reward={reward:+.3f}  "
@@ -322,8 +349,7 @@ class HarmonicEnv(gym.Env):
             )
         else:
             logger.info(
-                f"\n  Step {self.current_step + 1}/{self.max_steps} | "
-                f"target={self.target_fret} fret={fret_position:.2f} torque={torque:.0f}\n"
+                f"\n  {step_header}\n"
                 f"    no classification | reward={reward:+.3f}"
             )
         
@@ -357,6 +383,7 @@ class HarmonicEnv(gym.Env):
         # Build info dict
         info = {
             'target_fret': self.target_fret,
+            'string_index': self.string_index,
             'fret_position': fret_position,
             'slider_mm': rl_action.slider_mm,
             'torque': torque,

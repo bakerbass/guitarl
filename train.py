@@ -91,12 +91,13 @@ class HarmonicProgressCallback(CallbackList):
         return True
 
 
-def make_env(model_path: str, curriculum_mode: str, string_index: int = 2,
+def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett"):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
         string_index=string_index,
+        string_indices=string_indices,
         osc_port=osc_port,
         audio_device=audio_device,
         curriculum_mode=curriculum_mode,
@@ -128,12 +129,16 @@ def train(args):
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     
+    # Resolve string pool: --string-indices takes precedence, else fall back to --string-index
+    string_indices = args.string_indices if args.string_indices else [args.string_index]
+    logger.info(f"String pool: {string_indices}")
+    
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
         model_path=args.model_path,
         curriculum_mode=args.curriculum,
-        string_index=args.string_index,
+        string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device
     )
@@ -142,7 +147,7 @@ def train(args):
     eval_env = make_env(
         model_path=args.model_path,
         curriculum_mode="random",  # Evaluate on all frets
-        string_index=args.string_index,
+        string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device
     )
@@ -253,7 +258,14 @@ def main():
     # Environment arguments
     parser.add_argument('--model-path', required=True, help='Path to HarmonicsClassifier model')
     parser.add_argument('--string-index', type=int, default=2,
-                        help='String to train on (0, 2, or 4 — must have plucker; default: 2=D)')
+                        help='Single string to train on (0, 2, or 4 — must have plucker; default: 2=D). '
+                             'Ignored when --string-indices is provided.')
+    parser.add_argument('--string-indices', type=int, nargs='+', default=None,
+                        metavar='S',
+                        help='One or more strings to rotate across episodes (e.g. --string-indices 0 2 4). '
+                             'Each reset() samples uniformly, distributing motor wear while keeping '
+                             'the policy string-aware via a 3-element one-hot in the observation. '
+                             'Overrides --string-index when provided.')
     parser.add_argument('--osc-port', type=int, default=12000,
                         help='OSC port (default: 12000 for GuitarBot, 8000 for StringSim)')
     parser.add_argument('--audio-device', type=str, default='Scarlett',
