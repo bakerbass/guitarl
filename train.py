@@ -217,6 +217,32 @@ def train(args):
         logger.info("Model saved")
     
     finally:
+        # NOTE: /Reset is NOT sent automatically on exit.
+        # Sending /Reset while the robot is executing a trajectory can cause a
+        # mechanical malfunction (both threads call RobotController.main() at
+        # the same time, corrupting the UDP stream).
+        #
+        # The GuitarBot's arm_list_recieverNN.py now serialises all robot calls
+        # through a robot_lock, so a /Reset sent after Ctrl+C will wait for the
+        # current trajectory to finish before executing — but only send it if
+        # you are certain the robot has finished its last action.
+        #
+        # Pass --reset-on-exit to request a reset after training stops.
+        if args.reset_on_exit:
+            logger.info("Sending /Reset (--reset-on-exit requested)...")
+            logger.info("The reset will be queued behind any active trajectory on the robot.")
+            # Unwrap Monitor wrapper to access the underlying HarmonicEnv
+            base_env = env.env if hasattr(env, 'env') else env
+            if hasattr(base_env, 'osc_client'):
+                base_env.osc_client.reset(wait_time=0.5)
+                logger.info("/Reset sent.")
+        else:
+            logger.info(
+                "Robot holds its last position. "
+                "Send /Reset manually from arm_list_recieverNN.py when safe, "
+                "or restart training with --reset-on-exit."
+            )
+        
         env.close()
         eval_env.close()
 
@@ -249,6 +275,15 @@ def main():
     parser.add_argument('--output-dir', type=str, default='./runs', help='Output directory')
     parser.add_argument('--checkpoint-freq', type=int, default=5000, help='Checkpoint frequency')
     parser.add_argument('--eval-freq', type=int, default=2000, help='Evaluation frequency')
+    
+    # Robot safety
+    parser.add_argument('--reset-on-exit', action='store_true', default=True,
+                        help='Send /Reset to GuitarBot when training stops. '
+                             'Only use this when you are certain no trajectory is '
+                             'actively running on the robot — the GuitarBot '
+                             'serialises the reset behind any active trajectory, '
+                             'but premature resets can still cause mechanical issues. '
+                             'Default: ON (robot resets on exit).')
     
     # Device
     parser.add_argument('--device', type=str, default='auto',
