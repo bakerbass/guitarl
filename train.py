@@ -249,7 +249,7 @@ def train(args):
             )
         
         env.close()
-        eval_env.close()
+        eval_env.close()  # eval_env is a separate HarmonicEnv instance — closing both is intentional
 
 
 def main():
