@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 import logging
 import sys
@@ -130,6 +131,12 @@ def train(args):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
         output_dir.mkdir(parents=True, exist_ok=True)
+        # Persist args so --resume can restore them automatically
+        args_file = output_dir / "run_args.json"
+        saved_args = {k: v for k, v in vars(args).items()
+                      if k not in ('resume', 'resume_checkpoint')}
+        args_file.write_text(json.dumps(saved_args, indent=2))
+        logger.info(f"Run args saved to {args_file}")
     
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -200,7 +207,7 @@ def train(args):
         if args.resume_checkpoint:
             model_file = Path(args.resume_checkpoint)
         elif (output_dir / "interrupted_model.zip").exists():
-            model_file = output_dir / "interrupted_model"
+            model_file = output_dir / "interrupted_model.zip"
         else:
             model_file = _latest_checkpoint(checkpoint_dir)
 
@@ -211,7 +218,7 @@ def train(args):
         logger.info(f"Loading weights from: {model_file}")
         model = SAC.load(model_file, env=env, device=args.device)
 
-        buffer_file = Path(str(model_file) + "_replay_buffer.pkl")
+        buffer_file = Path(str(model_file.with_suffix('') if model_file.suffix == '.zip' else model_file) + "_replay_buffer.pkl")
         if buffer_file.exists():
             logger.info(f"Loading replay buffer from: {buffer_file}")
             model.load_replay_buffer(buffer_file)
@@ -249,16 +256,35 @@ def train(args):
     callbacks = CallbackList([checkpoint_callback, eval_callback, progress_callback])
     
     # Train
-    logger.info(f"Starting training for {args.total_timesteps} timesteps...")
+    # When resuming, treat --total-timesteps as an absolute ceiling rather than
+    # additional steps.  SB3's reset_num_timesteps=False internally does
+    # `total_timesteps += self.num_timesteps`, which would add the requested
+    # count ON TOP of the already-elapsed steps.  Instead we pass only the
+    # remaining budget so the ceiling stays absolute.
+    elapsed = model.num_timesteps if args.resume else 0
+    remaining_timesteps = max(0, args.total_timesteps - elapsed)
+    if args.resume:
+        logger.info(
+            f"Resuming from step {elapsed} — "
+            f"{remaining_timesteps} steps remaining to reach {args.total_timesteps} total."
+        )
+    logger.info(f"Starting training for {remaining_timesteps} timesteps...")
     logger.info(f"Device: {args.device}")
     
+    if args.resume and remaining_timesteps <= 0:
+        logger.warning(
+            f"Run already reached {elapsed} steps (ceiling: {args.total_timesteps}). "
+            "Pass a higher --total-timesteps to continue training."
+        )
+        return
+
     try:
         model.learn(
-            total_timesteps=args.total_timesteps,
+            total_timesteps=remaining_timesteps,
             callback=callbacks,
             log_interval=10,
             progress_bar=True,
-            reset_num_timesteps=not args.resume,  # preserve timestep counter when resuming
+            reset_num_timesteps=False,  # always False: preserve step counter & TB logs
         )
         
         # Save final model
@@ -271,6 +297,17 @@ def train(args):
         model.save(output_dir / "interrupted_model")
         model.save_replay_buffer(output_dir / "interrupted_model_replay_buffer")
         logger.info("Model and replay buffer saved")
+    
+    except Exception as exc:
+        # Robot errors, OSC failures, etc. — save whatever we have before propagating
+        logger.error(f"Training aborted by exception: {exc}")
+        try:
+            model.save(output_dir / "interrupted_model")
+            model.save_replay_buffer(output_dir / "interrupted_model_replay_buffer")
+            logger.info("Emergency save complete — run can be resumed with --resume")
+        except Exception as save_exc:
+            logger.error(f"Emergency save also failed: {save_exc}")
+        raise
     
     finally:
         # NOTE: /Reset is NOT sent automatically on exit.
@@ -369,6 +406,22 @@ def main():
                         choices=['auto', 'cuda', 'cpu'],
                         help='Device to use for training')
     
+    # First pass: if --resume is given and a run_args.json exists, load those
+    # values as parser defaults so the run reproduces itself automatically.
+    # Any arg explicitly supplied on the CLI still overrides the saved value.
+    pre_args, _ = parser.parse_known_args()
+    if pre_args.resume:
+        args_file = Path(pre_args.resume) / "run_args.json"
+        if args_file.exists():
+            saved = json.loads(args_file.read_text())
+            # Session-specific keys must always come from the CLI
+            for key in ('resume', 'resume_checkpoint', 'output_dir'):
+                saved.pop(key, None)
+            parser.set_defaults(**saved)
+            logger.info(f"Loaded saved run args from {args_file}")
+        else:
+            logger.warning(f"No run_args.json in {pre_args.resume} — using CLI args only.")
+
     args = parser.parse_args()
     
     # Check model exists

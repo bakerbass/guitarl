@@ -119,7 +119,7 @@ unambiguous signal to avoid degenerate regions of the action space.
 |-------|-----------|-----------|
 | Torque too high | > 350 | Harmonics require a light touch; heavy fretting damps the partial |
 | Torque too low | < 15 | Presser below the microcontroller's safety dead-zone |
-| Fret too far | > 3 frets from target | Outside any plausible harmonic neighbourhood |
+| Fret too far | > 3 frets from nearest harmonic node | Not near any harmonic position |
 
 **Filtration penalty**: −1.0 (constant, independent of how far outside limits the action is).
 
@@ -135,8 +135,13 @@ $$r = 0.6 \cdot r_\text{audio} + 0.2 \cdot r_\text{fret} + 0.2 \cdot r_\text{tor
 | Component | Formula | Range | Purpose |
 |-----------|---------|-------|---------|
 | $r_\text{audio}$ | `harmonic_prob` from CNN | [0, 1] | Does it *sound* like a harmonic? |
-| $r_\text{fret}$ | $\exp\!\left(-\dfrac{e_f^2}{2 \cdot 0.35^2}\right)$ | [0, 1] | Gaussian centred on target fret (σ = 0.35) |
+| $r_\text{fret}$ | $\exp\!\left(-\dfrac{d_\text{nearest}^2}{2 \cdot 0.35^2}\right)$ | [0, 1] | Gaussian centred on the **nearest harmonic node** (σ = 0.35) |
 | $r_\text{torque}$ | $2\exp\!\left(-\dfrac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal presser value 30 (σ = 75) |
+
+where $d_\text{nearest} = \min_{h \in \{4,5,7,9\}} |f - h|$.
+Being on fret 4 scores full fret reward regardless of the episode target —
+all harmonic nodes are physically valid positions.  The target fret guides the
+agent through the observation one-hot and curriculum, not through per-step penalisation.
 
 - Optimal presser target: **30** encoder units (light touch for harmonics)
 - **Success bonus**: +1.0 added when `harmonic_prob > 0.8`; episode terminates early
@@ -221,21 +226,29 @@ python train.py \
 
 ### Resuming an Interrupted Run
 
-The `KeyboardInterrupt` handler saves both the model weights and the SAC
-replay buffer.  Periodic checkpoints also include the buffer
-(`save_replay_buffer=True`).  To resume:
+On `KeyboardInterrupt` **or** an unhandled exception (e.g. a robot error),
+`train.py` saves `interrupted_model.zip` and `interrupted_model_replay_buffer.pkl`
+directly into the run directory root — **not** in `checkpoints/`.
+Periodic checkpoints save to `checkpoints/` only when `--checkpoint-freq` steps
+are reached (default 5000); short runs may have nothing there.
+
+To resume, point `--resume` at the run directory:
 
 ```bash
-# Auto-selects interrupted_model, or latest checkpoint
+# Automatic: finds interrupted_model.zip, or the latest checkpoint
 python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
-    --resume ./runs/harmonic_sac_20260218_134500
+    --resume ./runs/harmonic_sac_20260218_150711
+```
 
-# Resume from a specific checkpoint
+`--resume-checkpoint` is only needed when you want a specific checkpoint file
+(without `.zip` extension), overriding the automatic selection:
+
+```bash
 python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
-    --resume ./runs/harmonic_sac_20260218_134500 \
-    --resume-checkpoint ./runs/harmonic_sac_20260218_134500/checkpoints/harmonic_sac_5000_steps
+    --resume ./runs/harmonic_sac_20260218_150711 \
+    --resume-checkpoint ./runs/harmonic_sac_20260218_150711/checkpoints/harmonic_sac_5000_steps
 ```
 
 `reset_num_timesteps=False` is passed to SB3 so the internal timestep counter

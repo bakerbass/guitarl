@@ -98,12 +98,14 @@ def compute_filtration(
             'penalty': FILTRATION_PENALTY,
         }
 
-    # Check: fret way too far from target
-    fret_error = abs(fret_position - float(target_fret))
-    if fret_error > FRET_MAX_ERROR:
+    # Check: fret too far from every harmonic node.
+    # Uses nearest-node distance so landing on any valid harmonic (e.g. fret 4
+    # while targeting 7) is not penalised — only truly off-node positions are gated.
+    nearest_err = min(abs(fret_position - float(h)) for h in HARMONIC_FRETS)
+    if nearest_err > FRET_MAX_ERROR:
         return {
             'passed': False,
-            'reason': f'fret_too_far ({fret_position:.2f}, err={fret_error:.2f} > {FRET_MAX_ERROR})',
+            'reason': f'fret_too_far ({fret_position:.2f}, nearest_harmonic_err={nearest_err:.2f} > {FRET_MAX_ERROR})',
             'penalty': FILTRATION_PENALTY,
         }
 
@@ -122,13 +124,17 @@ def compute_audio_reward(
     Classifier-based reward, only called when the filtration layer passes.
 
     Reward = w_audio * harmonic_prob
-           + w_fret  * exp(-fret_error² / 2σ_fret²)
+           + w_fret  * exp(-nearest_harmonic_err² / 2σ_fret²)
            + w_torque* (2·exp(-torque_error² / 2σ_torque²) - 1)
+
+    fret_error is the distance to the NEAREST harmonic node, not the target fret.
+    All harmonic nodes are valid positions; the target guides the agent through
+    the observation one-hot and curriculum rather than per-step penalisation.
 
     Args:
         fret_position: Fractional fret position the agent chose (0.0 – 9.0)
         torque:        Presser torque the agent chose
-        target_fret:   Target harmonic fret (4, 5, or 7)
+        target_fret:   Target harmonic fret — passed for context only
         harmonic_prob: Probability of 'harmonic' class from classifier
 
     Returns:
@@ -137,8 +143,10 @@ def compute_audio_reward(
     # Audio reward: harmonic probability straight from classifier
     audio_reward = float(harmonic_prob)
 
-    # Fret shaping: Gaussian centred on target fret
-    fret_error = abs(fret_position - float(target_fret))
+    # Fret shaping: Gaussian centred on the nearest harmonic node.
+    # Being on fret 4 scores full fret reward regardless of target fret —
+    # all harmonic nodes are valid; specific target guidance comes from the obs one-hot.
+    fret_error = min(abs(fret_position - float(h)) for h in HARMONIC_FRETS)
     fret_reward = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
 
     # Torque shaping: shifted Gaussian, range [-1, +1]
@@ -196,7 +204,7 @@ def compute_reward(
             'audio_reward':      0.0,
             'fret_reward':       0.0,
             'torque_reward':     0.0,
-            'fret_error':        abs(fret_position - float(target_fret)),
+            'fret_error':        min(abs(fret_position - float(h)) for h in HARMONIC_FRETS),
             'torque_error':      abs(torque - TORQUE_OPTIMAL_HARMONIC),
             'target_fret':       target_fret,
             'filtered':          True,
@@ -281,14 +289,14 @@ def compute_reward_no_audio(
             'audio_reward':  0.0,
             'fret_reward':   0.0,
             'torque_reward': 0.0,
-            'fret_error':    abs(fret_position - float(target_fret)),
+            'fret_error':    min(abs(fret_position - float(h)) for h in HARMONIC_FRETS),
             'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
             'target_fret':   target_fret,
             'filtered':      True,
             'filter_reason': filt['reason'],
         }
 
-    fret_error    = abs(fret_position - float(target_fret))
+    fret_error    = min(abs(fret_position - float(h)) for h in HARMONIC_FRETS)
     fret_reward   = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
     torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
     torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
