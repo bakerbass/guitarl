@@ -7,7 +7,6 @@ Usage:
 """
 
 import argparse
-import json
 from pathlib import Path
 import logging
 import sys
@@ -92,9 +91,9 @@ class HarmonicProgressCallback(CallbackList):
         return True
 
 
-def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_index: int = 2,
+def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
-             reward_mode: str = 'full'):
+             reward_mode: str = 'full', offline: bool = False):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -106,6 +105,7 @@ def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_
         max_steps=10,
         success_threshold=0.8,
         reward_mode=reward_mode,
+        offline=offline,
     )
     env = Monitor(env)
     return env
@@ -116,6 +116,8 @@ def train(args):
     logger.info("=" * 60)
     logger.info("Starting harmonic RL training")
     logger.info("=" * 60)
+    logger.info(f"CUDA available: {torch.cuda.is_available()}" +
+                (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
     
     # ── Output directory ──────────────────────────────────────────────
     # When resuming, reuse the existing run directory so logs/checkpoints
@@ -131,12 +133,6 @@ def train(args):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
         output_dir.mkdir(parents=True, exist_ok=True)
-        # Persist args so --resume can restore them automatically
-        args_file = output_dir / "run_args.json"
-        saved_args = {k: v for k, v in vars(args).items()
-                      if k not in ('resume', 'resume_checkpoint')}
-        args_file.write_text(json.dumps(saved_args, indent=2))
-        logger.info(f"Run args saved to {args_file}")
     
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
@@ -148,11 +144,22 @@ def train(args):
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     logger.info(f"Reward mode: {args.reward_mode}")
-    
+
+    if args.pretrain:
+        logger.info(
+            "*** OFFLINE PRE-TRAINING MODE ***\n"
+            "  - No robot or audio hardware required.\n"
+            "  - Reward = filtration layer only (fret + torque shaping).\n"
+            "  - Fret shaping uses wide Gaussian (σ=1.5 frets) for full-neck gradients.\n"
+            "  - Steps are instant (no physics wait).\n"
+            "  - TIP: use --ent-coef 0.1 (or higher) to prevent policy entropy collapse.\n"
+            "  - Resume on the robot with:  --resume <this run dir>  --clear-buffer  (without --pretrain)"
+        )
+
     # Resolve string pool: --string-indices takes precedence, else fall back to --string-index
     string_indices = args.string_indices if args.string_indices else [args.string_index]
     logger.info(f"String pool: {string_indices}")
-    
+
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
@@ -162,8 +169,9 @@ def train(args):
         osc_port=args.osc_port,
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
+        offline=args.pretrain,
     )
-    
+
     # Create evaluation environment
     eval_env = make_env(
         model_path=args.model_path,
@@ -172,6 +180,7 @@ def train(args):
         osc_port=args.osc_port,
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
+        offline=args.pretrain,
     )
     
     # Configure SAC agent
@@ -180,6 +189,13 @@ def train(args):
         net_arch=[256, 256],  # Hidden layers
     )
     
+    # Parse ent_coef: allow float or the string 'auto' / 'auto_X.X'
+    ent_coef = args.ent_coef
+    try:
+        ent_coef = float(ent_coef)
+    except ValueError:
+        pass  # keep as string ('auto' or 'auto_X.X')
+
     model = SAC(
         "MlpPolicy",
         env,
@@ -191,11 +207,14 @@ def train(args):
         gamma=args.gamma,
         train_freq=1,
         gradient_steps=1,
+        ent_coef=ent_coef,
         policy_kwargs=policy_kwargs,
         verbose=1,
         tensorboard_log=str(log_dir),
         device=args.device
     )
+    logger.info(f"Entropy coefficient: {ent_coef}"
+                + (" (auto-tuned)" if str(ent_coef).startswith("auto") else " (fixed)"))
     
     # ── Resume: load weights + replay buffer ──────────────────────────
     if args.resume:
@@ -207,7 +226,7 @@ def train(args):
         if args.resume_checkpoint:
             model_file = Path(args.resume_checkpoint)
         elif (output_dir / "interrupted_model.zip").exists():
-            model_file = output_dir / "interrupted_model.zip"
+            model_file = output_dir / "interrupted_model"
         else:
             model_file = _latest_checkpoint(checkpoint_dir)
 
@@ -218,8 +237,14 @@ def train(args):
         logger.info(f"Loading weights from: {model_file}")
         model = SAC.load(model_file, env=env, device=args.device)
 
-        buffer_file = Path(str(model_file.with_suffix('') if model_file.suffix == '.zip' else model_file) + "_replay_buffer.pkl")
-        if buffer_file.exists():
+        buffer_file = Path(str(model_file) + "_replay_buffer.pkl")
+        if args.clear_buffer:
+            logger.info(
+                "--clear-buffer set: skipping replay buffer load. "
+                "SAC will warm up with fresh transitions (useful when transitioning "
+                "from offline pre-training to online robot training)."
+            )
+        elif buffer_file.exists():
             logger.info(f"Loading replay buffer from: {buffer_file}")
             model.load_replay_buffer(buffer_file)
             logger.info(f"  Buffer size restored: {model.replay_buffer.size()} transitions")
@@ -256,35 +281,16 @@ def train(args):
     callbacks = CallbackList([checkpoint_callback, eval_callback, progress_callback])
     
     # Train
-    # When resuming, treat --total-timesteps as an absolute ceiling rather than
-    # additional steps.  SB3's reset_num_timesteps=False internally does
-    # `total_timesteps += self.num_timesteps`, which would add the requested
-    # count ON TOP of the already-elapsed steps.  Instead we pass only the
-    # remaining budget so the ceiling stays absolute.
-    elapsed = model.num_timesteps if args.resume else 0
-    remaining_timesteps = max(0, args.total_timesteps - elapsed)
-    if args.resume:
-        logger.info(
-            f"Resuming from step {elapsed} — "
-            f"{remaining_timesteps} steps remaining to reach {args.total_timesteps} total."
-        )
-    logger.info(f"Starting training for {remaining_timesteps} timesteps...")
+    logger.info(f"Starting training for {args.total_timesteps} timesteps...")
     logger.info(f"Device: {args.device}")
     
-    if args.resume and remaining_timesteps <= 0:
-        logger.warning(
-            f"Run already reached {elapsed} steps (ceiling: {args.total_timesteps}). "
-            "Pass a higher --total-timesteps to continue training."
-        )
-        return
-
     try:
         model.learn(
-            total_timesteps=remaining_timesteps,
+            total_timesteps=args.total_timesteps,
             callback=callbacks,
             log_interval=10,
             progress_bar=True,
-            reset_num_timesteps=False,  # always False: preserve step counter & TB logs
+            reset_num_timesteps=not args.resume,  # preserve timestep counter when resuming
         )
         
         # Save final model
@@ -298,19 +304,8 @@ def train(args):
         model.save_replay_buffer(output_dir / "interrupted_model_replay_buffer")
         logger.info("Model and replay buffer saved")
     
-    except Exception as exc:
-        # Robot errors, OSC failures, etc. — save whatever we have before propagating
-        logger.error(f"Training aborted by exception: {exc}")
-        try:
-            model.save(output_dir / "interrupted_model")
-            model.save_replay_buffer(output_dir / "interrupted_model_replay_buffer")
-            logger.info("Emergency save complete — run can be resumed with --resume")
-        except Exception as save_exc:
-            logger.error(f"Emergency save also failed: {save_exc}")
-        raise
-    
     finally:
-        # NOTE: /Reset is NOT sent automatically on exit.
+        # NOTE: /Reset is sent automatically on exit.
         # Sending /Reset while the robot is executing a trajectory can cause a
         # mechanical malfunction (both threads call RobotController.main() at
         # the same time, corrupting the UDP stream).
@@ -318,15 +313,16 @@ def train(args):
         # The GuitarBot's arm_list_recieverNN.py now serialises all robot calls
         # through a robot_lock, so a /Reset sent after Ctrl+C will wait for the
         # current trajectory to finish before executing — but only send it if
-        # you are certain the robot has finished its last action.
-        #
-        # Pass --reset-on-exit to request a reset after training stops.
-        if args.reset_on_exit:
+        # you are confident the robot has finished its last action.
+        
+        if args.pretrain:
+            logger.info("Offline pre-training complete. No robot reset needed.")
+        elif args.reset_on_exit:
             logger.info("Sending /Reset (--reset-on-exit requested)...")
             logger.info("The reset will be queued behind any active trajectory on the robot.")
             # Unwrap Monitor wrapper to access the underlying HarmonicEnv
             base_env = env.env if hasattr(env, 'env') else env
-            if hasattr(base_env, 'osc_client'):
+            if hasattr(base_env, 'osc_client') and base_env.osc_client is not None:
                 base_env.osc_client.reset(wait_time=0.5)
                 logger.info("/Reset sent.")
         else:
@@ -344,7 +340,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train harmonic RL agent')
     
     # Environment arguments
-    parser.add_argument('--model-path', required=True, help='Path to HarmonicsClassifier model')
+    parser.add_argument('--model-path', default=None,
+                        help='Path to HarmonicsClassifier model. '
+                             'Required for online training (default). '
+                             'Not needed when --pretrain is set.')
     parser.add_argument('--string-index', type=int, default=2,
                         help='Single string to train on (0, 2, or 4 — must have plucker; default: 2=D). '
                              'Ignored when --string-indices is provided.')
@@ -363,13 +362,19 @@ def main():
                         help='Curriculum learning mode')
     
     # Training arguments
-    parser.add_argument('--total-timesteps', type=int, default=10000, help='Total training timesteps')
+    parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
     parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--buffer-size', type=int, default=100000, help='Replay buffer size')
-    parser.add_argument('--learning-starts', type=int, default=50, help='Steps before learning starts')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
+    parser.add_argument('--learning-starts', type=int, default=500, help='Steps before learning starts')
+    parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
     parser.add_argument('--tau', type=float, default=0.005, help='Target network update rate')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--ent-coef', type=str, default='auto',
+                        help='SAC entropy coefficient. "auto" lets SAC tune it automatically. '
+                             'Set a fixed float (e.g. 0.5) to prevent policy entropy collapse '
+                             'during --pretrain — the auto-tuner can drive entropy too low when '
+                             'steps are instant, leaving the policy stuck at a point estimate. '
+                             'Recommended for --pretrain: 0.1 to 0.5  (default: auto)')
     
     # Logging arguments
     parser.add_argument('--output-dir', type=str, default='./runs', help='Output directory')
@@ -385,7 +390,20 @@ def main():
     parser.add_argument('--resume-checkpoint', type=str, default=None, metavar='CKPT',
                         help='Explicit checkpoint file to resume from (without .zip extension). '
                              'Overrides the automatic latest-checkpoint search within --resume.')
+    parser.add_argument('--clear-buffer', action='store_true', default=False,
+                        help='When resuming, discard the saved replay buffer and start fresh. '
+                             'Use this when transitioning from --pretrain to online robot '
+                             'training: the pre-train buffer contains no audio reward signal '
+                             'and can bias the policy away from harmonic-seeking behaviour.')
     
+    # Pre-training (offline, filtration-only)
+    parser.add_argument('--pretrain', action='store_true', default=False,
+                        help='Run in offline pre-training mode. No robot or audio hardware is '
+                             'needed. Reward comes from the filtration layer only '
+                             '(fret + torque shaping). Steps are instant — no physics wait. '
+                             'Save the resulting model and resume on the robot later with '
+                             '--resume <run-dir> (without --pretrain).')
+
     # Robot safety
     parser.add_argument('--reset-on-exit', action='store_true', default=True,
                         help='Send /Reset to GuitarBot when training stops. '
@@ -405,30 +423,32 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='Device to use for training')
-    
-    # First pass: if --resume is given and a run_args.json exists, load those
-    # values as parser defaults so the run reproduces itself automatically.
-    # Any arg explicitly supplied on the CLI still overrides the saved value.
-    pre_args, _ = parser.parse_known_args()
-    if pre_args.resume:
-        args_file = Path(pre_args.resume) / "run_args.json"
-        if args_file.exists():
-            saved = json.loads(args_file.read_text())
-            # Session-specific keys must always come from the CLI
-            for key in ('resume', 'resume_checkpoint', 'output_dir'):
-                saved.pop(key, None)
-            parser.set_defaults(**saved)
-            logger.info(f"Loaded saved run args from {args_file}")
-        else:
-            logger.warning(f"No run_args.json in {pre_args.resume} — using CLI args only.")
+
+    # Verbosity
+    parser.add_argument('--verbose', action='store_true', default=False,
+                        help='Enable per-step debug logging. In --pretrain mode steps are '
+                             'instant so this output is hidden by default to keep the '
+                             'terminal readable.')
 
     args = parser.parse_args()
-    
-    # Check model exists
-    if not Path(args.model_path).exists():
-        logger.error(f"Model not found: {args.model_path}")
-        sys.exit(1)
-    
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Validate model path (not required for offline pre-training)
+    if args.pretrain:
+        if args.model_path is not None and not Path(args.model_path).exists():
+            logger.error(f"Model not found: {args.model_path}")
+            sys.exit(1)
+    else:
+        if args.model_path is None:
+            logger.error("--model-path is required for online training. "
+                         "Use --pretrain to run without a robot/audio setup.")
+            sys.exit(1)
+        if not Path(args.model_path).exists():
+            logger.error(f"Model not found: {args.model_path}")
+            sys.exit(1)
+
     train(args)
 
 

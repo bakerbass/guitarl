@@ -119,7 +119,7 @@ unambiguous signal to avoid degenerate regions of the action space.
 |-------|-----------|-----------|
 | Torque too high | > 350 | Harmonics require a light touch; heavy fretting damps the partial |
 | Torque too low | < 15 | Presser below the microcontroller's safety dead-zone |
-| Fret too far | > 3 frets from nearest harmonic node | Not near any harmonic position |
+| Fret too far | > 3 frets from target | Outside any plausible harmonic neighbourhood |
 
 **Filtration penalty**: −1.0 (constant, independent of how far outside limits the action is).
 
@@ -135,15 +135,10 @@ $$r = 0.6 \cdot r_\text{audio} + 0.2 \cdot r_\text{fret} + 0.2 \cdot r_\text{tor
 | Component | Formula | Range | Purpose |
 |-----------|---------|-------|---------|
 | $r_\text{audio}$ | `harmonic_prob` from CNN | [0, 1] | Does it *sound* like a harmonic? |
-| $r_\text{fret}$ | $\exp\!\left(-\dfrac{d_\text{nearest}^2}{2 \cdot 0.35^2}\right)$ | [0, 1] | Gaussian centred on the **nearest harmonic node** (σ = 0.35) |
+| $r_\text{fret}$ | $\exp\!\left(-\dfrac{e_f^2}{2 \cdot 0.35^2}\right)$ | [0, 1] | Gaussian centred on target fret (σ = 0.35) |
 | $r_\text{torque}$ | $2\exp\!\left(-\dfrac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal presser value 30 (σ = 75) |
 
-where $d_\text{nearest} = \min_{h \in \{4,5,7,9\}} |f - h|$.
-Being on fret 4 scores full fret reward regardless of the episode target —
-all harmonic nodes are physically valid positions.  The target fret guides the
-agent through the observation one-hot and curriculum, not through per-step penalisation.
-
-- Optimal presser target: **30** encoder units (light touch for harmonics)
+- Optimal presser target: **70** encoder units (light touch for harmonics)
 - **Success bonus**: +1.0 added when `harmonic_prob > 0.8`; episode terminates early
 
 ---
@@ -226,29 +221,21 @@ python train.py \
 
 ### Resuming an Interrupted Run
 
-On `KeyboardInterrupt` **or** an unhandled exception (e.g. a robot error),
-`train.py` saves `interrupted_model.zip` and `interrupted_model_replay_buffer.pkl`
-directly into the run directory root — **not** in `checkpoints/`.
-Periodic checkpoints save to `checkpoints/` only when `--checkpoint-freq` steps
-are reached (default 5000); short runs may have nothing there.
-
-To resume, point `--resume` at the run directory:
+The `KeyboardInterrupt` handler saves both the model weights and the SAC
+replay buffer.  Periodic checkpoints also include the buffer
+(`save_replay_buffer=True`).  To resume:
 
 ```bash
-# Automatic: finds interrupted_model.zip, or the latest checkpoint
+# Auto-selects interrupted_model, or latest checkpoint
 python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
-    --resume ./runs/harmonic_sac_20260218_150711
-```
+    --resume ./runs/harmonic_sac_20260218_134500
 
-`--resume-checkpoint` is only needed when you want a specific checkpoint file
-(without `.zip` extension), overriding the automatic selection:
-
-```bash
+# Resume from a specific checkpoint
 python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
-    --resume ./runs/harmonic_sac_20260218_150711 \
-    --resume-checkpoint ./runs/harmonic_sac_20260218_150711/checkpoints/harmonic_sac_5000_steps
+    --resume ./runs/harmonic_sac_20260218_134500 \
+    --resume-checkpoint ./runs/harmonic_sac_20260218_134500/checkpoints/harmonic_sac_5000_steps
 ```
 
 `reset_num_timesteps=False` is passed to SB3 so the internal timestep counter
@@ -295,3 +282,137 @@ tensorboard --logdir runs/harmonic_sac_TIMESTAMP/logs
 Per-step console output shows string index, target fret, commanded fret,
 presser value, classifier probabilities (H / D / G), reward decomposition,
 and filtration status when Layer 1 rejects an action.
+
+---
+
+## Offline Pre-Training vs. Robot Training
+
+### Why pre-train offline?
+
+The physical robot is slow: each step takes ~2–3 s of audio capture and OSC
+round-trips.  Offline pre-training skips the robot entirely — steps are
+instant — so the policy can learn **which fret positions and presser values
+are physically plausible** before the first real string is touched.
+
+Offline reward uses only the **physics filtration layer** (Layer 1) with a
+wider fret Gaussian (σ = 1.5 frets instead of 0.35) so the agent receives
+a useful gradient signal across the whole fret range, not just within ±0.35
+of the target node.
+
+---
+
+### Step 1 — Offline pre-training (no robot, no audio)
+
+```bash
+# Recommended starting point
+python train.py \
+    --pretrain \
+    --ent-coef 0.1 \
+    --curriculum easy_to_hard \
+    --total-timesteps 200000
+
+# Multi-string, more exploration, verbose step logs
+python train.py \
+    --pretrain \
+    --ent-coef 0.3 \
+    --curriculum random \
+    --string-indices 0 2 4 \
+    --total-timesteps 300000 \
+    --verbose
+```
+
+**Key flags for pre-training**
+
+| Flag | Recommended value | Why |
+|------|-------------------|-----|
+| `--pretrain` | — | Disables OSC + audio; instant steps |
+| `--ent-coef` | `0.1` – `0.3` | Prevents SAC entropy collapse during fast offline steps; `auto` can drive policy std to ~0 |
+| `--curriculum` | `easy_to_hard` | Starts on fret 7 (strongest harmonic), then progressively harder targets |
+| `--total-timesteps` | `100k` – `300k` | Offline steps are free; run until fret and torque distributions converge |
+
+> **Watch out for policy collapse**: if `--ent-coef auto` is used during
+> pre-training, the very fast step rate can cause the SAC entropy tuner to
+> over-shrink policy standard deviation.  Use a fixed value like `0.1` and
+> increase to `0.3` if exploration is insufficient.
+
+---
+
+### Step 2 — Inspect the pre-trained policy
+
+Use `query.py` to verify the policy is exploring a reasonable range before
+deploying on hardware.  With a healthy pre-trained model, stochastic samples
+should vary across the expected fret neighbourhood.
+
+```bash
+# Single deterministic action
+python query.py \
+    --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
+    --target-fret 7 --string 2
+
+# 10 stochastic samples — check variance across fret and torque
+python query.py \
+    --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
+    --target-fret 7 --string 2 \
+    --num-actions 10 --stochastic
+```
+
+Expected healthy output (varied fret, torque near 70):
+
+```
+  #    fret  torque      mm  harmonic
+  ---  ------  ------  ------  --------
+    1   6.821      64   179.4  -
+    2   7.134      71   188.6  YES
+    3   7.058      68   186.8  YES
+    4   6.654      58   175.2  -
+    5   7.203      77   190.2  YES
+```
+
+If all rows are identical (policy collapse), re-run pre-training with a
+higher `--ent-coef`.
+
+---
+
+### Step 3 — Transition to robot training
+
+Resume from the pre-trained checkpoint and pass `--clear-buffer` to discard
+the offline replay buffer.  Pre-train transitions carry **no audio signal**
+and will bias the critic if kept.
+
+```bash
+python train.py \
+    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --resume ./runs/harmonic_sac_TIMESTAMP \
+    --clear-buffer \
+    --ent-coef auto \
+    --curriculum easy_to_hard \
+    --total-timesteps 50000
+```
+
+| Flag | Why |
+|------|-----|
+| `--resume` | Loads pre-trained weights + (discarded) buffer |
+| `--clear-buffer` | Prevents offline (no-audio) transitions from biasing the online critic |
+| `--ent-coef auto` | Let SAC self-tune entropy once audio reward provides richer signal |
+| `--total-timesteps` | Real-robot budget is scarcer; start small and extend if needed |
+
+> **`--clear-buffer` is important.** Without it, the replay buffer is filled
+> with transitions that have `audio_reward = 0` by construction, which will
+> suppress the agent's weight on audio even once the real classifier starts
+> providing signal.
+
+---
+
+### Summary: recommended workflow
+
+```
+1. Offline pre-train (fast, no hardware)
+   python train.py --pretrain --ent-coef 0.1 --curriculum easy_to_hard --total-timesteps 200000
+
+2. Verify policy quality
+   python query.py --model runs/.../best_model/best_model.zip --num-actions 10 --stochastic
+
+3. Deploy on robot (resume + clear buffer)
+   python train.py --model-path ../HarmonicsClassifier/models/best_model.pt \
+       --resume runs/harmonic_sac_TIMESTAMP --clear-buffer --ent-coef auto
+```
