@@ -16,7 +16,7 @@ import numpy as np
 import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import (
-    CheckpointCallback, EvalCallback, CallbackList
+    BaseCallback, CheckpointCallback, EvalCallback, CallbackList
 )
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
@@ -90,6 +90,129 @@ class HarmonicProgressCallback(CallbackList):
         
         return True
 
+
+# ---------------------------------------------------------------------------
+# Slow-mode audio plot callback
+# ---------------------------------------------------------------------------
+
+def _plot_episode_audio(audio: np.ndarray, reward_info: dict, rl_action,
+                        episode_num: int, model_sr: int = 22050,
+                        capture_duration: float = 2.0) -> None:
+    """Plot waveform + mel spectrogram for one episode step (blocking)."""
+    import matplotlib.pyplot as plt
+    import librosa
+
+    cls = reward_info.get('classification') or {}
+    label = cls.get('predicted_label', 'unknown')
+    h_prob = cls.get('harmonic_prob', 0.0)
+    d_prob = cls.get('dead_prob', 0.0)
+    g_prob = cls.get('general_prob', 0.0)
+    confidence = cls.get('confidence', 0.0)
+    reward = reward_info.get('total_reward', 0.0)
+
+    # Mel spectrogram
+    mel = librosa.feature.melspectrogram(
+        y=audio.astype(np.float32), sr=model_sr,
+        n_mels=128, n_fft=2048, hop_length=512,
+        fmin=80, fmax=8000,
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+    action_str = (
+        f'String {rl_action.string_idx}  '
+        f'Fret {rl_action.fret_position:.2f}  '
+        f'Torque {rl_action.torque:.0f}'
+    )
+    fig.suptitle(f'Episode step {episode_num}  |  {action_str}', fontsize=11, fontweight='bold')
+
+    # Waveform
+    t = np.arange(len(audio)) / model_sr
+    axes[0].plot(t, audio, linewidth=0.5)
+    axes[0].set_xlabel('Time (s)')
+    axes[0].set_ylabel('Amplitude')
+    reward_str = (
+        f'Reward: {reward:+.3f}  '
+        f'(audio={reward_info.get("audio_reward", 0):+.2f}  '
+        f'fret={reward_info.get("fret_reward", 0):+.2f}  '
+        f'torque={reward_info.get("torque_reward", 0):+.2f})'
+    )
+    axes[0].set_title(
+        f'Classified: {label.upper()} ({confidence*100:.1f}%)  '
+        f'H={h_prob:.3f}  D={d_prob:.3f}  G={g_prob:.3f}\n{reward_str}'
+    )
+    axes[0].grid(True, alpha=0.3)
+
+    # Mel spectrogram
+    img = axes[1].imshow(
+        mel_db, aspect='auto', origin='lower', cmap='viridis',
+        extent=[0, capture_duration, 0, 128],
+    )
+    axes[1].set_xlabel('Time (s)')
+    axes[1].set_ylabel('Mel Frequency Bin')
+    axes[1].set_title('Mel Spectrogram (dB)')
+    plt.colorbar(img, ax=axes[1], format='%+2.0f dB')
+
+    plt.tight_layout()
+    plt.show(block=True)   # Blocks — training pauses until the window is closed
+    plt.close(fig)
+
+
+class SlowModeCallback(BaseCallback):
+    """
+    When --slow is set, plot the waveform + mel spectrogram after every episode
+    step and block until the plot window is closed.  Lets you visually verify
+    that the classifier is hearing the note correctly before committing a long
+    training run.
+
+    Only activates on the *training* env (not the eval env) and only in online
+    (non-pretrain) mode.
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self._step_count = 0
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get('dones', [])
+        for i, done in enumerate(dones):
+            if not done:
+                continue
+            # Unwrap DummyVecEnv → Monitor → HarmonicEnv
+            try:
+                monitor_env = self.training_env.envs[i]
+                base_env = getattr(monitor_env, 'env', monitor_env)
+            except (AttributeError, IndexError):
+                continue
+
+            audio = getattr(base_env, 'last_audio', None)
+            rl_action = getattr(base_env, 'last_rl_action', None)
+            reward_info = getattr(base_env, 'last_reward_info', None)
+
+            if audio is None or rl_action is None or reward_info is None:
+                logger.warning('[slow] No audio data available for this episode — skipping plot.')
+                continue
+
+            self._step_count += 1
+            capture_dur = getattr(
+                getattr(base_env, 'reward_calc', None), 'capture_duration', 2.0
+            )
+            model_sr = getattr(
+                getattr(base_env, 'reward_calc', None), 'model_sr', 22050
+            )
+            _plot_episode_audio(
+                audio=audio,
+                reward_info=reward_info,
+                rl_action=rl_action,
+                episode_num=self._step_count,
+                model_sr=model_sr,
+                capture_duration=capture_dur,
+            )
+        return True
+
+
+# ---------------------------------------------------------------------------
 
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
@@ -277,8 +400,18 @@ def train(args):
     )
     
     progress_callback = HarmonicProgressCallback(verbose=1)
-    
-    callbacks = CallbackList([checkpoint_callback, eval_callback, progress_callback])
+
+    cb_list = [checkpoint_callback, eval_callback, progress_callback]
+    if args.slow and not args.pretrain:
+        cb_list.append(SlowModeCallback())
+        logger.info(
+            '[slow] Slow-mode enabled: training will pause after every episode to plot audio. '
+            'Close the plot window to continue.'
+        )
+    elif args.slow and args.pretrain:
+        logger.warning('[slow] --slow has no effect in --pretrain mode (no audio captured).')
+
+    callbacks = CallbackList(cb_list)
     
     # Train
     logger.info(f"Starting training for {args.total_timesteps} timesteps...")
@@ -423,6 +556,14 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='Device to use for training')
+
+    # Slow / debug
+    parser.add_argument('--slow', action='store_true', default=False,
+                        help='After every episode, pause training and display a plot of the '
+                             'captured audio waveform + mel spectrogram with classification '
+                             'results and reward breakdown. Close the plot window to continue. '
+                             'Use this to visually verify the classifier is hearing the note '
+                             'before committing to a long run. No-op in --pretrain mode.')
 
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,

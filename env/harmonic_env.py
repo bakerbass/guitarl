@@ -91,7 +91,8 @@ class HarmonicEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 3.0       # Time to wait after each action (seconds)
+    ACTION_DURATION = 3.0       # Total step duration (seconds)
+    CAPTURE_PRE_DELAY = 0.5     # Wait after send_rlfret before recording (robot arm movement + pluck)
     STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
     
     def __init__(self,
@@ -101,7 +102,7 @@ class HarmonicEnv(gym.Env):
                  osc_host: str = "127.0.0.1",
                  osc_port: int = 12000,
                  audio_device: str = "Scarlett",
-                 capture_duration: float = 0.8,
+                 capture_duration: float = 2.0,
                  max_steps: int = MAX_STEPS_PER_EPISODE,
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
@@ -223,6 +224,11 @@ class HarmonicEnv(gym.Env):
         # Curriculum learning state
         self.episode_count = 0
         self.curriculum_fret_idx = 0  # Start with easiest (fret 7)
+
+        # Last-step data exposed to callbacks (e.g. --slow plot mode in train.py)
+        self.last_audio: Optional[np.ndarray] = None
+        self.last_rl_action: Optional[object] = None
+        self.last_reward_info: Optional[dict] = None
         
         logger.info(f"HarmonicEnv initialized: strings={self.string_indices}, max_steps={max_steps}, "
                     f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}, "
@@ -388,19 +394,34 @@ class HarmonicEnv(gym.Env):
                     f"reward={reward:+.3f}"
                 )
         else:
-            # Online mode: send action to robot and wait for physics + audio.
+            # Online mode: send action to robot, capture audio while note rings,
+            # then wait out the rest of ACTION_DURATION before the next step.
             self.osc_client.send_rlfret(rl_action)
 
-            # Wait for physics to settle and sound to develop
-            time.sleep(self.ACTION_DURATION)
+            # Short pre-delay for the robot arm to physically move and pluck.
+            time.sleep(self.CAPTURE_PRE_DELAY)
 
-            # Capture audio and compute reward
+            # Capture audio now — the note is ringing.
+            audio = self.reward_calc.capture_audio()
+
+            # Wait out remaining ACTION_DURATION so total step time is unchanged.
+            remaining = self.ACTION_DURATION - self.CAPTURE_PRE_DELAY - self.reward_calc.capture_duration
+            if remaining > 0:
+                time.sleep(remaining)
+
+            # Compute reward with the already-captured audio (no second capture).
             reward_info = self.reward_calc.compute_reward(
                 fret_position=fret_position,
                 torque=torque,
                 target_fret=self.target_fret,
-                capture_audio=True,
+                capture_audio=False,
+                audio=audio,
             )
+
+            # Expose for --slow plot callback
+            self.last_audio = audio
+            self.last_rl_action = rl_action
+            self.last_reward_info = reward_info
 
             reward = reward_info['total_reward']
             filtered = reward_info.get('filtered', False)
@@ -418,7 +439,7 @@ class HarmonicEnv(gym.Env):
                 logger.info(
                     f"\n  {step_header}\n"
                     f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
-                    f"D={cls.get('dead_note_prob', 0):.3f}  G={cls.get('general_note_prob', 0):.3f}\n"
+                    f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
                     f"    reward={reward:+.3f}  "
                     f"(audio={reward_info['audio_reward']:+.3f}  "
                     f"fret={reward_info['fret_reward']:+.3f}  "

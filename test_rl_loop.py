@@ -404,6 +404,43 @@ class RLTestLoop:
                 print(f"\nWaiting {delay_between}s before next test...")
                 time.sleep(delay_between)
     
+    def run_baseline_tests(self, delay_between=4.0):
+        """
+        Run a fixed set of known-good actions to verify the classifier is working.
+
+        These actions are chosen because they reliably produce clear harmonics
+        on the physical robot.  If the classifier scores them poorly, the issue
+        is in the audio pipeline or the model — not the RL training.
+        """
+        # (string_idx, fret_position, torque)  — all known harmonic positions
+        BASELINE_ACTIONS = [
+            (2, 7.2,  60),   # String 2, fret 7 — perfect 12th, very light touch
+            (2, 7.3,  38),   # String 2, fret 7 — slightly lighter
+            (2, 7.2,  120),   # String 2, fret 7 — slightly heavier
+            (2, 5.3,  68),   # String 2, fret 5 — major 14th
+            (2, 4.2,  65),   # String 2, fret 4 — major 17th
+        ]
+
+        print(f"\n{'='*70}")
+        print(f"RUNNING {len(BASELINE_ACTIONS)} BASELINE (KNOWN-GOOD) TESTS")
+        print("These should all classify as HARMONIC if the pipeline is working.")
+        print(f"{'='*70}")
+
+        for i, (string_idx, fret, torque) in enumerate(BASELINE_ACTIONS):
+            print(f"\n--- Baseline {i+1}/{len(BASELINE_ACTIONS)}: "
+                  f"string={string_idx}  fret={fret}  torque={torque} ---")
+            action = RLFretAction(
+                string_idx=string_idx,
+                fret_position=fret,
+                press_action=PresserAction.PRESS,
+                torque=torque,
+            )
+            self.run_test(action)
+
+            if i < len(BASELINE_ACTIONS) - 1:
+                print(f"\nWaiting {delay_between}s before next test...")
+                time.sleep(delay_between)
+
     def print_summary(self):
         """Print summary statistics."""
         if not self.test_results:
@@ -528,7 +565,10 @@ def main():
     parser.add_argument('--delay', type=float, default=4.0, help='Delay between tests (seconds)')
     parser.add_argument('--no-plot', action='store_true',
                         help='Disable per-note plotting (plots shown by default)')
-    
+    parser.add_argument('--baseline', action='store_true',
+                        help='Run fixed known-good actions to verify the classifier pipeline '
+                             '(overrides --target-harmonic and --num-tests)')
+
     args = parser.parse_args()
     
     # Check model exists
@@ -562,7 +602,9 @@ def main():
     
     try:
         # Run tests
-        if args.target_harmonic:
+        if args.baseline:
+            test_loop.run_baseline_tests(args.delay)
+        elif args.target_harmonic:
             test_loop.run_harmonic_tests(args.num_tests, args.delay)
         else:
             test_loop.run_random_tests(args.num_tests, args.delay)
