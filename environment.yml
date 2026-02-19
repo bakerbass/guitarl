@@ -10,7 +10,7 @@ dependencies:
   
   # PyTorch with CUDA support
   - pytorch
-  # - pytorch-cuda=11.8
+  - pytorch-cuda=11.8
   - torchvision
   - torchaudio
   

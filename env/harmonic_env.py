@@ -40,7 +40,10 @@ if str(_parent_dir) not in sys.path:
     sys.path.insert(0, str(_parent_dir))
 
 from utils.audio_reward import HarmonicRewardCalculator
-from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO
+from utils.reward import (
+    REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
+    compute_reward_no_audio as _compute_reward_no_audio,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -91,7 +94,7 @@ class HarmonicEnv(gym.Env):
     STRING_SWITCH_WAIT = 10.0   # Seconds to pause after a /Reset between strings
     
     def __init__(self,
-                 model_path: str,
+                 model_path: Optional[str] = None,
                  string_index: int = 2,  # Default to D string — used when string_indices is None
                  string_indices=None,    # List of strings to rotate across (e.g. [0,2,4])
                  osc_host: str = "127.0.0.1",
@@ -103,12 +106,13 @@ class HarmonicEnv(gym.Env):
                  curriculum_mode: str = "random",
                  use_simple_action_space: bool = False,
                  always_press: bool = True,
-                 reward_mode: str = REWARD_MODE_FULL):
+                 reward_mode: str = REWARD_MODE_FULL,
+                 offline: bool = False):
         """
         Initialize HarmonicEnv.
-        
+
         Args:
-            model_path: Path to HarmonicsClassifier model
+            model_path: Path to HarmonicsClassifier model. Not required when offline=True.
             string_index: Fallback single string (0, 2, or 4). Ignored when string_indices is set.
             string_indices: List of strings to rotate across each episode (e.g. [0, 2, 4]).
                             Sampled uniformly at each reset(). Distributes motor wear while
@@ -124,8 +128,13 @@ class HarmonicEnv(gym.Env):
             use_simple_action_space: If True, use 3D continuous space instead of 5D
             always_press: If True, remove press_decision from action space (always PRESS)
             reward_mode: 'full', 'no_filtration', or 'no_audio' (see reward.py)
+            offline: If True, skip all robot/audio hardware. Reward comes from the
+                     filtration layer only (fret + torque shaping). Use for fast
+                     pre-training before deploying on the physical robot.
         """
         super().__init__()
+
+        self.offline = offline
         
         # Resolve string pool — validate every entry has a plucker
         if string_indices is not None:
@@ -148,17 +157,29 @@ class HarmonicEnv(gym.Env):
         
         # Initialize action space helper
         self.action_space_helper = GuitarBotActionSpace(use_normalized=True)
-        
-        # Initialize OSC client
-        self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)
-        
-        # Initialize reward calculator
-        self.reward_calc = HarmonicRewardCalculator(
-            model_path=model_path,
-            device_name=audio_device,
-            capture_duration=capture_duration,
-            reward_mode=reward_mode,
-        )
+
+        if self.offline:
+            # Offline pre-training: no robot, no audio hardware needed.
+            # Reward is computed purely from the filtration layer.
+            self.osc_client = None
+            self.reward_calc = None
+            logger.info(
+                "HarmonicEnv running in OFFLINE pre-training mode. "
+                "No robot or audio connection will be made. "
+                "Reward = filtration layer only (fret + torque shaping)."
+            )
+        else:
+            if model_path is None:
+                raise ValueError("model_path is required when offline=False")
+            # Initialize OSC client
+            self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)
+            # Initialize reward calculator
+            self.reward_calc = HarmonicRewardCalculator(
+                model_path=model_path,
+                device_name=audio_device,
+                capture_duration=capture_duration,
+                reward_mode=reward_mode,
+            )
         
         # Define action space dimensions
         # When always_press=True, press_decision is removed (always PRESS)
@@ -204,7 +225,7 @@ class HarmonicEnv(gym.Env):
         
         logger.info(f"HarmonicEnv initialized: strings={self.string_indices}, max_steps={max_steps}, "
                     f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}, "
-                    f"reward_mode={reward_mode}")
+                    f"reward_mode={reward_mode}, offline={offline}")
     
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
@@ -261,8 +282,11 @@ class HarmonicEnv(gym.Env):
         # Sample active string for this episode
         new_string_index = int(np.random.choice(self.string_indices))
         
-        # If the string changed, reset the robot and wait for it to home safely
-        if self._prev_string_index is not None and new_string_index != self._prev_string_index:
+        # If the string changed, reset the robot and wait for it to home safely.
+        # In offline mode there is no robot, so this is skipped entirely.
+        if (not self.offline
+                and self._prev_string_index is not None
+                and new_string_index != self._prev_string_index):
             logger.info(
                 f"String switch: {self._prev_string_index} -> {new_string_index}. "
                 f"Sending /Reset and waiting {self.STRING_SWITCH_WAIT:.0f}s..."
@@ -325,55 +349,82 @@ class HarmonicEnv(gym.Env):
         
         fret_position = rl_action.fret_position
         torque = rl_action.torque
-        
-        # Send action to StringSim via /rlfret
-        self.osc_client.send_rlfret(rl_action)
-        
-        # Wait for physics to settle and sound to develop
-        time.sleep(self.ACTION_DURATION)
-        
-        # Capture audio and compute reward
-        reward_info = self.reward_calc.compute_reward(
-            fret_position=fret_position,
-            torque=torque,
-            target_fret=self.target_fret,
-            capture_audio=True
-        )
-        
-        reward = reward_info['total_reward']
-        
-        # Log per-step classifier results
-        filtered = reward_info.get('filtered', False)
-        filter_reason = reward_info.get('filter_reason', '')
-        cls = reward_info.get('classification')
 
         step_header = (
             f"Step {self.current_step + 1}/{self.max_steps} | "
             f"str={self.string_index} target={self.target_fret} "
             f"fret={fret_position:.2f} torque={torque:.0f}"
         )
-        if filtered:
-            logger.info(
-                f"\n  {step_header}\n"
-                f"    FILTERED: {filter_reason}\n"
-                f"    reward={reward:+.3f}"
+
+        if self.offline:
+            # Offline pre-training: compute reward from filtration layer only.
+            # No robot command, no physics wait, no audio capture.
+            reward_info = _compute_reward_no_audio(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=self.target_fret,
             )
-        elif cls is not None:
-            label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
-            logger.info(
-                f"\n  {step_header}\n"
-                f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
-                f"D={cls.get('dead_note_prob', 0):.3f}  G={cls.get('general_note_prob', 0):.3f}\n"
-                f"    reward={reward:+.3f}  "
-                f"(audio={reward_info['audio_reward']:+.3f}  "
-                f"fret={reward_info['fret_reward']:+.3f}  "
-                f"torque={reward_info['torque_reward']:+.3f})"
-            )
+            reward_info['classification'] = None
+            reward_info['audio_rms'] = None
+
+            reward = reward_info['total_reward']
+            filtered = reward_info.get('filtered', False)
+            filter_reason = reward_info.get('filter_reason', '')
+            if filtered:
+                logger.debug(
+                    f"\n  {step_header} [offline]\n"
+                    f"    FILTERED: {filter_reason}\n"
+                    f"    reward={reward:+.3f}"
+                )
+            else:
+                logger.debug(
+                    f"\n  {step_header} [offline]\n"
+                    f"    fret={reward_info['fret_reward']:+.3f}  "
+                    f"torque={reward_info['torque_reward']:+.3f}  "
+                    f"reward={reward:+.3f}"
+                )
         else:
-            logger.info(
-                f"\n  {step_header}\n"
-                f"    no classification | reward={reward:+.3f}"
+            # Online mode: send action to robot and wait for physics + audio.
+            self.osc_client.send_rlfret(rl_action)
+
+            # Wait for physics to settle and sound to develop
+            time.sleep(self.ACTION_DURATION)
+
+            # Capture audio and compute reward
+            reward_info = self.reward_calc.compute_reward(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=self.target_fret,
+                capture_audio=True,
             )
+
+            reward = reward_info['total_reward']
+            filtered = reward_info.get('filtered', False)
+            filter_reason = reward_info.get('filter_reason', '')
+            cls = reward_info.get('classification')
+
+            if filtered:
+                logger.info(
+                    f"\n  {step_header}\n"
+                    f"    FILTERED: {filter_reason}\n"
+                    f"    reward={reward:+.3f}"
+                )
+            elif cls is not None:
+                label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
+                logger.info(
+                    f"\n  {step_header}\n"
+                    f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
+                    f"D={cls.get('dead_note_prob', 0):.3f}  G={cls.get('general_note_prob', 0):.3f}\n"
+                    f"    reward={reward:+.3f}  "
+                    f"(audio={reward_info['audio_reward']:+.3f}  "
+                    f"fret={reward_info['fret_reward']:+.3f}  "
+                    f"torque={reward_info['torque_reward']:+.3f})"
+                )
+            else:
+                logger.info(
+                    f"\n  {step_header}\n"
+                    f"    no classification | reward={reward:+.3f}"
+                )
         
         # Update state
         self.current_fret = fret_position
@@ -429,5 +480,6 @@ class HarmonicEnv(gym.Env):
     
     def close(self):
         """Clean up resources."""
-        self.osc_client.close()
-        logger.info(f"HarmonicEnv closed (string_indices={self.string_indices})")
+        if self.osc_client is not None:
+            self.osc_client.close()
+        logger.info(f"HarmonicEnv closed (string_indices={self.string_indices}, offline={self.offline})")

@@ -91,9 +91,9 @@ class HarmonicProgressCallback(CallbackList):
         return True
 
 
-def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_index: int = 2,
+def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
-             reward_mode: str = 'full'):
+             reward_mode: str = 'full', offline: bool = False):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -105,6 +105,7 @@ def make_env(model_path: str, curriculum_mode: str, string_indices=None, string_
         max_steps=10,
         success_threshold=0.8,
         reward_mode=reward_mode,
+        offline=offline,
     )
     env = Monitor(env)
     return env
@@ -115,6 +116,8 @@ def train(args):
     logger.info("=" * 60)
     logger.info("Starting harmonic RL training")
     logger.info("=" * 60)
+    logger.info(f"CUDA available: {torch.cuda.is_available()}" +
+                (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
     
     # ── Output directory ──────────────────────────────────────────────
     # When resuming, reuse the existing run directory so logs/checkpoints
@@ -141,11 +144,20 @@ def train(args):
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     logger.info(f"Reward mode: {args.reward_mode}")
-    
+
+    if args.pretrain:
+        logger.info(
+            "*** OFFLINE PRE-TRAINING MODE ***\n"
+            "  - No robot or audio hardware required.\n"
+            "  - Reward = filtration layer only (fret + torque shaping).\n"
+            "  - Steps are instant (no physics wait).\n"
+            "  - Resume on the robot later with:  --resume <this run dir>  (without --pretrain)"
+        )
+
     # Resolve string pool: --string-indices takes precedence, else fall back to --string-index
     string_indices = args.string_indices if args.string_indices else [args.string_index]
     logger.info(f"String pool: {string_indices}")
-    
+
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
@@ -155,8 +167,9 @@ def train(args):
         osc_port=args.osc_port,
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
+        offline=args.pretrain,
     )
-    
+
     # Create evaluation environment
     eval_env = make_env(
         model_path=args.model_path,
@@ -165,6 +178,7 @@ def train(args):
         osc_port=args.osc_port,
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
+        offline=args.pretrain,
     )
     
     # Configure SAC agent
@@ -284,12 +298,14 @@ def train(args):
         # you are certain the robot has finished its last action.
         #
         # Pass --reset-on-exit to request a reset after training stops.
-        if args.reset_on_exit:
+        if args.pretrain:
+            logger.info("Offline pre-training complete. No robot reset needed.")
+        elif args.reset_on_exit:
             logger.info("Sending /Reset (--reset-on-exit requested)...")
             logger.info("The reset will be queued behind any active trajectory on the robot.")
             # Unwrap Monitor wrapper to access the underlying HarmonicEnv
             base_env = env.env if hasattr(env, 'env') else env
-            if hasattr(base_env, 'osc_client'):
+            if hasattr(base_env, 'osc_client') and base_env.osc_client is not None:
                 base_env.osc_client.reset(wait_time=0.5)
                 logger.info("/Reset sent.")
         else:
@@ -307,7 +323,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train harmonic RL agent')
     
     # Environment arguments
-    parser.add_argument('--model-path', required=True, help='Path to HarmonicsClassifier model')
+    parser.add_argument('--model-path', default=None,
+                        help='Path to HarmonicsClassifier model. '
+                             'Required for online training (default). '
+                             'Not needed when --pretrain is set.')
     parser.add_argument('--string-index', type=int, default=2,
                         help='Single string to train on (0, 2, or 4 — must have plucker; default: 2=D). '
                              'Ignored when --string-indices is provided.')
@@ -349,6 +368,14 @@ def main():
                         help='Explicit checkpoint file to resume from (without .zip extension). '
                              'Overrides the automatic latest-checkpoint search within --resume.')
     
+    # Pre-training (offline, filtration-only)
+    parser.add_argument('--pretrain', action='store_true', default=False,
+                        help='Run in offline pre-training mode. No robot or audio hardware is '
+                             'needed. Reward comes from the filtration layer only '
+                             '(fret + torque shaping). Steps are instant — no physics wait. '
+                             'Save the resulting model and resume on the robot later with '
+                             '--resume <run-dir> (without --pretrain).')
+
     # Robot safety
     parser.add_argument('--reset-on-exit', action='store_true', default=True,
                         help='Send /Reset to GuitarBot when training stops. '
@@ -368,14 +395,32 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='Device to use for training')
-    
+
+    # Verbosity
+    parser.add_argument('--verbose', action='store_true', default=False,
+                        help='Enable per-step debug logging. In --pretrain mode steps are '
+                             'instant so this output is hidden by default to keep the '
+                             'terminal readable.')
+
     args = parser.parse_args()
-    
-    # Check model exists
-    if not Path(args.model_path).exists():
-        logger.error(f"Model not found: {args.model_path}")
-        sys.exit(1)
-    
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Validate model path (not required for offline pre-training)
+    if args.pretrain:
+        if args.model_path is not None and not Path(args.model_path).exists():
+            logger.error(f"Model not found: {args.model_path}")
+            sys.exit(1)
+    else:
+        if args.model_path is None:
+            logger.error("--model-path is required for online training. "
+                         "Use --pretrain to run without a robot/audio setup.")
+            sys.exit(1)
+        if not Path(args.model_path).exists():
+            logger.error(f"Model not found: {args.model_path}")
+            sys.exit(1)
+
     train(args)
 
 
