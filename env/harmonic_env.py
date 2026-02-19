@@ -43,6 +43,7 @@ from utils.audio_reward import HarmonicRewardCalculator
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
     compute_reward_no_audio as _compute_reward_no_audio,
+    PRETRAIN_FRET_TOLERANCE,
 )
 
 
@@ -359,10 +360,13 @@ class HarmonicEnv(gym.Env):
         if self.offline:
             # Offline pre-training: compute reward from filtration layer only.
             # No robot command, no physics wait, no audio capture.
+            # Use PRETRAIN_FRET_TOLERANCE (wider Gaussian) so the agent receives
+            # a gradient signal across the whole fret range, not just ±0.35 frets.
             reward_info = _compute_reward_no_audio(
                 fret_position=fret_position,
                 torque=torque,
                 target_fret=self.target_fret,
+                fret_tolerance=PRETRAIN_FRET_TOLERANCE,
             )
             reward_info['classification'] = None
             reward_info['audio_rms'] = None

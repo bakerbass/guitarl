@@ -150,8 +150,10 @@ def train(args):
             "*** OFFLINE PRE-TRAINING MODE ***\n"
             "  - No robot or audio hardware required.\n"
             "  - Reward = filtration layer only (fret + torque shaping).\n"
+            "  - Fret shaping uses wide Gaussian (σ=1.5 frets) for full-neck gradients.\n"
             "  - Steps are instant (no physics wait).\n"
-            "  - Resume on the robot later with:  --resume <this run dir>  (without --pretrain)"
+            "  - TIP: use --ent-coef 0.1 (or higher) to prevent policy entropy collapse.\n"
+            "  - Resume on the robot with:  --resume <this run dir>  --clear-buffer  (without --pretrain)"
         )
 
     # Resolve string pool: --string-indices takes precedence, else fall back to --string-index
@@ -187,6 +189,13 @@ def train(args):
         net_arch=[256, 256],  # Hidden layers
     )
     
+    # Parse ent_coef: allow float or the string 'auto' / 'auto_X.X'
+    ent_coef = args.ent_coef
+    try:
+        ent_coef = float(ent_coef)
+    except ValueError:
+        pass  # keep as string ('auto' or 'auto_X.X')
+
     model = SAC(
         "MlpPolicy",
         env,
@@ -198,11 +207,14 @@ def train(args):
         gamma=args.gamma,
         train_freq=1,
         gradient_steps=1,
+        ent_coef=ent_coef,
         policy_kwargs=policy_kwargs,
         verbose=1,
         tensorboard_log=str(log_dir),
         device=args.device
     )
+    logger.info(f"Entropy coefficient: {ent_coef}"
+                + (" (auto-tuned)" if str(ent_coef).startswith("auto") else " (fixed)"))
     
     # ── Resume: load weights + replay buffer ──────────────────────────
     if args.resume:
@@ -226,7 +238,13 @@ def train(args):
         model = SAC.load(model_file, env=env, device=args.device)
 
         buffer_file = Path(str(model_file) + "_replay_buffer.pkl")
-        if buffer_file.exists():
+        if args.clear_buffer:
+            logger.info(
+                "--clear-buffer set: skipping replay buffer load. "
+                "SAC will warm up with fresh transitions (useful when transitioning "
+                "from offline pre-training to online robot training)."
+            )
+        elif buffer_file.exists():
             logger.info(f"Loading replay buffer from: {buffer_file}")
             model.load_replay_buffer(buffer_file)
             logger.info(f"  Buffer size restored: {model.replay_buffer.size()} transitions")
@@ -287,7 +305,7 @@ def train(args):
         logger.info("Model and replay buffer saved")
     
     finally:
-        # NOTE: /Reset is NOT sent automatically on exit.
+        # NOTE: /Reset is sent automatically on exit.
         # Sending /Reset while the robot is executing a trajectory can cause a
         # mechanical malfunction (both threads call RobotController.main() at
         # the same time, corrupting the UDP stream).
@@ -295,9 +313,8 @@ def train(args):
         # The GuitarBot's arm_list_recieverNN.py now serialises all robot calls
         # through a robot_lock, so a /Reset sent after Ctrl+C will wait for the
         # current trajectory to finish before executing — but only send it if
-        # you are certain the robot has finished its last action.
-        #
-        # Pass --reset-on-exit to request a reset after training stops.
+        # you are confident the robot has finished its last action.
+        
         if args.pretrain:
             logger.info("Offline pre-training complete. No robot reset needed.")
         elif args.reset_on_exit:
@@ -352,6 +369,12 @@ def main():
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
     parser.add_argument('--tau', type=float, default=0.005, help='Target network update rate')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--ent-coef', type=str, default='auto',
+                        help='SAC entropy coefficient. "auto" lets SAC tune it automatically. '
+                             'Set a fixed float (e.g. 0.5) to prevent policy entropy collapse '
+                             'during --pretrain — the auto-tuner can drive entropy too low when '
+                             'steps are instant, leaving the policy stuck at a point estimate. '
+                             'Recommended for --pretrain: 0.1 to 0.5  (default: auto)')
     
     # Logging arguments
     parser.add_argument('--output-dir', type=str, default='./runs', help='Output directory')
@@ -367,6 +390,11 @@ def main():
     parser.add_argument('--resume-checkpoint', type=str, default=None, metavar='CKPT',
                         help='Explicit checkpoint file to resume from (without .zip extension). '
                              'Overrides the automatic latest-checkpoint search within --resume.')
+    parser.add_argument('--clear-buffer', action='store_true', default=False,
+                        help='When resuming, discard the saved replay buffer and start fresh. '
+                             'Use this when transitioning from --pretrain to online robot '
+                             'training: the pre-train buffer contains no audio reward signal '
+                             'and can bias the policy away from harmonic-seeking behaviour.')
     
     # Pre-training (offline, filtration-only)
     parser.add_argument('--pretrain', action='store_true', default=False,

@@ -25,7 +25,7 @@ from typing import Dict, Optional
 
 # ── Constants ─────────────────────────────────────────────────────────
 HARMONIC_FRETS = [4, 5, 7, 9]
-TORQUE_OPTIMAL_HARMONIC = 30.0   # Light touch for harmonics
+TORQUE_OPTIMAL_HARMONIC = 70.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
 TORQUE_SAFE_MIN = 16.0
 
@@ -54,6 +54,17 @@ REWARD_WEIGHT_TORQUE = 0.2  # Small shaping bonus for light torque
 # Ablation: no-audio mode — fret + torque shaping only, rebalanced
 ABLATION_NO_AUDIO_FRET_WEIGHT   = 0.5
 ABLATION_NO_AUDIO_TORQUE_WEIGHT = 0.5
+
+# Offline pre-training: wider fret Gaussian so the agent gets useful gradients
+# across the whole fret range, not just within ±FRET_TOLERANCE of target.
+#
+# At σ=0.35 (online):  reward at 1 fret away ≈ 0.01  → effectively zero; no gradient
+# At σ=1.5  (pretrain): reward at 1 fret away ≈ 0.80
+#                        reward at 2 frets away ≈ 0.41
+#                        reward at 3 frets away ≈ 0.14 (filtration boundary)
+# This ensures the agent always has a direction signal toward the harmonic node
+# even when exploring far from target.
+PRETRAIN_FRET_TOLERANCE = 1.5
 
 # Reward mode strings
 REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
@@ -260,19 +271,25 @@ def compute_reward_no_audio(
     torque: float,
     target_fret: int,
     audio_rms: Optional[float] = None,
+    fret_tolerance: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     Ablation: Layer 2 audio signal (CNN classifier) is removed.
 
     Layer 1 (filtration) still runs (torque + fret checks).
-    Silence detection was removed from filtration as it was inconsistent.  When it passes, reward is the fret +
-    torque shaping terms only, rebalanced to equal weights (0.5 / 0.5).
+    When it passes, reward is fret + torque shaping only (equal 0.5 / 0.5 weights).
 
-    Use this to measure how much of the policy's performance comes from
-    the CNN signal vs. pure mechanical guidance.
+    Args:
+        fret_tolerance: Width (σ) of the fret Gaussian. Defaults to FRET_TOLERANCE
+                        (0.35 frets, tight — good for online fine-tuning).
+                        Use PRETRAIN_FRET_TOLERANCE (1.5 frets) for offline
+                        pre-training so the agent gets a gradient signal across
+                        the whole fret range, not just within ±0.35 of target.
     """
     if target_fret not in HARMONIC_FRETS:
         raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    _fret_tol = fret_tolerance if fret_tolerance is not None else FRET_TOLERANCE
 
     filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
     if not filt['passed']:
@@ -289,7 +306,7 @@ def compute_reward_no_audio(
         }
 
     fret_error    = abs(fret_position - float(target_fret))
-    fret_reward   = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
+    fret_reward   = np.exp(-(fret_error ** 2) / (2 * _fret_tol ** 2))
     torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
     torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
 
