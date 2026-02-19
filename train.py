@@ -363,11 +363,11 @@ def main():
                         help='Curriculum learning mode')
     
     # Training arguments
-    parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
+    parser.add_argument('--total-timesteps', type=int, default=10000, help='Total training timesteps')
     parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--buffer-size', type=int, default=100000, help='Replay buffer size')
-    parser.add_argument('--learning-starts', type=int, default=500, help='Steps before learning starts')
-    parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
+    parser.add_argument('--learning-starts', type=int, default=50, help='Steps before learning starts')
+    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
     parser.add_argument('--tau', type=float, default=0.005, help='Target network update rate')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     

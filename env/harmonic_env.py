@@ -88,7 +88,7 @@ class HarmonicEnv(gym.Env):
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
     ACTION_DURATION = 3.0       # Time to wait after each action (seconds)
-    STRING_SWITCH_WAIT = 10.0   # Seconds to pause after a /Reset between strings
+    STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
     
     def __init__(self,
                  model_path: str,
