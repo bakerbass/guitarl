@@ -39,7 +39,7 @@ HARMONIC_CLASS_IDX = 0
 SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 
 # ── Filtration layer thresholds ───────────────────────────────────────
-TORQUE_HARD_MAX   = 350.0   # Anything above this is too aggressive for harmonics
+TORQUE_HARD_MAX   = 300.0   # Anything above this is too aggressive for harmonics
 TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
 FRET_MAX_ERROR    = 3.0     # More than 3 frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
@@ -47,9 +47,9 @@ RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; ke
 FILTRATION_PENALTY = -1.0   # Flat penalty when filtration rejects an action
 
 # ── Layer 2 weights (audio layer) ─────────────────────────────────────
-REWARD_WEIGHT_AUDIO  = 0.6  # Classifier is the primary signal
+REWARD_WEIGHT_AUDIO  = 0.45  # Classifier is the primary signal
 REWARD_WEIGHT_FRET   = 0.2  # Small shaping bonus for fret accuracy
-REWARD_WEIGHT_TORQUE = 0.2  # Small shaping bonus for light torque
+REWARD_WEIGHT_TORQUE = 0.35  # Small shaping bonus for light torque
 
 # Ablation: no-audio mode — fret + torque shaping only, rebalanced
 ABLATION_NO_AUDIO_FRET_WEIGHT   = 0.5
