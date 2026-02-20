@@ -23,6 +23,7 @@ from stable_baselines3.common.monitor import Monitor
 import torch
 
 from env.harmonic_env import HarmonicEnv
+from utils.success_recorder import SuccessRecorder
 
 
 # Setup logging
@@ -159,6 +160,52 @@ def _plot_episode_audio(audio: np.ndarray, reward_info: dict, rl_action,
     plt.close(fig)
 
 
+class RobotLearningStartCallback(BaseCallback):
+    """
+    Triggers SAC gradient updates only after a specified number of *real robot
+    actions* (i.e. steps where an OSC command was actually sent and audio was
+    captured).  Filtered steps — which return instantly without touching the
+    robot — are excluded from the count.
+
+    This replaces the raw `learning_starts` threshold on the SAC model, which
+    counts every timestep including filtered ones and is therefore hard to
+    reason about when the random policy is generating many out-of-range actions.
+
+    Implementation: the SAC model is initialised with a huge `learning_starts`
+    value so SB3 never starts on its own.  Once `robot_step_count` reaches the
+    threshold this callback sets `model.learning_starts = 0`, which makes SB3
+    begin gradient updates on the very next training check.
+    """
+
+    def __init__(self, robot_steps_threshold: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.threshold = robot_steps_threshold
+        self._triggered = False
+
+    def _get_base_env(self, idx: int = 0):
+        try:
+            monitor_env = self.training_env.envs[idx]
+            return getattr(monitor_env, 'env', monitor_env)
+        except (AttributeError, IndexError):
+            return None
+
+    def _on_step(self) -> bool:
+        if self._triggered:
+            return True
+        base_env = self._get_base_env()
+        if base_env is None:
+            return True
+        robot_steps = getattr(base_env, 'robot_step_count', 0)
+        if robot_steps >= self.threshold:
+            self.model.learning_starts = 0
+            self._triggered = True
+            logger.info(
+                f'[learning] {robot_steps} real robot actions collected — '
+                f'SAC gradient updates now active.'
+            )
+        return True
+
+
 class SlowModeCallback(BaseCallback):
     """
     When --slow is set, plot the waveform + mel spectrogram after every episode
@@ -216,7 +263,8 @@ class SlowModeCallback(BaseCallback):
 
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
-             reward_mode: str = 'full', offline: bool = False):
+             reward_mode: str = 'full', offline: bool = False,
+             success_recorder=None):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -229,6 +277,7 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         success_threshold=0.8,
         reward_mode=reward_mode,
         offline=offline,
+        success_recorder=success_recorder,
     )
     env = Monitor(env)
     return env
@@ -243,27 +292,32 @@ def train(args):
                 (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
     
     # ── Output directory ──────────────────────────────────────────────
-    # When resuming, reuse the existing run directory so logs/checkpoints
-    # stay together.  When starting fresh, create a timestamped subdirectory.
+    # Always create a fresh timestamped subdirectory so every run has its own
+    # isolated logs, checkpoints, and best_model — even when resuming.
+    # The source run directory is kept as resume_dir and used only for
+    # locating the checkpoint/buffer to load from.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_dir = None
     if args.resume:
         resume_dir = Path(args.resume)
         if not resume_dir.exists():
             logger.error(f"Resume directory not found: {resume_dir}")
             sys.exit(1)
-        output_dir = resume_dir
-        logger.info(f"Resuming from: {output_dir}")
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = Path(args.output_dir) / f"harmonic_sac_{timestamp}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-    
+        # Record lineage so the chain of runs is traceable.
+        (output_dir / "resumed_from.txt").write_text(str(resume_dir.resolve()) + "\n")
+        logger.info(f"Resuming weights from: {resume_dir}")
+
+    logger.info(f"Output directory: {output_dir}")
+
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
-    
+
     checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
-    
-    logger.info(f"Output directory: {output_dir}")
+
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     logger.info(f"Reward mode: {args.reward_mode}")
@@ -283,6 +337,13 @@ def train(args):
     string_indices = args.string_indices if args.string_indices else [args.string_index]
     logger.info(f"String pool: {string_indices}")
 
+    # Create success recorder if requested (online mode only)
+    success_recorder = None
+    if args.record_successes and not args.pretrain:
+        success_recorder = SuccessRecorder(output_dir / "successes")
+    elif args.record_successes and args.pretrain:
+        logger.warning("[record-successes] No-op in --pretrain mode (no audio captured).")
+
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
@@ -293,6 +354,7 @@ def train(args):
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
         offline=args.pretrain,
+        success_recorder=success_recorder,
     )
 
     # Create evaluation environment
@@ -324,7 +386,11 @@ def train(args):
         env,
         learning_rate=args.learning_rate,
         buffer_size=args.buffer_size,
-        learning_starts=args.learning_starts,
+        # In online mode, set learning_starts to a sentinel so SB3 never
+        # auto-starts.  RobotLearningStartCallback controls the actual trigger
+        # based on robot_step_count (real OSC actions, filtered steps excluded).
+        # In pretrain mode every step is real, so pass the arg directly.
+        learning_starts=args.learning_starts if args.pretrain else 10_000_000,
         batch_size=args.batch_size,
         tau=args.tau,
         gamma=args.gamma,
@@ -340,18 +406,19 @@ def train(args):
                 + (" (auto-tuned)" if str(ent_coef).startswith("auto") else " (fixed)"))
     
     # ── Resume: load weights + replay buffer ──────────────────────────
-    if args.resume:
+    if resume_dir is not None:
         def _latest_checkpoint(ckpt_dir: Path):
             """Return the .zip with the highest timestep number, or None."""
             zips = sorted(ckpt_dir.glob("harmonic_sac_*_steps.zip"))
             return zips[-1].with_suffix('') if zips else None
 
+        resume_ckpt_dir = resume_dir / "checkpoints"
         if args.resume_checkpoint:
             model_file = Path(args.resume_checkpoint)
-        elif (output_dir / "interrupted_model.zip").exists():
-            model_file = output_dir / "interrupted_model"
+        elif (resume_dir / "interrupted_model.zip").exists():
+            model_file = resume_dir / "interrupted_model"
         else:
-            model_file = _latest_checkpoint(checkpoint_dir)
+            model_file = _latest_checkpoint(resume_ckpt_dir)
 
         if model_file is None:
             logger.error("No checkpoint found in resume directory. Cannot resume.")
@@ -402,6 +469,11 @@ def train(args):
     progress_callback = HarmonicProgressCallback(verbose=1)
 
     cb_list = [checkpoint_callback, eval_callback, progress_callback]
+    if not args.pretrain:
+        # In online mode, learning_starts on the SAC model is set to a sentinel
+        # value (see SAC constructor above).  RobotLearningStartCallback lowers
+        # it to 0 once enough real robot actions have been collected.
+        cb_list.append(RobotLearningStartCallback(args.learning_starts))
     if args.slow and not args.pretrain:
         cb_list.append(SlowModeCallback())
         logger.info(
@@ -448,6 +520,11 @@ def train(args):
         # current trajectory to finish before executing — but only send it if
         # you are confident the robot has finished its last action.
         
+        # Drain success recorder before closing env
+        if success_recorder is not None:
+            logger.info("[record-successes] Flushing pending writes...")
+            success_recorder.close()
+
         if args.pretrain:
             logger.info("Offline pre-training complete. No robot reset needed.")
         elif args.reset_on_exit:
@@ -498,7 +575,12 @@ def main():
     parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
     parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--buffer-size', type=int, default=100000, help='Replay buffer size')
-    parser.add_argument('--learning-starts', type=int, default=500, help='Steps before learning starts')
+    parser.add_argument('--learning-starts', type=int, default=100,
+                        help='Number of *real robot actions* (OSC sent, audio captured) to collect '
+                             'before SAC gradient updates begin.  Filtered steps — which return '
+                             'instantly without touching the robot — are excluded from this count. '
+                             'In --pretrain mode this reverts to the standard SB3 total-timestep '
+                             'threshold since every step is real (default: 100).')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
     parser.add_argument('--tau', type=float, default=0.005, help='Target network update rate')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
@@ -556,6 +638,15 @@ def main():
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
                         help='Device to use for training')
+
+    parser.add_argument('--record-successes', action='store_true', default=False,
+                        help='Save every successful harmonic to disk for classifier retraining. '
+                             'Each success produces a WAV (raw captured audio at device SR) and '
+                             'a JSON sidecar with full action/reward/classification metadata. '
+                             'Files are written in the background so step() timing is unaffected. '
+                             'Output: <run-dir>/successes/  — review with --slow or any audio '
+                             'player, edit suggested_label in the JSON, then feed back into '
+                             'HarmonicsClassifier retraining. No-op in --pretrain mode.')
 
     # Slow / debug
     parser.add_argument('--slow', action='store_true', default=False,
