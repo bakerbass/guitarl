@@ -28,8 +28,10 @@ The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
 - [Usage](#usage)
   - [Diagnostic Test Loop](#diagnostic-test-loop)
   - [Training](#training)
+  - [Recording Successful Harmonics](#recording-successful-harmonics)
   - [Resuming an Interrupted Run](#resuming-an-interrupted-run)
   - [Evaluation](#evaluation)
+  - [Reviewing & Relabeling Clips](#reviewing--relabeling-clips)
 - [Robot Safety](#robot-safety)
 - [Monitoring](#monitoring)
 - [Offline Pre-Training vs. Robot Training](#offline-pre-training-vs-robot-training)
@@ -78,7 +80,13 @@ guitaRL/
 │   └── audio_reward.py     # Audio capture + classifier dispatch → reward.py
 ├── scripts/
 │   ├── ablation_no_filtration.sh   # Ablation: bypass physics gate
-│   └── ablation_no_audio.sh        # Ablation: no CNN, fret+torque shaping only
+│   ├── ablation_no_audio.sh        # Ablation: no CNN, fret+torque shaping only
+│   └── review_successes.py         # Interactive clip review / relabeling tool
+├── utils/
+│   ├── __init__.py
+│   ├── reward.py           # All reward logic — single source of truth
+│   ├── audio_reward.py     # Audio capture + classifier dispatch → reward.py
+│   └── success_recorder.py # Async background writer for successful harmonic clips
 ├── train.py                # SAC training script (resume supported)
 ├── test_rl_loop.py         # Diagnostic: manual action → OSC → audio → classify → reward
 ├── evaluate.py             # Evaluation script
@@ -247,6 +255,53 @@ python train.py \
 - `random` — uniform random fret each episode
 - `fixed_fret` — always fret 7
 
+### Recording Successful Harmonics
+
+Pass `--record-successes` to save every success (classification `harmonic_prob > 0.8`) to
+disk as a WAV + JSON pair.  Clips are written asynchronously in a background
+thread — no impact on step latency.
+
+```bash
+python train.py \
+    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --record-successes
+```
+
+Clips are saved under the run's `successes/` subdirectory:
+
+```
+runs/harmonic_sac_TIMESTAMP/
+└── successes/
+    ├── 000001_20260218_143201_str2_fret7.00_torque68.wav
+    ├── 000001_20260218_143201_str2_fret7.00_torque68.json
+    ├── 000002_...
+    └── ...
+```
+
+Each JSON sidecar contains the full metadata for the episode:
+
+```json
+{
+  "suggested_label": "harmonic",
+  "reviewed": false,
+  "string_idx": 2,
+  "target_fret": 7,
+  "fret": 7.03,
+  "torque": 68,
+  "harmonic_prob": 0.93,
+  "dead_prob": 0.04,
+  "general_prob": 0.03,
+  "reward": 1.56,
+  "device_sr": 44100,
+  "timestamp": "2026-02-18T14:32:01.412"
+}
+```
+
+These clips feed directly into the HarmonicsClassifier retraining pipeline after
+review with `scripts/review_successes.py`.
+
+---
+
 ### Resuming an Interrupted Run
 
 The `KeyboardInterrupt` handler saves both the model weights and the SAC
@@ -329,6 +384,7 @@ python train.py \
 | `--reset-on-exit` | on | Send `/Reset` to GuitarBot when training exits (normally or via Ctrl+C). The middleware serialises the reset behind any active trajectory, but avoid triggering this mid-motion on fragile mechanisms. |
 | `--reward-mode MODE` | `full` | Reward variant for ablation studies. `full`: both layers (default). `no_filtration`: bypass the physics gate — all actions reach the CNN. `no_audio`: skip CNN entirely, use fret + torque shaping only (weights 0.5 / 0.5). |
 | `--slow` | off | After every **episode**, pause training and display a waveform + mel spectrogram plot with classification results and reward breakdown. Close the window to continue. Use this to visually verify the classifier is hearing the note before committing to a long run. No-op with `--pretrain`. |
+| `--record-successes` | off | Save every successful harmonic (`harmonic_prob > 0.8`) to `<run-dir>/successes/` as a float32 WAV + JSON sidecar. Written asynchronously — no step latency penalty. Clips can be reviewed and relabeled with `scripts/review_successes.py` for HarmonicsClassifier retraining. No-op with `--pretrain`. |
 | `--verbose` | off | Enable per-step `DEBUG` logging. Normally suppressed to keep the terminal readable, especially during `--pretrain` where steps are instant. |
 
 ---
@@ -347,6 +403,48 @@ python evaluate.py \
     --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
     --target-fret 7 \
     --episodes 10
+```
+
+### Reviewing & Relabeling Clips
+
+`scripts/review_successes.py` is an interactive terminal tool for a researcher
+to listen to each saved clip and confirm or correct its label before
+retraining the classifier.
+
+```bash
+# Review all clips in a run's successes directory
+python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/
+
+# Only show clips not yet reviewed
+python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/ --unreviewed-only
+
+# Skip audio playback (e.g. no speaker connected)
+python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/ --no-audio
+```
+
+**Keypress actions during review**
+
+| Key | Action |
+|-----|--------|
+| `h` | Label as `harmonic` |
+| `d` | Label as `dead_note` |
+| `g` | Label as `general_note` |
+| `r` | Replay audio |
+| `s` | Skip (leave label unchanged) |
+| `q` | Quit and print session summary |
+
+Reviewing a clip sets `reviewed: true` in the JSON sidecar and updates
+`suggested_label` in-place — the WAV file is never modified.  A session
+summary with per-label counts is printed on exit.
+
+Reviewed clips (with accurate labels) can then be imported into the
+HarmonicsClassifier dataset for retraining:
+
+```bash
+# Copy reviewed clips into the HarmonicsClassifier data directory
+python ../HarmonicsClassifier/copy_harmonics_to_clips.py \
+    runs/harmonic_sac_TIMESTAMP/successes/ \
+    --reviewed-only
 ```
 
 ---
