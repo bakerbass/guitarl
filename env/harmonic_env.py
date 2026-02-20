@@ -573,6 +573,8 @@ class HarmonicEnv(gym.Env):
     
     def close(self):
         """Clean up resources."""
+        if self.reward_calc is not None:
+            self.reward_calc.close()
         if self.osc_client is not None:
             self.osc_client.close()
         logger.info(f"HarmonicEnv closed (string_indices={self.string_indices}, offline={self.offline})")

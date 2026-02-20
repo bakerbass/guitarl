@@ -99,15 +99,25 @@ class HarmonicRewardCalculator:
         # Find audio device
         self.device_id = self._find_audio_device()
         if self.device_id is None:
-            logger.warning(f"Audio device '{device_name}' not found. Audio capture may fail.")
-        
+            if reward_mode == REWARD_MODE_NO_AUDIO:
+                # Audio not used in this mode — skip device requirement
+                logger.info("reward_mode=no_audio — audio device not required.")
+            elif sys.stdin.isatty():
+                self.device_id = self._prompt_select_device()
+            else:
+                raise RuntimeError(
+                    f"Audio input device matching '{device_name}' not found and stdin is "
+                    "not a TTY (cannot prompt). Pass a different --audio-device substring "
+                    "or fix your ALSA/PulseAudio routing."
+                )
+
         # Get device sample rate
         if self.device_id is not None:
             device_info = sd.query_devices(self.device_id, 'input')
             self.device_sr = int(device_info['default_samplerate'])
             logger.info(f"Audio device SR: {self.device_sr} Hz")
         else:
-            self.device_sr = 44100  # Default fallback
+            self.device_sr = 44100  # Default fallback (no_audio mode)
         
         # Load model
         self.model = self._load_model()
@@ -115,13 +125,66 @@ class HarmonicRewardCalculator:
         logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
     
     def _find_audio_device(self) -> Optional[int]:
-        """Find audio input device by name."""
+        """Find audio input device by name substring (input channels required)."""
         devices = sd.query_devices()
         for idx, device in enumerate(devices):
-            if self.device_name.lower() in device['name'].lower():
+            if (self.device_name.lower() in device['name'].lower()
+                    and device['max_input_channels'] > 0):
                 logger.info(f"Found audio device: {device['name']} (ID: {idx})")
                 return idx
+        # Second pass: warn about any matching output-only devices so the user
+        # understands why the substring matched but was rejected.
+        for idx, device in enumerate(devices):
+            if (self.device_name.lower() in device['name'].lower()
+                    and device['max_input_channels'] == 0):
+                logger.warning(
+                    f"Skipped output-only device '{device['name']}' (ID: {idx}) — "
+                    "no input channels. Check ALSA / PulseAudio routing."
+                )
         return None
+
+    def _prompt_select_device(self) -> int:
+        """Interactively prompt the user to choose an input device or quit."""
+        devices = sd.query_devices()
+        input_devices = [
+            (idx, dev)
+            for idx, dev in enumerate(devices)
+            if dev['max_input_channels'] > 0
+        ]
+
+        print("\n" + "=" * 60)
+        print(f"  Audio device '{self.device_name}' not found (or has no input channels).")
+        print("  Available INPUT devices:")
+        print("=" * 60)
+        for i, (idx, dev) in enumerate(input_devices):
+            print(f"  [{i}]  ID={idx:2d}  ch={dev['max_input_channels']:2d}  "
+                  f"SR={int(dev['default_samplerate'])}  {dev['name']}")
+        print("  [q]  Quit and fix --audio-device, then retry")
+        print("=" * 60)
+
+        while True:
+            try:
+                raw = input("  Select device number (or q): ").strip().lower()
+            except EOFError:
+                raw = "q"
+
+            if raw == "q":
+                print("Exiting. Re-run with the correct --audio-device substring.")
+                raise SystemExit(1)
+
+            try:
+                choice = int(raw)
+                if 0 <= choice < len(input_devices):
+                    dev_id, dev = input_devices[choice]
+                    self.device_name = dev['name']
+                    print(f"  Using: {dev['name']} (ID: {dev_id})")
+                    print("=" * 60 + "\n")
+                    logger.info(f"User selected audio device: {dev['name']} (ID: {dev_id})")
+                    return dev_id
+                else:
+                    print(f"  Please enter a number between 0 and {len(input_devices)-1}.")
+            except ValueError:
+                print("  Invalid input — enter a number or 'q'.")
     
     def _load_model(self) -> HarmonicsCNN:
         """Load pretrained harmonic classifier."""
@@ -156,19 +219,37 @@ class HarmonicRewardCalculator:
         
         try:
             logger.debug(f"Capturing {duration}s from device {self.device_id}")
-            audio = sd.rec(
-                int(duration * self.device_sr),
+            frames = int(duration * self.device_sr)
+            buf = np.zeros(frames, dtype='float32')
+            with sd.InputStream(
                 samplerate=self.device_sr,
                 channels=1,
                 device=self.device_id,
-                dtype='float32'
-            )
-            sd.wait()
-            return audio.flatten()
+                dtype='float32',
+            ) as stream:
+                remaining = frames
+                offset = 0
+                while remaining > 0:
+                    chunk, _ = stream.read(min(remaining, 4096))
+                    n = len(chunk)
+                    buf[offset:offset + n] = chunk[:, 0]
+                    offset += n
+                    remaining -= n
+            return buf
         except Exception as e:
             logger.error(f"Audio capture failed: {e}")
             return np.zeros(int(self.device_sr * duration))
     
+    def close(self) -> None:
+        """Release any held audio resources. Safe to call multiple times."""
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        self.close()
+
     def preprocess_audio(self, audio: np.ndarray) -> torch.Tensor:
         """
         Preprocess audio to mel spectrogram for model input.
