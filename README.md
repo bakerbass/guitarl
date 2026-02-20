@@ -223,10 +223,17 @@ python train.py \
 
 The `KeyboardInterrupt` handler saves both the model weights and the SAC
 replay buffer.  Periodic checkpoints also include the buffer
-(`save_replay_buffer=True`).  To resume:
+(`save_replay_buffer=True`).
+
+Every run — including resumes — creates a **fresh timestamped directory**.
+The source run is only used to locate the checkpoint and replay buffer to
+load from.  A `resumed_from.txt` file in the new directory records the
+lineage so the chain of runs is traceable.
+
+To resume:
 
 ```bash
-# Auto-selects interrupted_model, or latest checkpoint
+# Auto-selects interrupted_model, or latest checkpoint in the source run
 python train.py \
     --model-path ../HarmonicsClassifier/models/best_model.pt \
     --resume ./runs/harmonic_sac_20260218_134500
@@ -238,9 +245,65 @@ python train.py \
     --resume-checkpoint ./runs/harmonic_sac_20260218_134500/checkpoints/harmonic_sac_5000_steps
 ```
 
-`reset_num_timesteps=False` is passed to SB3 so the internal timestep counter
-continues from where it left off and `--total-timesteps` is treated as an
-absolute ceiling rather than additional steps.
+### CLI Reference — train.py
+
+#### Environment
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-path PATH` | *(required online)* | Path to the trained HarmonicsClassifier `.pt` file. Not required when `--pretrain` is set. |
+| `--string-index N` | `2` | Single string to train on. Must be `0`, `2`, or `4` (strings with pluckers). Ignored when `--string-indices` is provided. |
+| `--string-indices N …` | *(unset)* | One or more strings to rotate across episodes (e.g. `--string-indices 0 2 4`). At each `reset()` the active string is sampled uniformly — distributes motor wear while keeping the policy string-aware via a one-hot in the observation. Overrides `--string-index`. |
+| `--curriculum MODE` | `easy_to_hard` | Target fret schedule: `easy_to_hard` (fret 7 → 5 → 4, 100 episodes each), `random` (uniform), `fixed_fret` (always fret 7). |
+| `--osc-port PORT` | `12000` | UDP port of the GuitarBot middleware. Use `8000` for StringSim. |
+| `--audio-device STR` | `Scarlett` | Substring matched against available audio device names to select the recording input. |
+
+#### SAC Hyperparameters
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--total-timesteps N` | `2000` | Training budget. When resuming, treated as an **absolute ceiling** (not additional steps) because `reset_num_timesteps=False` is passed to SB3. |
+| `--learning-rate LR` | `3e-4` | Adam learning rate for all SAC networks. |
+| `--buffer-size N` | `100000` | Maximum SAC replay buffer capacity (transitions). |
+| `--learning-starts N` | `100` | Number of **real robot actions** (OSC sent, audio captured) before SAC gradient updates begin. Filtered steps — which return instantly without touching the robot — are excluded from this count, so the value maps directly to meaningful transitions in the buffer. In `--pretrain` mode reverts to the standard SB3 total-timestep threshold since every step is real. |
+| `--batch-size N` | `256` | Mini-batch size drawn from the replay buffer each gradient step. |
+| `--tau τ` | `0.005` | Polyak averaging rate for the target network soft update. |
+| `--gamma γ` | `0.99` | Discount factor for future rewards. |
+| `--ent-coef VALUE` | `auto` | SAC entropy coefficient. `auto` lets SB3 tune it to match a target entropy. Set a fixed float (e.g. `0.1`–`0.3`) for `--pretrain` runs — the auto-tuner can collapse policy entropy to near-zero when steps are instant, leaving the agent stuck at a point estimate. |
+| `--device DEVICE` | `auto` | Torch device: `auto` (GPU if available), `cuda`, or `cpu`. |
+
+#### Checkpointing & Logging
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir DIR` | `./runs` | Root directory for run output. Each run creates a timestamped subdirectory `harmonic_sac_YYYYMMDD_HHMMSS/` containing logs, checkpoints, best model, and eval logs. |
+| `--checkpoint-freq N` | `5000` | Save a checkpoint (weights + replay buffer) every N timesteps. |
+| `--eval-freq N` | `2000` | Run `EvalCallback` every N timesteps to update `best_model/`. |
+
+#### Resuming
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--resume DIR` | *(unset)* | Path to an existing run directory to resume from. Weights and replay buffer are loaded from there, but all new output (logs, checkpoints, best model) goes into a **fresh timestamped directory**. A `resumed_from.txt` file in the new directory records the source path for lineage tracking. Automatically picks `interrupted_model.zip` if present, otherwise the highest-numbered checkpoint. |
+| `--resume-checkpoint PATH` | *(unset)* | Explicit checkpoint to load (without `.zip`). Overrides the automatic search within `--resume`. |
+| `--clear-buffer` | off | When resuming, discard the saved replay buffer. **Required once** when transitioning from `--pretrain` to the first robot run — offline transitions carry no audio reward and will bias the critic if kept. Do **not** pass this flag when resuming an interrupted robot run, or you will throw away valuable online transitions. |
+
+#### Offline Pre-Training
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pretrain` | off | Offline mode: no robot, no audio. Reward is computed from the filtration layer only (fret + torque shaping) with a wider fret Gaussian (σ = 1.5 frets). Steps are instant — run hundreds of thousands of steps before touching hardware. Resume on the robot with `--resume <dir> --clear-buffer`. |
+
+#### Robot Safety & Debugging
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--reset-on-exit` | on | Send `/Reset` to GuitarBot when training exits (normally or via Ctrl+C). The middleware serialises the reset behind any active trajectory, but avoid triggering this mid-motion on fragile mechanisms. |
+| `--reward-mode MODE` | `full` | Reward variant for ablation studies. `full`: both layers (default). `no_filtration`: bypass the physics gate — all actions reach the CNN. `no_audio`: skip CNN entirely, use fret + torque shaping only (weights 0.5 / 0.5). |
+| `--slow` | off | After every **episode**, pause training and display a waveform + mel spectrogram plot with classification results and reward breakdown. Close the window to continue. Use this to visually verify the classifier is hearing the note before committing to a long run. No-op with `--pretrain`. |
+| `--verbose` | off | Enable per-step `DEBUG` logging. Normally suppressed to keep the terminal readable, especially during `--pretrain` where steps are instant. |
+
+---
 
 ### Evaluation
 
@@ -396,10 +459,13 @@ python train.py \
 | `--ent-coef auto` | Let SAC self-tune entropy once audio reward provides richer signal |
 | `--total-timesteps` | Real-robot budget is scarcer; start small and extend if needed |
 
-> **`--clear-buffer` is important.** Without it, the replay buffer is filled
-> with transitions that have `audio_reward = 0` by construction, which will
-> suppress the agent's weight on audio even once the real classifier starts
-> providing signal.
+> **`--clear-buffer` is a one-time flag for the offline → online transition only.**
+> Without it, the replay buffer is filled with transitions that have `audio_reward = 0`
+> by construction, which will suppress the agent's weight on audio even once the real
+> classifier starts providing signal.
+> Once you are running on the robot, do **not** pass `--clear-buffer` on subsequent
+> resumes — those interruptions will have saved a buffer of real audio transitions
+> that are worth keeping.
 
 ---
 
@@ -412,7 +478,11 @@ python train.py \
 2. Verify policy quality
    python query.py --model runs/.../best_model/best_model.zip --num-actions 10 --stochastic
 
-3. Deploy on robot (resume + clear buffer)
+3. Deploy on robot — clear the offline buffer (one time only)
    python train.py --model-path ../HarmonicsClassifier/models/best_model.pt \
-       --resume runs/harmonic_sac_TIMESTAMP --clear-buffer --ent-coef auto
+       --resume runs/harmonic_sac_PRETRAIN_TIMESTAMP --clear-buffer --ent-coef auto
+
+4. Resume an interrupted robot run — do NOT clear the buffer
+   python train.py --model-path ../HarmonicsClassifier/models/best_model.pt \
+       --resume runs/harmonic_sac_ROBOT_TIMESTAMP --ent-coef auto
 ```

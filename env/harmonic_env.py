@@ -43,8 +43,11 @@ from utils.audio_reward import HarmonicRewardCalculator
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
     compute_reward_no_audio as _compute_reward_no_audio,
+    compute_filtration,
+    FILTRATION_PENALTY,
     PRETRAIN_FRET_TOLERANCE,
 )
+from utils.success_recorder import SuccessRecorder
 
 
 logger = logging.getLogger(__name__)
@@ -109,7 +112,8 @@ class HarmonicEnv(gym.Env):
                  use_simple_action_space: bool = False,
                  always_press: bool = True,
                  reward_mode: str = REWARD_MODE_FULL,
-                 offline: bool = False):
+                 offline: bool = False,
+                 success_recorder: Optional['SuccessRecorder'] = None):
         """
         Initialize HarmonicEnv.
 
@@ -137,7 +141,7 @@ class HarmonicEnv(gym.Env):
         super().__init__()
 
         self.offline = offline
-        
+        self.success_recorder = success_recorder
         # Resolve string pool — validate every entry has a plucker
         if string_indices is not None:
             for s in string_indices:
@@ -229,6 +233,11 @@ class HarmonicEnv(gym.Env):
         self.last_audio: Optional[np.ndarray] = None
         self.last_rl_action: Optional[object] = None
         self.last_reward_info: Optional[dict] = None
+
+        # Count of steps where OSC was actually sent (filtered steps excluded).
+        # Used by RobotLearningStartCallback to trigger learning after N real
+        # robot actions rather than N total timesteps.
+        self.robot_step_count: int = 0
         
         logger.info(f"HarmonicEnv initialized: strings={self.string_indices}, max_steps={max_steps}, "
                     f"action_dim={action_dim}, obs_dim={obs_dim}, always_press={always_press}, "
@@ -394,62 +403,95 @@ class HarmonicEnv(gym.Env):
                     f"reward={reward:+.3f}"
                 )
         else:
-            # Online mode: send action to robot, capture audio while note rings,
-            # then wait out the rest of ACTION_DURATION before the next step.
-            self.osc_client.send_rlfret(rl_action)
+            # Online mode: pre-check the action with the filtration layer BEFORE
+            # sending any OSC command.  If it fails, return immediately —
+            # no robot command, no audio capture, no 3-second wait.  This
+            # stops the motors from chasing garbage actions during random
+            # exploration and keeps filtered steps instant.
+            # Skipped in no_filtration ablation mode where the gate is intentionally bypassed.
+            pre_filter_active = (self.reward_calc.reward_mode != REWARD_MODE_NO_FILTRATION)
+            filt = compute_filtration(fret_position, torque, self.target_fret) if pre_filter_active else {'passed': True}
 
-            # Short pre-delay for the robot arm to physically move and pluck.
-            time.sleep(self.CAPTURE_PRE_DELAY)
-
-            # Capture audio now — the note is ringing.
-            audio = self.reward_calc.capture_audio()
-
-            # Wait out remaining ACTION_DURATION so total step time is unchanged.
-            remaining = self.ACTION_DURATION - self.CAPTURE_PRE_DELAY - self.reward_calc.capture_duration
-            if remaining > 0:
-                time.sleep(remaining)
-
-            # Compute reward with the already-captured audio (no second capture).
-            reward_info = self.reward_calc.compute_reward(
-                fret_position=fret_position,
-                torque=torque,
-                target_fret=self.target_fret,
-                capture_audio=False,
-                audio=audio,
-            )
-
-            # Expose for --slow plot callback
-            self.last_audio = audio
-            self.last_rl_action = rl_action
-            self.last_reward_info = reward_info
-
-            reward = reward_info['total_reward']
-            filtered = reward_info.get('filtered', False)
-            filter_reason = reward_info.get('filter_reason', '')
-            cls = reward_info.get('classification')
-
-            if filtered:
-                logger.info(
+            if not filt['passed']:
+                filter_reason = filt['reason']
+                reward = FILTRATION_PENALTY
+                reward_info = {
+                    'total_reward':  reward,
+                    'audio_reward':  0.0,
+                    'fret_reward':   0.0,
+                    'torque_reward': 0.0,
+                    'fret_error':    abs(fret_position - float(self.target_fret)),
+                    'torque_error':  0.0,
+                    'filtered':      True,
+                    'filter_reason': filter_reason,
+                    'classification': None,
+                    'audio_rms':     None,
+                }
+                self.last_rl_action = rl_action
+                self.last_reward_info = reward_info
+                self.last_audio = None
+                logger.debug(
                     f"\n  {step_header}\n"
-                    f"    FILTERED: {filter_reason}\n"
+                    f"    FILTERED (no OSC): {filter_reason}\n"
                     f"    reward={reward:+.3f}"
                 )
-            elif cls is not None:
-                label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
-                logger.info(
-                    f"\n  {step_header}\n"
-                    f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
-                    f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
-                    f"    reward={reward:+.3f}  "
-                    f"(audio={reward_info['audio_reward']:+.3f}  "
-                    f"fret={reward_info['fret_reward']:+.3f}  "
-                    f"torque={reward_info['torque_reward']:+.3f})"
-                )
             else:
-                logger.info(
-                    f"\n  {step_header}\n"
-                    f"    no classification | reward={reward:+.3f}"
+                # Action passed filtration — send to robot, capture audio, compute reward.
+                self.robot_step_count += 1
+                self.osc_client.send_rlfret(rl_action)
+
+                # Short pre-delay for the robot arm to physically move and pluck.
+                time.sleep(self.CAPTURE_PRE_DELAY)
+
+                # Capture audio now — the note is ringing.
+                audio = self.reward_calc.capture_audio()
+
+                # Wait out remaining ACTION_DURATION so total step time is unchanged.
+                remaining = self.ACTION_DURATION - self.CAPTURE_PRE_DELAY - self.reward_calc.capture_duration
+                if remaining > 0:
+                    time.sleep(remaining)
+
+                # Compute reward with the already-captured audio (no second capture).
+                reward_info = self.reward_calc.compute_reward(
+                    fret_position=fret_position,
+                    torque=torque,
+                    target_fret=self.target_fret,
+                    capture_audio=False,
+                    audio=audio,
                 )
+
+                # Expose for --slow plot callback
+                self.last_audio = audio
+                self.last_rl_action = rl_action
+                self.last_reward_info = reward_info
+
+                reward = reward_info['total_reward']
+                filtered = reward_info.get('filtered', False)
+                filter_reason = reward_info.get('filter_reason', '')
+                cls = reward_info.get('classification')
+
+                if filtered:
+                    logger.info(
+                        f"\n  {step_header}\n"
+                        f"    FILTERED: {filter_reason}\n"
+                        f"    reward={reward:+.3f}"
+                    )
+                elif cls is not None:
+                    label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
+                    logger.info(
+                        f"\n  {step_header}\n"
+                        f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
+                        f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
+                        f"    reward={reward:+.3f}  "
+                        f"(audio={reward_info['audio_reward']:+.3f}  "
+                        f"fret={reward_info['fret_reward']:+.3f}  "
+                        f"torque={reward_info['torque_reward']:+.3f})"
+                    )
+                else:
+                    logger.info(
+                        f"\n  {step_header}\n"
+                        f"    no classification | reward={reward:+.3f}"
+                    )
         
         # Update state
         self.current_fret = fret_position
@@ -462,14 +504,40 @@ class HarmonicEnv(gym.Env):
         # Check termination conditions
         terminated = False
         truncated = False
-        
-        # Success termination (optional - can disable for fixed-length episodes)
-        if reward_info['classification'] is not None:
+
+        # Success termination: only award bonus for unfiltered actions that actually
+        # reached the classifier.  A filtered step (no OSC sent) cannot be a success.
+        if not reward_info.get('filtered', False) and reward_info['classification'] is not None:
             is_success = self.reward_calc.is_success(reward_info['classification'])
             if is_success:
                 terminated = True
                 reward += 1.0  # Bonus for success
-                logger.info(f"Success! Harmonic prob: {reward_info['classification']['harmonic_prob']:.3f}")
+                cls = reward_info['classification']
+                logger.info(f"Success! Harmonic prob: {cls['harmonic_prob']:.3f}")
+
+                # Non-blocking: hand audio + metadata to the background writer.
+                if self.success_recorder is not None and self.last_audio is not None:
+                    self.success_recorder.record(
+                        audio=self.last_audio,
+                        metadata={
+                            'episode':        self.episode_count,
+                            'step':           self.current_step,
+                            'string_index':   self.string_index,
+                            'target_fret':    self.target_fret,
+                            'fret_position':  fret_position,
+                            'torque':         torque,
+                            'harmonic_prob':  cls.get('harmonic_prob', 0.0),
+                            'dead_prob':      cls.get('dead_prob', 0.0),
+                            'general_prob':   cls.get('general_prob', 0.0),
+                            'confidence':     cls.get('confidence', 0.0),
+                            'predicted_label': cls.get('predicted_label', 'unknown'),
+                            'total_reward':   reward_info.get('total_reward', 0.0),
+                            'audio_reward':   reward_info.get('audio_reward', 0.0),
+                            'fret_reward':    reward_info.get('fret_reward', 0.0),
+                            'torque_reward':  reward_info.get('torque_reward', 0.0),
+                            'device_sr':      self.reward_calc.device_sr,
+                        },
+                    )
         
         # Max steps truncation
         if self.current_step >= self.max_steps:
