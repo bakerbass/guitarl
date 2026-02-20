@@ -12,6 +12,34 @@ The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
 
 ---
 
+## Table of Contents
+
+- [Setup](#setup)
+- [Project Structure](#project-structure)
+- [Environment Details](#environment-details)
+  - [Observation Space](#observation-space-14-dim)
+  - [Action Space](#action-space-5-dim-continuous-normalised-to-1-1)
+  - [Target Harmonics](#target-harmonics)
+- [Reward Function — Two-Layer Architecture](#reward-function--two-layer-architecture)
+  - [Layer 1: Filtration](#layer-1-filtration-physics-gate)
+  - [Layer 2: Audio](#layer-2-audio-classifier-reward)
+- [Multi-String Training & Motor Wear Distribution](#multi-string-training--motor-wear-distribution)
+- [Ablation Studies](#ablation-studies)
+- [Usage](#usage)
+  - [Diagnostic Test Loop](#diagnostic-test-loop)
+  - [Training](#training)
+  - [Resuming an Interrupted Run](#resuming-an-interrupted-run)
+  - [Evaluation](#evaluation)
+- [Robot Safety](#robot-safety)
+- [Monitoring](#monitoring)
+- [Offline Pre-Training vs. Robot Training](#offline-pre-training-vs-robot-training)
+  - [Step 1 — Offline pre-training](#step-1--offline-pre-training-no-robot-no-audio)
+  - [Step 2 — Inspect the pre-trained policy](#step-2--inspect-the-pre-trained-policy)
+  - [Step 3 — Transition to robot training](#step-3--transition-to-robot-training)
+  - [Summary: recommended workflow](#summary-recommended-workflow)
+
+---
+
 ## Setup
 
 1. **Install dependencies**:
