@@ -10,7 +10,11 @@ import argparse
 from pathlib import Path
 import logging
 import sys
+import select
+import threading
+from collections import deque
 from datetime import datetime
+from typing import Optional
 import numpy as np
 
 import gymnasium as gym
@@ -260,6 +264,199 @@ class SlowModeCallback(BaseCallback):
 
 
 # ---------------------------------------------------------------------------
+# Audio history / on-demand dump callback
+# ---------------------------------------------------------------------------
+
+class AudioHistoryCallback(BaseCallback):
+    """
+    Maintains a rolling buffer of the last N real robot audio captures and
+    writes them to disk on demand when the user presses a key.
+
+    - Fills only on steps where an OSC command was actually sent (robot_step_count
+      increments), so filtered/instant steps are invisible to the buffer.
+    - Listens for keypresses on stdin in a non-blocking background thread.
+      Default trigger key: 'a'  (mnemonic: audio).
+    - Each dump goes into  <output_dir>/audio_dumps/dump_YYYYMMDD_HHMMSS/
+      as WAV + JSON sidecar pairs, identical in format to success_recorder.
+    """
+
+    def __init__(self,
+                 output_dir: Path,
+                 history_size: int = 10,
+                 trigger_key: str = 'a',
+                 verbose: int = 0):
+        super().__init__(verbose)
+        self.output_dir    = Path(output_dir)
+        self.history_size  = history_size
+        self.trigger_key   = trigger_key
+        self._buffer: deque = deque(maxlen=history_size)  # (audio, reward_info, rl_action)
+        self._dump_event   = threading.Event()
+        self._stop_event   = threading.Event()
+        self._last_robot_step = 0
+        self._listener_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Background stdin listener
+    # ------------------------------------------------------------------
+
+    def _stdin_listener(self) -> None:
+        """Daemon thread: poll stdin for the trigger key without blocking.
+
+        Raw mode is entered only for the instant a character is read, then
+        immediately restored.  This prevents tty.setraw() from holding the
+        terminal in raw mode while SB3 prints its progress table (raw mode
+        suppresses CR insertion, producing staircase output).
+        """
+        try:
+            import tty
+            import termios
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+        except Exception:
+            # No real tty (pipes, CI, etc.) — listener is a no-op
+            return
+
+        while not self._stop_event.is_set():
+            # Wait up to 100 ms for a keypress — terminal stays in cooked mode
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+            # Enter raw mode only for the single read, then restore immediately
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
+
+            if ch == self.trigger_key:
+                if not self._dump_event.is_set():
+                    self._dump_event.set()
+                    sys.stdout.write(
+                        f"\n[audio-history] Dump requested — "
+                        f"{len(self._buffer)}/{self.history_size} clips queued.\n"
+                    )
+                    sys.stdout.flush()
+            elif ch in ('\x03', 'q'):   # Ctrl+C or q — let SB3 handle it
+                self._stop_event.set()
+                import signal, os
+                os.kill(os.getpid(), signal.SIGINT)
+                break
+
+    # ------------------------------------------------------------------
+    # SB3 callback hooks
+    # ------------------------------------------------------------------
+
+    def _on_training_start(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._listener_thread = threading.Thread(
+            target=self._stdin_listener, daemon=True, name="audio-history-listener"
+        )
+        self._listener_thread.start()
+        logger.info(
+            f"[audio-history] Listening on stdin — press '{self.trigger_key}' at any time "
+            f"to dump the last {self.history_size} robot audio captures to disk."
+        )
+
+    def _on_step(self) -> bool:
+        # --- Fill buffer on new real robot steps ---
+        try:
+            base_env = self.training_env.envs[0]
+            base_env = getattr(base_env, 'env', base_env)
+        except (AttributeError, IndexError):
+            return True
+
+        robot_steps = getattr(base_env, 'robot_step_count', 0)
+        if robot_steps > self._last_robot_step:
+            self._last_robot_step = robot_steps
+            audio       = getattr(base_env, 'last_audio', None)
+            reward_info = getattr(base_env, 'last_reward_info', None)
+            rl_action   = getattr(base_env, 'last_rl_action', None)
+            if audio is not None:
+                self._buffer.append((
+                    audio.copy(),
+                    dict(reward_info) if reward_info else {},
+                    rl_action,
+                ))
+
+        # --- Drain on request ---
+        if self._dump_event.is_set():
+            self._dump_event.clear()
+            self._save_buffer()
+
+        return True
+
+    def _on_training_end(self) -> None:
+        self._stop_event.set()
+        # Drain any pending request
+        if self._dump_event.is_set():
+            self._dump_event.clear()
+            self._save_buffer()
+
+    # ------------------------------------------------------------------
+    # Disk writer
+    # ------------------------------------------------------------------
+
+    def _save_buffer(self) -> None:
+        import soundfile as sf
+
+        if not self._buffer:
+            logger.warning('[audio-history] Buffer is empty — nothing to dump.')
+            return
+
+        ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dump_dir  = self.output_dir / f"dump_{ts}"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        n = len(self._buffer)
+        logger.info(f"[audio-history] Writing {n} clip(s) to {dump_dir}")
+
+        for i, (audio, reward_info, rl_action) in enumerate(self._buffer, start=1):
+            cls       = reward_info.get('classification') or {}
+            fret      = reward_info.get('fret_position', 0.0)
+            torque    = reward_info.get('torque', 0.0)
+            str_idx   = reward_info.get('string_index', 0)
+            device_sr = reward_info.get('device_sr', 44100)
+
+            stem = (
+                f"{i:03d}_str{str_idx}"
+                f"_fret{fret:.2f}"
+                f"_torque{torque:.0f}"
+            )
+            wav_path  = dump_dir / f"{stem}.wav"
+            json_path = dump_dir / f"{stem}.json"
+
+            sf.write(str(wav_path), audio.astype('float32'), device_sr, subtype='FLOAT')
+
+            meta = {
+                'dump_ts':         ts,
+                'buffer_position': i,
+                'buffer_size':     n,
+                'string_index':    str_idx,
+                'fret_position':   fret,
+                'torque':          torque,
+                'harmonic_prob':   cls.get('harmonic_prob'),
+                'dead_prob':       cls.get('dead_prob'),
+                'general_prob':    cls.get('general_prob'),
+                'predicted_label': cls.get('predicted_label'),
+                'total_reward':    reward_info.get('total_reward'),
+                'audio_reward':    reward_info.get('audio_reward'),
+                'fret_reward':     reward_info.get('fret_reward'),
+                'torque_reward':   reward_info.get('torque_reward'),
+                'device_sr':       device_sr,
+                'wav_file':        wav_path.name,
+                'filtered':        reward_info.get('filtered', False),
+                'rl_action':       str(rl_action) if rl_action is not None else None,
+            }
+            json_path.write_text(__import__('json').dumps(meta, indent=2, default=str))
+
+        logger.info(f"[audio-history] Dump complete: {dump_dir}")
+        print(f"[audio-history] {n} clip(s) saved → {dump_dir}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
@@ -483,6 +680,19 @@ def train(args):
     elif args.slow and args.pretrain:
         logger.warning('[slow] --slow has no effect in --pretrain mode (no audio captured).')
 
+    if args.audio_history and not args.pretrain:
+        audio_history_cb = AudioHistoryCallback(
+            output_dir=output_dir / 'audio_dumps',
+            history_size=args.audio_history_size,
+        )
+        cb_list.append(audio_history_cb)
+        logger.info(
+            f"[audio-history] Enabled — rolling buffer of last {args.audio_history_size} "
+            f"robot audio captures. Press 'a' during training to dump to disk."
+        )
+    elif args.audio_history and args.pretrain:
+        logger.warning('[audio-history] --audio-history has no effect in --pretrain mode (no audio captured).')
+
     callbacks = CallbackList(cb_list)
     
     # Train
@@ -655,6 +865,17 @@ def main():
                              'results and reward breakdown. Close the plot window to continue. '
                              'Use this to visually verify the classifier is hearing the note '
                              'before committing to a long run. No-op in --pretrain mode.')
+
+    parser.add_argument('--audio-history', action='store_true', default=True,
+                        help='Keep a rolling buffer of the last N real robot audio captures '
+                             '(filtered/instant steps are excluded). Press \'a\' at any point '
+                             'during training to dump the current buffer to '
+                             '<run-dir>/audio_dumps/dump_TIMESTAMP/ as WAV + JSON pairs. '
+                             'Useful for spot-checking what the robot is actually hearing '
+                             'without interrupting the training run. No-op in --pretrain mode.')
+    parser.add_argument('--audio-history-size', type=int, default=5, metavar='N',
+                        help='Number of recent robot audio captures to keep in the rolling '
+                             'buffer for --audio-history (default: 5).')
 
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,

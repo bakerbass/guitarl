@@ -41,7 +41,7 @@ SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 # ── Filtration layer thresholds ───────────────────────────────────────
 TORQUE_HARD_MAX   = 300.0   # Anything above this is too aggressive for harmonics
 TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
-FRET_MAX_ERROR    = 3.0     # More than 3 frets away? Not even trying
+FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
 FILTRATION_PENALTY = -1.0   # Flat penalty when filtration rejects an action

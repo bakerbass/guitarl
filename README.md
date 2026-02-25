@@ -32,6 +32,7 @@ The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
   - [Resuming an Interrupted Run](#resuming-an-interrupted-run)
   - [Evaluation](#evaluation)
   - [Reviewing & Relabeling Clips](#reviewing--relabeling-clips)
+  - [Exporting an Augmented Dataset](#exporting-an-augmented-dataset)
 - [Robot Safety](#robot-safety)
 - [Monitoring](#monitoring)
 - [Offline Pre-Training vs. Robot Training](#offline-pre-training-vs-robot-training)
@@ -79,9 +80,10 @@ guitaRL/
 │   ├── reward.py           # All reward logic — single source of truth
 │   └── audio_reward.py     # Audio capture + classifier dispatch → reward.py
 ├── scripts/
-│   ├── ablation_no_filtration.sh   # Ablation: bypass physics gate
-│   ├── ablation_no_audio.sh        # Ablation: no CNN, fret+torque shaping only
-│   └── review_successes.py         # Interactive clip review / relabeling tool
+│   ├── ablation_no_filtration.sh       # Ablation: bypass physics gate
+│   ├── ablation_no_audio.sh            # Ablation: no CNN, fret+torque shaping only
+│   ├── review_successes.py             # Interactive clip review / relabeling tool
+│   └── export_augmented_dataset.py    # Package augmented dataset zip for retraining
 ├── utils/
 │   ├── __init__.py
 │   ├── reward.py           # All reward logic — single source of truth
@@ -415,12 +417,22 @@ retraining the classifier.
 # Review all clips in a run's successes directory
 python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/
 
+# Review every clip across ALL runs at once
+python scripts/review_successes.py --all-runs
+python scripts/review_successes.py --all-runs ./runs   # explicit runs root
+
 # Only show clips not yet reviewed
 python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/ --unreviewed-only
+python scripts/review_successes.py --all-runs --unreviewed-only
 
 # Skip audio playback (e.g. no speaker connected)
 python scripts/review_successes.py runs/harmonic_sac_TIMESTAMP/successes/ --no-audio
 ```
+
+When audio is enabled the script always prompts you to choose an output device before
+starting, so the right speaker/interface is used regardless of the system default.
+When `--all-runs` is used, a per-run clip count and total is shown and you must
+confirm before review begins.
 
 **Keypress actions during review**
 
@@ -445,6 +457,43 @@ HarmonicsClassifier dataset for retraining:
 python ../HarmonicsClassifier/copy_harmonics_to_clips.py \
     runs/harmonic_sac_TIMESTAMP/successes/ \
     --reviewed-only
+```
+
+---
+
+### Exporting an Augmented Dataset
+
+`scripts/export_augmented_dataset.py` bundles the original HarmonicsClassifier
+`note_clips/` together with all reviewed RL clips into a single zip, ready to
+drop on a flash drive and retrain on another machine.
+
+```bash
+# Default: uses ./runs and ../HarmonicsClassifier, writes zip to current directory
+python scripts/export_augmented_dataset.py
+
+# Explicit paths and custom output location
+python scripts/export_augmented_dataset.py \
+    --runs-dir ./runs \
+    --classifier-dir ../HarmonicsClassifier \
+    --output-dir ~/Desktop
+
+# Include clips not yet reviewed (uses suggested_label as-is — use with caution)
+python scripts/export_augmented_dataset.py --include-unreviewed
+
+# Export only the new RL clips, without the original dataset
+python scripts/export_augmented_dataset.py --no-original
+```
+
+The zip contains:
+- `note_clips/{harmonic,dead_note,general_note}/` — originals + new `RL_*` clips
+- `manifest.json` — per-run provenance, label counts, fret/torque/prob metadata
+
+**On the target machine:**
+```bash
+unzip harmonics_dataset_augmented_TIMESTAMP.zip
+# Move note_clips/ into HarmonicsClassifier/, then:
+python run_build_dataset.py
+python train_cnn.py
 ```
 
 ---
