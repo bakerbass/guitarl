@@ -27,7 +27,7 @@ from typing import Dict, Optional
 HARMONIC_FRETS = [4, 5, 7, 9]
 TORQUE_OPTIMAL_HARMONIC = 70.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
-TORQUE_SAFE_MIN = 16.0
+TORQUE_SAFE_MIN = 60.0
 
 FRET_TOLERANCE = 0.35             # ~1/3 of a fret is acceptable
 TORQUE_TOLERANCE = 75.0          # Within 75 units of optimal
@@ -40,7 +40,7 @@ SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 
 # ── Filtration layer thresholds ───────────────────────────────────────
 TORQUE_HARD_MAX   = 300.0   # Anything above this is too aggressive for harmonics
-TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
+TORQUE_HARD_MIN   = 50.0    # Below this the presser barely touches the string or triggers a weird edge case
 FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
