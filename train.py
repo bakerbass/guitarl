@@ -284,11 +284,13 @@ class AudioHistoryCallback(BaseCallback):
                  output_dir: Path,
                  history_size: int = 10,
                  trigger_key: str = 'a',
+                 reward_override_cb: Optional['RewardOverrideCallback'] = None,
                  verbose: int = 0):
         super().__init__(verbose)
-        self.output_dir    = Path(output_dir)
-        self.history_size  = history_size
-        self.trigger_key   = trigger_key
+        self.output_dir        = Path(output_dir)
+        self.history_size      = history_size
+        self.trigger_key       = trigger_key
+        self.reward_override_cb = reward_override_cb  # Optional: dispatch y/n here
         self._buffer: deque = deque(maxlen=history_size)  # (audio, reward_info, rl_action)
         self._dump_event   = threading.Event()
         self._stop_event   = threading.Event()
@@ -339,6 +341,13 @@ class AudioHistoryCallback(BaseCallback):
                         f"{len(self._buffer)}/{self.history_size} clips queued.\n"
                     )
                     sys.stdout.flush()
+            # Dispatch override keys to RewardOverrideCallback when it is active
+            # alongside --audio-history.  Handling them here avoids two threads
+            # racing on the same stdin file descriptor.
+            elif ch == RewardOverrideCallback.CONFIRM_KEY and self.reward_override_cb is not None:
+                self.reward_override_cb.request_override(self.reward_override_cb.confirm_reward)
+            elif ch == RewardOverrideCallback.REJECT_KEY and self.reward_override_cb is not None:
+                self.reward_override_cb.request_override(self.reward_override_cb.reject_reward)
             elif ch in ('\x03', 'q'):   # Ctrl+C or q — let SB3 handle it
                 self._stop_event.set()
                 import signal, os
@@ -355,9 +364,16 @@ class AudioHistoryCallback(BaseCallback):
             target=self._stdin_listener, daemon=True, name="audio-history-listener"
         )
         self._listener_thread.start()
+        keys_msg = f"'{self.trigger_key}' to dump audio"
+        if self.reward_override_cb is not None:
+            keys_msg += (
+                f", '{RewardOverrideCallback.CONFIRM_KEY}' to confirm reward "
+                f"({self.reward_override_cb.confirm_reward:+.1f}), "
+                f"'{RewardOverrideCallback.REJECT_KEY}' to reject "
+                f"({self.reward_override_cb.reject_reward:+.1f})"
+            )
         logger.info(
-            f"[audio-history] Listening on stdin — press '{self.trigger_key}' at any time "
-            f"to dump the last {self.history_size} robot audio captures to disk."
+            f"[audio-history] Listening on stdin — press {keys_msg}."
         )
 
     def _on_step(self) -> bool:
@@ -454,6 +470,246 @@ class AudioHistoryCallback(BaseCallback):
 
         logger.info(f"[audio-history] Dump complete: {dump_dir}")
         print(f"[audio-history] {n} clip(s) saved → {dump_dir}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Researcher reward override callback
+# ---------------------------------------------------------------------------
+
+# These values deliberately exceed the normal reward ceiling so a researcher's
+# override signal is unambiguous to the agent.  The normal per-step reward is
+# roughly in [-0.1, +2.0] (filtration penalty → full-success step + bonus).
+# Confirmed harmonics get +5.0; classifier false-positives get -3.0.
+OVERRIDE_REWARD_CONFIRM: float =  5.0
+OVERRIDE_REWARD_REJECT:  float = -3.0
+
+
+class RewardOverrideCallback(BaseCallback):
+    """
+    Lets a babysitting researcher inject a strong reward signal directly into
+    the SAC replay buffer, overriding whatever the classifier computed.
+
+    Two outcomes:
+        y  →  CONFIRM  (+5.0 by default)
+               Works for ANY step — not just classifier successes.
+               Use when:
+                 • The agent played a real harmonic the classifier missed
+                   (FALSE NEGATIVE — classifier said "not harmonic").
+                 • The classifier correctly flagged a success but you want
+                   to reinforce it more strongly.
+               On CONFIRM, the replay buffer transition is also marked as
+               terminal (done=True) regardless of what the classifier
+               decided.  This makes the Q-target purely the override reward
+               (+5.0) with no bootstrapping from the next state — giving
+               the agent an unambiguous terminal success signal even when
+               the episode would otherwise have continued.
+
+        n  →  REJECT   (-3.0 by default)
+               Use when the classifier fired a success on noise, a muted
+               string, or any false positive.  The existing done=True flag
+               in the buffer is preserved (episode correctly terminated),
+               only the reward is replaced with a strong negative.
+
+    The override is applied to the *most recently stored* replay buffer
+    transition, which is the step the researcher just observed (assuming the
+    keypress happens during or immediately after the ~3-second robot action).
+
+    Stdin integration:
+        If an AudioHistoryCallback instance is provided at construction,
+        'y'/'n' are dispatched through its existing stdin thread so the two
+        listeners don't race on the same file descriptor.  When running
+        without --audio-history, this callback starts its own stdin thread.
+    """
+
+    CONFIRM_KEY = 'y'
+    REJECT_KEY  = 'n'
+
+    def __init__(self,
+                 confirm_reward: float = OVERRIDE_REWARD_CONFIRM,
+                 reject_reward:  float = OVERRIDE_REWARD_REJECT,
+                 standalone: bool = True,
+                 verbose: int = 0):
+        """
+        Args:
+            confirm_reward: Reward injected on CONFIRM keypress (default +5.0).
+            reject_reward:  Reward injected on REJECT  keypress (default -3.0).
+            standalone:     True  → spin up own stdin listener thread.
+                            False → rely on an external caller (e.g.
+                                    AudioHistoryCallback) to call
+                                    request_override() directly.
+        """
+        super().__init__(verbose)
+        self.confirm_reward = confirm_reward
+        self.reject_reward  = reject_reward
+        self.standalone     = standalone
+        self._pending: Optional[float] = None
+        self._lock          = threading.Lock()
+        self._stop_event    = threading.Event()
+        self._listener_thread: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    # Public API (called from sibling callbacks or keyboard handler)
+    # ------------------------------------------------------------------
+
+    def request_override(self, value: float) -> None:
+        """Queue a reward override.  Thread-safe; safe to call from any thread."""
+        with self._lock:
+            if self._pending is not None:
+                logger.warning(
+                    f'[override] Previous override ({self._pending:+.1f}) was not yet applied '
+                    f'— replacing with {value:+.1f}.'
+                )
+            self._pending = value
+        label = f'CONFIRM (+{value:.1f})' if value >= 0 else f'REJECT ({value:+.1f})'
+        sys.stdout.write(
+            f'\n[override] {label} queued — will inject into replay buffer on next step.\n'
+            f'           Press during the robot action to target the current step.\n'
+        )
+        sys.stdout.flush()
+
+    # ------------------------------------------------------------------
+    # Standalone stdin listener (used when --audio-history is off)
+    # ------------------------------------------------------------------
+
+    def _stdin_listener(self) -> None:
+        """Daemon thread: poll stdin for 'y' / 'n' without blocking training."""
+        try:
+            import tty
+            import termios
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+        except Exception:
+            return  # No real tty (pipes, CI, etc.)
+
+        while not self._stop_event.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
+
+            if ch == self.CONFIRM_KEY:
+                self.request_override(self.confirm_reward)
+            elif ch == self.REJECT_KEY:
+                self.request_override(self.reject_reward)
+            elif ch in ('\x03', 'q'):
+                self._stop_event.set()
+                import signal as _signal, os
+                os.kill(os.getpid(), _signal.SIGINT)
+                break
+
+    # ------------------------------------------------------------------
+    # SB3 callback hooks
+    # ------------------------------------------------------------------
+
+    def _get_base_env(self):
+        """Unwrap DummyVecEnv → Monitor → HarmonicEnv."""
+        try:
+            env = self.training_env.envs[0]
+            return getattr(env, 'env', env)
+        except (AttributeError, IndexError):
+            return None
+
+    def _on_training_start(self) -> None:
+        if self.standalone:
+            self._listener_thread = threading.Thread(
+                target=self._stdin_listener, daemon=True, name='reward-override-listener'
+            )
+            self._listener_thread.start()
+        logger.info(
+            f'[override] Researcher reward override ACTIVE\n'
+            f'           Press  "{self.CONFIRM_KEY}"  to CONFIRM a step as a real harmonic\n'
+            f'             → Injects {self.confirm_reward:+.1f} and marks the transition terminal.\n'
+            f'             → Works on ANY step: use for classifier successes AND false negatives\n'
+            f'               (classifier said "not harmonic" but you heard a real harmonic).\n'
+            f'           Press  "{self.REJECT_KEY}"  to REJECT a classifier false-positive\n'
+            f'             → Injects {self.reject_reward:+.1f} (keeps existing done flag).\n'
+            f'           Both values far exceed the normal reward ceiling (~+2.0).\n'
+            f'           Press during the ~3-second robot action to target that step.'
+        )
+
+    def _on_step(self) -> bool:
+        with self._lock:
+            val = self._pending
+            self._pending = None
+
+        if val is None:
+            return True
+
+        buf = getattr(self.model, 'replay_buffer', None)
+        if buf is None or buf.size() == 0:
+            logger.warning('[override] Replay buffer empty — override discarded.')
+            return True
+
+        last_pos = (buf.pos - 1) % buf.max_size
+        old_reward  = float(buf.rewards[last_pos, 0])
+        old_done    = bool(buf.dones[last_pos, 0])
+
+        # --- Fetch classification context from the environment ---
+        base_env    = self._get_base_env()
+        reward_info = getattr(base_env, 'last_reward_info', None) or {}
+        cls         = reward_info.get('classification') or {}
+        h_prob      = cls.get('harmonic_prob')
+        cls_label   = cls.get('predicted_label', 'unknown')
+        filtered    = reward_info.get('filtered', False)
+
+        is_confirm = val > 0
+
+        # For CONFIRM: determine whether this is a false-negative correction
+        # (classifier said non-harmonic but researcher heard a harmonic).
+        # A true classifier success has old_done=True and h_prob >= success_threshold.
+        success_threshold = getattr(base_env, 'success_threshold', 0.8)
+        classifier_said_harmonic = (h_prob is not None and h_prob >= success_threshold)
+        is_false_negative = is_confirm and (not classifier_said_harmonic) and (not filtered)
+
+        # --- Patch replay buffer ---
+        buf.rewards[last_pos, 0] = float(val)
+
+        # On CONFIRM: mark the transition as terminal — the Q-target becomes
+        # purely the override reward with no next-state bootstrapping.  This
+        # gives the agent an unambiguous terminal success signal even when the
+        # classifier didn't terminate the episode (false negative case).
+        if is_confirm:
+            buf.dones[last_pos, 0] = True
+
+        # --- Build human-readable context line ---
+        if filtered:
+            ctx = 'filtered step (no audio captured)'
+        elif h_prob is not None:
+            ctx = (f'classifier={cls_label}  H={h_prob:.3f}')
+        else:
+            ctx = 'no classification available'
+
+        tag = 'CONFIRM ✓' if is_confirm else 'REJECT  ✗'
+        fn_note = '  ← FALSE NEGATIVE CORRECTION' if is_false_negative else ''
+
+        done_patch = f'{old_done} → True' if (is_confirm and not old_done) else str(old_done)
+
+        logger.info(
+            f'\n{"=" * 60}\n'
+            f'  [override] {tag}{fn_note}\n'
+            f'  Buffer pos {last_pos}:\n'
+            f'    reward: {old_reward:+.4f}  →  {val:+.4f}\n'
+            f'    done:   {done_patch}\n'
+            f'    context: {ctx}\n'
+            f'{"=" * 60}\n'
+        )
+        fn_suffix = ' (false-negative correction)' if is_false_negative else ''
+        sys.stdout.write(
+            f'\n[override] {tag}{fn_suffix}\n'
+            f'  reward {old_reward:+.3f} → {val:+.3f}  |  {ctx}\n'
+        )
+        sys.stdout.flush()
+        return True
+
+    def _on_training_end(self) -> None:
+        self._stop_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -681,9 +937,21 @@ def train(args):
         logger.warning('[slow] --slow has no effect in --pretrain mode (no audio captured).')
 
     if args.audio_history and not args.pretrain:
+        # Build the override callback first (may be None) so it can be wired
+        # into AudioHistoryCallback's stdin dispatcher to avoid stdin races.
+        override_cb: Optional[RewardOverrideCallback] = None
+        if args.override:
+            override_cb = RewardOverrideCallback(
+                confirm_reward=args.override_confirm_reward,
+                reject_reward=args.override_reject_reward,
+                standalone=False,   # AudioHistoryCallback owns the stdin thread
+            )
+            cb_list.append(override_cb)
+
         audio_history_cb = AudioHistoryCallback(
             output_dir=output_dir / 'audio_dumps',
             history_size=args.audio_history_size,
+            reward_override_cb=override_cb,
         )
         cb_list.append(audio_history_cb)
         logger.info(
@@ -692,6 +960,19 @@ def train(args):
         )
     elif args.audio_history and args.pretrain:
         logger.warning('[audio-history] --audio-history has no effect in --pretrain mode (no audio captured).')
+        if args.override and args.pretrain:
+            logger.warning('[override] --override has no effect in --pretrain mode (no audio captured).')
+    else:
+        # No audio-history — wire standalone override if requested
+        if args.override and not args.pretrain:
+            override_cb = RewardOverrideCallback(
+                confirm_reward=args.override_confirm_reward,
+                reject_reward=args.override_reject_reward,
+                standalone=True,    # Owns its own stdin listener thread
+            )
+            cb_list.append(override_cb)
+        elif args.override and args.pretrain:
+            logger.warning('[override] --override has no effect in --pretrain mode (no audio captured).')
 
     callbacks = CallbackList(cb_list)
     
@@ -876,6 +1157,33 @@ def main():
     parser.add_argument('--audio-history-size', type=int, default=5, metavar='N',
                         help='Number of recent robot audio captures to keep in the rolling '
                              'buffer for --audio-history (default: 5).')
+
+    # Researcher reward override
+    parser.add_argument('--override', action='store_true', default=False,
+                        help='Enable researcher reward override during babysitting. '
+                             'Press "y" at any time during a robot action to CONFIRM the '
+                             'step as a real harmonic — this works on ANY step, including '
+                             'ones the classifier labelled as non-harmonic (false negatives). '
+                             'The transition is marked terminal and given '
+                             '--override-confirm-reward (default +5.0). '
+                             'Press "n" to REJECT a classifier false-positive '
+                             '(injects --override-reject-reward, default -3.0; keeps existing '
+                             'done flag). '
+                             'Both values far exceed the normal reward ceiling (~+2.0), so the '
+                             'override unambiguously dominates the agent\'s learning. '
+                             'The keypress is captured by the same stdin thread as '
+                             '--audio-history when both are active (no race condition). '
+                             'No-op in --pretrain mode.')
+    parser.add_argument('--override-confirm-reward', type=float, default=OVERRIDE_REWARD_CONFIRM,
+                        metavar='R',
+                        help=f'Reward injected when the researcher presses "y" (CONFIRM). '
+                             f'Should be >> the normal max reward (~+2.0). '
+                             f'Default: {OVERRIDE_REWARD_CONFIRM}')
+    parser.add_argument('--override-reject-reward', type=float, default=OVERRIDE_REWARD_REJECT,
+                        metavar='R',
+                        help=f'Reward injected when the researcher presses "n" (REJECT). '
+                             f'Should be a strong negative well below 0. '
+                             f'Default: {OVERRIDE_REWARD_REJECT}')
 
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,
