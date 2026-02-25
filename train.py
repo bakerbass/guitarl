@@ -717,7 +717,7 @@ class RewardOverrideCallback(BaseCallback):
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None):
+             success_recorder=None, temperature: float = 1.5):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -731,6 +731,7 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         reward_mode=reward_mode,
         offline=offline,
         success_recorder=success_recorder,
+        temperature=temperature,
     )
     env = Monitor(env)
     return env
@@ -774,6 +775,7 @@ def train(args):
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     logger.info(f"Reward mode: {args.reward_mode}")
+    logger.info(f"Classifier temperature: {args.temperature}")
 
     if args.pretrain:
         logger.info(
@@ -808,6 +810,7 @@ def train(args):
         reward_mode=args.reward_mode,
         offline=args.pretrain,
         success_recorder=success_recorder,
+        temperature=args.temperature,
     )
 
     # Create evaluation environment
@@ -819,6 +822,7 @@ def train(args):
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
         offline=args.pretrain,
+        temperature=args.temperature,
     )
     
     # Configure SAC agent
@@ -1124,7 +1128,11 @@ def main():
                         help='Reward function variant for ablation studies. '
                              '"full" (default): two-layer reward (filtration + CNN). '
                              '"no_filtration": skip physics gate, all actions reach the CNN. '
-                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights).')    
+                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights).')
+    parser.add_argument('--temperature', type=float, default=1.5,
+                        help='Temperature for classifier logit scaling before softmax (default: 1.5). '
+                             'Values > 1 produce softer, less overconfident harmonic probabilities. '
+                             'T=1.0 is equivalent to standard softmax.')
     # Device
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],

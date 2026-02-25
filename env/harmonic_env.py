@@ -113,7 +113,8 @@ class HarmonicEnv(gym.Env):
                  always_press: bool = True,
                  reward_mode: str = REWARD_MODE_FULL,
                  offline: bool = False,
-                 success_recorder: Optional['SuccessRecorder'] = None):
+                 success_recorder: Optional['SuccessRecorder'] = None,
+                 temperature: float = 1.5):
         """
         Initialize HarmonicEnv.
 
@@ -137,6 +138,9 @@ class HarmonicEnv(gym.Env):
             offline: If True, skip all robot/audio hardware. Reward comes from the
                      filtration layer only (fret + torque shaping). Use for fast
                      pre-training before deploying on the physical robot.
+            temperature: Temperature for logit scaling before softmax in the classifier
+                         (default 1.5). Values > 1 produce softer, less overconfident
+                         harmonic probabilities. Passed through to HarmonicRewardCalculator.
         """
         super().__init__()
 
@@ -185,6 +189,7 @@ class HarmonicEnv(gym.Env):
                 device_name=audio_device,
                 capture_duration=capture_duration,
                 reward_mode=reward_mode,
+                temperature=temperature,
             )
         
         # Define action space dimensions

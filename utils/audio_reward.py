@@ -70,7 +70,8 @@ class HarmonicRewardCalculator:
                  capture_duration: float = 1.0,
                  model_sr: int = 22050,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu",
-                 reward_mode: str = REWARD_MODE_FULL):
+                 reward_mode: str = REWARD_MODE_FULL,
+                 temperature: float = 1.5):
         """
         Initialize reward calculator.
         
@@ -84,12 +85,15 @@ class HarmonicRewardCalculator:
                          'full'           — two-layer reward (default)
                          'no_filtration'  — bypass physics gate, Layer 2 only
                          'no_audio'       — Layer 1 + fret/torque shaping, no CNN
+            temperature: Temperature for logit scaling before softmax (default 1.5).
+                         Values > 1 produce softer, less overconfident probabilities.
         """
         self.model_path = Path(model_path)
         self.device_name = device_name
         self.capture_duration = capture_duration
         self.model_sr = model_sr
         self.device = torch.device(device)
+        self.temperature = temperature
         
         # Audio processing parameters
         self.n_mels = 128
@@ -122,7 +126,7 @@ class HarmonicRewardCalculator:
         # Load model
         self.model = self._load_model()
         self.reward_mode = reward_mode
-        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
+        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}, temperature={temperature}")
     
     def _find_audio_device(self) -> Optional[int]:
         """Find audio input device by name substring (input channels required)."""
@@ -314,10 +318,10 @@ class HarmonicRewardCalculator:
         audio_tensor = self.preprocess_audio(audio_trimmed)
         audio_tensor = audio_tensor.to(self.device)
         
-        # Inference
+        # Inference with temperature scaling
         with torch.no_grad():
-            outputs = self.model(audio_tensor)
-            probabilities = torch.softmax(outputs, dim=1)
+            logits = self.model(audio_tensor)
+            probabilities = torch.softmax(logits / self.temperature, dim=1)
             predicted_class = torch.argmax(probabilities, dim=1).item()
             confidence = probabilities[0, predicted_class].item()
         
