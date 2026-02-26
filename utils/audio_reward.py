@@ -17,6 +17,20 @@ import logging
 from typing import Dict, Optional, Tuple
 import time
 
+from utils.audio_buffer import RollingAudioBuffer
+
+
+# ---------------------------------------------------------------------------
+# Rolling-buffer / onset-detection constants
+# ---------------------------------------------------------------------------
+ROLLING_BUFFER_DURATION = 60.0   # seconds of rolling audio history
+ONSET_PRE_ROLL          = 0.05   # seconds before detected onset to include
+ONSET_POST_ROLL         = 1.5    # seconds after onset (CNN window duration)
+ONSET_THRESHOLD_FACTOR  = 8.0    # energy multiple above background → onset
+ONSET_SEARCH_WINDOW     = 3.0    # seconds to search after action timestamp
+ONSET_TIMEOUT           = 5.0    # fallback after this many seconds
+LATENCY_EMA_ALPHA       = 0.1    # EMA smoothing factor for latency estimate
+
 
 # Add HarmonicsClassifier to path
 HARMONICS_CLASSIFIER_PATH = Path(__file__).parent.parent.parent / "HarmonicsClassifier"
@@ -127,7 +141,20 @@ class HarmonicRewardCalculator:
         self.model = self._load_model()
         self.reward_mode = reward_mode
         logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}, temperature={temperature}")
-    
+
+        # Rolling audio buffer (always-on background recording)
+        self._rolling_buffer = RollingAudioBuffer(
+            device_id=self.device_id,
+            device_sr=self.device_sr,
+            buffer_duration=ROLLING_BUFFER_DURATION,
+        )
+        self._rolling_buffer.start()
+
+        # Latency estimate: EMA of (onset_time - action_time)
+        self._latency_ema: float = 0.5  # Sensible initial guess (seconds)
+
+        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
+
     def _find_audio_device(self) -> Optional[int]:
         """Find audio input device by name substring (input channels required)."""
         devices = sd.query_devices()
@@ -244,8 +271,106 @@ class HarmonicRewardCalculator:
             logger.error(f"Audio capture failed: {e}")
             return np.zeros(int(self.device_sr * duration))
     
+    @property
+    def latency_ema(self) -> float:
+        """Current exponential moving average of action-to-onset latency (seconds)."""
+        return self._latency_ema
+
+    def capture_audio_from_buffer(self, t_action: float) -> np.ndarray:
+        """
+        Onset-aligned audio capture using the rolling buffer.
+
+        Waits for a note onset after ``t_action``, then extracts a window
+        centred on the onset for CNN classification.  Updates the latency EMA.
+
+        Parameters
+        ----------
+        t_action : float
+            Monotonic wall-clock timestamp (``time.monotonic()``) of the OSC
+            send that triggered the robot pluck.
+
+        Returns
+        -------
+        np.ndarray
+            Audio at device sample rate, length ≈ ONSET_PRE_ROLL + ONSET_POST_ROLL.
+        """
+        t_onset = self._rolling_buffer.wait_for_onset(
+            after_time=t_action,
+            search_window=ONSET_SEARCH_WINDOW,
+            timeout=ONSET_TIMEOUT,
+            threshold_factor=ONSET_THRESHOLD_FACTOR,
+            fallback_delay=self._latency_ema,
+        )
+
+        # Update latency EMA
+        measured_latency = t_onset - t_action
+        self._latency_ema = (
+            LATENCY_EMA_ALPHA * measured_latency
+            + (1.0 - LATENCY_EMA_ALPHA) * self._latency_ema
+        )
+        logger.debug(
+            f"Onset latency: {measured_latency:.3f}s  EMA: {self._latency_ema:.3f}s"
+        )
+
+        audio = self._rolling_buffer.get_audio_range(
+            t_onset - ONSET_PRE_ROLL,
+            t_onset + ONSET_POST_ROLL,
+        )
+        return audio
+
+    def calibrate_silence_threshold(
+        self,
+        duration: float = 2.0,
+        multiplier: float = 3.0,
+    ) -> float:
+        """
+        Measure ambient noise floor and return a suitable silence RMS threshold.
+
+        Delegates to ``RollingAudioBuffer.calibrate_silence_threshold()``.
+        Call this once at startup (before any robot actions) when using
+        ``--silence-rms auto``.
+
+        Parameters
+        ----------
+        duration : float
+            Seconds of quiescent audio to sample.
+        multiplier : float
+            Scale factor above the noise floor (default 3.0).
+
+        Returns
+        -------
+        float
+            Recommended RMS threshold for ``wait_for_silence()``.
+        """
+        return self._rolling_buffer.calibrate_silence_threshold(
+            duration=duration,
+            multiplier=multiplier,
+        )
+
+    def wait_for_silence(
+        self,
+        rms_threshold: float = 0.005,
+        hold_duration: float = 0.5,
+        timeout: float = 8.0,
+    ) -> bool:
+        """
+        Block until the audio signal has been below ``rms_threshold`` for
+        ``hold_duration`` continuous seconds (delegates to rolling buffer).
+
+        Returns True when silence confirmed, False on timeout.
+        """
+        return self._rolling_buffer.wait_for_silence(
+            rms_threshold=rms_threshold,
+            hold_duration=hold_duration,
+            timeout=timeout,
+        )
+
     def close(self) -> None:
         """Release any held audio resources. Safe to call multiple times."""
+        try:
+            self._rolling_buffer.stop()
+        except Exception:
+            pass
         try:
             sd.stop()
         except Exception:
