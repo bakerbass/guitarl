@@ -868,7 +868,8 @@ class RewardOverrideCallback(BaseCallback):
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None, temperature: float = 1.5):
+             success_recorder=None, temperature: float = 1.5,
+             shared_rolling_buffer=None, audio_device_id: Optional[int] = None):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -883,6 +884,8 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         offline=offline,
         success_recorder=success_recorder,
         temperature=temperature,
+        shared_rolling_buffer=shared_rolling_buffer,
+        audio_device_id=audio_device_id,
     )
     env = Monitor(env)
     return env
@@ -962,9 +965,16 @@ def train(args):
         offline=args.pretrain,
         success_recorder=success_recorder,
         temperature=args.temperature,
+        audio_device_id=getattr(args, 'audio_device_id', None),
     )
 
-    # Create evaluation environment
+    # Create evaluation environment, sharing the training env's audio buffer
+    # so only one InputStream is opened on the hardware device.
+    train_rolling_buffer = None
+    if not args.pretrain:
+        train_base = env.unwrapped  # type: ignore[assignment]
+        if hasattr(train_base, 'reward_calc') and train_base.reward_calc is not None:
+            train_rolling_buffer = train_base.reward_calc._rolling_buffer
     eval_env = make_env(
         model_path=args.model_path,
         curriculum_mode="random",  # Evaluate on all frets
@@ -974,6 +984,7 @@ def train(args):
         reward_mode=args.reward_mode,
         offline=args.pretrain,
         temperature=args.temperature,
+        shared_rolling_buffer=train_rolling_buffer,
     )
 
     # ── Silence-gate threshold calibration ────────────────────────────────────
@@ -1113,14 +1124,16 @@ def train(args):
         # value (see SAC constructor above).  RobotLearningStartCallback lowers
         # it to 0 once enough real robot actions have been collected.
         cb_list.append(RobotLearningStartCallback(args.learning_starts))
-    if args.slow and not args.pretrain:
+    _audio_plot = args.slow or getattr(args, 'test_audio', False)
+    if _audio_plot and not args.pretrain:
         cb_list.append(SlowModeCallback())
+        flag_name = '--test-audio' if getattr(args, 'test_audio', False) and not args.slow else '--slow'
         logger.info(
-            '[slow] Slow-mode enabled: training will pause after every episode to plot audio. '
+            f'[slow] {flag_name} enabled: training will pause after every episode to plot audio. '
             'Close the plot window to continue.'
         )
-    elif args.slow and args.pretrain:
-        logger.warning('[slow] --slow has no effect in --pretrain mode (no audio captured).')
+    elif _audio_plot and args.pretrain:
+        logger.warning('[slow] --slow / --test-audio has no effect in --pretrain mode (no audio captured).')
 
     if args.audio_history and not args.pretrain:
         # Build the override callback first (may be None) so it can be wired
@@ -1244,6 +1257,11 @@ def main():
                         help='OSC port (default: 12000 for GuitarBot, 8000 for StringSim)')
     parser.add_argument('--audio-device', type=str, default='Scarlett',
                         help='Audio input device name substring (default: Scarlett)')
+    parser.add_argument('--audio-device-id', type=int, default=None,
+                        help='Force a specific sounddevice device index, bypassing name '
+                             'search (use arecord -l or python -m sounddevice to list IDs). '
+                             'Useful when the named hw: device conflicts with PipeWire; '
+                             'e.g. --audio-device-id 6 to use sysdefault/PipeWire bridge.')
     parser.add_argument('--curriculum', type=str, default='easy_to_hard',
                         choices=['random', 'easy_to_hard', 'fixed_fret'],
                         help='Curriculum learning mode')
@@ -1336,6 +1354,12 @@ def main():
                              'results and reward breakdown. Close the plot window to continue. '
                              'Use this to visually verify the classifier is hearing the note '
                              'before committing to a long run. No-op in --pretrain mode.')
+
+    parser.add_argument('--test-audio', action='store_true', default=False,
+                        help='Alias for --slow. After every episode plot the captured audio '
+                             'waveform + mel spectrogram to confirm the audio pipeline is '
+                             'working correctly. Identical behaviour to --slow: blocks training '
+                             'until the plot window is closed. No-op in --pretrain mode.')
 
     parser.add_argument('--audio-history', action='store_true', default=True,
                         help='Keep a rolling buffer of the last N real robot audio captures '
