@@ -97,6 +97,13 @@ class HarmonicEnv(gym.Env):
     ACTION_DURATION = 3.0       # Total step duration (seconds)
     CAPTURE_PRE_DELAY = 0.5     # Wait after send_rlfret before recording (robot arm movement + pluck)
     STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
+
+    # Silence gate: wait for harmonic bleed to decay before the next step.
+    # silence_rms_threshold is stored as an instance variable so train.py can
+    # override it with --silence-rms auto or a numeric value after construction.
+    SILENCE_RMS_THRESHOLD = 0.005  # default; overridden by instance var below
+    SILENCE_HOLD_DURATION = 0.5    # seconds of continuous quiet required
+    SILENCE_TIMEOUT       = 8.0    # max wait before proceeding anyway
     
     def __init__(self,
                  model_path: Optional[str] = None,
@@ -142,6 +149,9 @@ class HarmonicEnv(gym.Env):
 
         self.offline = offline
         self.success_recorder = success_recorder
+        # Instance-level silence threshold — can be updated by train.py after
+        # construction (e.g. --silence-rms auto calibration).
+        self.silence_rms_threshold: float = self.SILENCE_RMS_THRESHOLD
         # Resolve string pool — validate every entry has a plucker
         if string_indices is not None:
             for s in string_indices:
@@ -438,6 +448,16 @@ class HarmonicEnv(gym.Env):
             else:
                 # Action passed filtration — send to robot, capture audio, compute reward.
                 self.robot_step_count += 1
+
+                # Wait for any harmonic bleed from the previous step to decay
+                # before committing the next action.  Proceeds immediately if
+                # already quiet or if no audio device is available.
+                self.reward_calc.wait_for_silence(
+                    rms_threshold=self.silence_rms_threshold,
+                    hold_duration=self.SILENCE_HOLD_DURATION,
+                    timeout=self.SILENCE_TIMEOUT,
+                )
+
                 self.osc_client.send_rlfret(rl_action)
 
                 # Short pre-delay for the robot arm to physically move and pluck.

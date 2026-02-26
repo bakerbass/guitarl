@@ -564,7 +564,32 @@ def train(args):
         reward_mode=args.reward_mode,
         offline=args.pretrain,
     )
-    
+
+    # ── Silence-gate threshold ─────────────────────────────────────────────────
+    # No-op in pretrain mode (no audio hardware).  In online mode, resolve
+    # --silence-rms: measure ambient noise floor ("auto") or use the given float.
+    if not args.pretrain:
+        train_base: HarmonicEnv = env.unwrapped      # type: ignore[assignment]
+        eval_base:  HarmonicEnv = eval_env.unwrapped # type: ignore[assignment]
+        silence_rms_str = args.silence_rms.strip().lower()
+        if silence_rms_str == 'auto':
+            logger.info("--silence-rms auto: measuring ambient noise floor (2 s)...")
+            threshold = train_base.reward_calc.calibrate_silence_threshold(
+                duration=2.0, multiplier=3.0
+            )
+        else:
+            try:
+                threshold = float(silence_rms_str)
+                logger.info(f"--silence-rms: using manual threshold {threshold:.6f}")
+            except ValueError:
+                logger.warning(
+                    f"--silence-rms '{args.silence_rms}' is not a float or 'auto'; "
+                    "using default 0.005"
+                )
+                threshold = 0.005
+        train_base.silence_rms_threshold = threshold
+        eval_base.silence_rms_threshold  = threshold
+
     # Configure SAC agent
     logger.info("Configuring SAC agent...")
     policy_kwargs = dict(
@@ -876,6 +901,14 @@ def main():
     parser.add_argument('--audio-history-size', type=int, default=5, metavar='N',
                         help='Number of recent robot audio captures to keep in the rolling '
                              'buffer for --audio-history (default: 5).')
+
+    # Silence gate
+    parser.add_argument('--silence-rms', type=str, default='auto', metavar='THRESHOLD',
+                        help='RMS threshold for the pre-step silence gate that waits for '
+                             'harmonic bleed to decay.  Pass a float (e.g. 0.005) to use '
+                             'it directly, or "auto" (default) to measure the ambient noise '
+                             'floor at startup and set the threshold to 3× that value.  '
+                             'No-op in --pretrain mode.')
 
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,

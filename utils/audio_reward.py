@@ -240,6 +240,121 @@ class HarmonicRewardCalculator:
             logger.error(f"Audio capture failed: {e}")
             return np.zeros(int(self.device_sr * duration))
     
+    def calibrate_silence_threshold(
+        self,
+        duration: float = 2.0,
+        multiplier: float = 3.0,
+    ) -> float:
+        """
+        Measure the ambient noise floor and return a suitable silence threshold.
+
+        Opens a short-lived stream, records ``duration`` seconds of quiescent
+        audio in 20 ms chunks, and returns ``median_chunk_rms * multiplier``.
+        The median is used rather than the mean so that brief transients (a door
+        slam, a key press) during calibration don't inflate the threshold.
+
+        Call this once at startup before any robot actions are sent.
+
+        Args:
+            duration:   Seconds of ambient audio to sample (default 2.0).
+            multiplier: Scale factor above the noise floor (default 3.0).
+                        A value of 3.0 means the silence gate fires when the
+                        signal has been < 3× the ambient RMS.
+
+        Returns:
+            RMS threshold (always >= 1e-6).
+        """
+        if self.device_id is None:
+            logger.warning("calibrate_silence_threshold: no device, returning default 0.005")
+            return 0.005
+
+        chunk_frames = int(0.02 * self.device_sr)  # 20 ms per chunk
+        n_chunks = max(1, int(duration / 0.02))
+        rms_values: list = []
+
+        logger.info(
+            f"Calibrating silence threshold: sampling {duration:.1f}s of ambient audio..."
+        )
+        try:
+            with sd.InputStream(
+                samplerate=self.device_sr,
+                channels=1,
+                device=self.device_id,
+                dtype="float32",
+                blocksize=chunk_frames,
+            ) as stream:
+                for _ in range(n_chunks):
+                    chunk, _ = stream.read(chunk_frames)
+                    rms_values.append(float(np.sqrt(np.mean(chunk[:, 0] ** 2))))
+        except Exception as exc:
+            logger.error(f"calibrate_silence_threshold failed: {exc}, returning default 0.005")
+            return 0.005
+
+        noise_floor = float(np.median(rms_values))
+        threshold = max(noise_floor * multiplier, 1e-6)
+        logger.info(
+            f"  Noise floor (median RMS): {noise_floor:.6f}  "
+            f"Threshold (×{multiplier}): {threshold:.6f}"
+        )
+        return threshold
+
+    def wait_for_silence(
+        self,
+        rms_threshold: float = 0.005,
+        hold_duration: float = 0.5,
+        timeout: float = 8.0,
+    ) -> bool:
+        """
+        Block until the audio signal has been below ``rms_threshold`` for
+        ``hold_duration`` continuous seconds, or until ``timeout`` elapses.
+
+        Opens a dedicated short-lived stream so the main capture stream is
+        not affected.  Reads audio in 20 ms chunks; each chunk is one poll
+        cycle (~50 Hz), so the hold counter is in units of 20 ms chunks.
+
+        Args:
+            rms_threshold: Per-chunk RMS that counts as "silent" (default 0.005).
+            hold_duration: Seconds of continuous silence required (default 0.5).
+            timeout:       Maximum wait in seconds before proceeding (default 8.0).
+
+        Returns:
+            True if silence was confirmed, False if timed out.
+        """
+        if self.device_id is None:
+            return True  # No device — treat as silent
+
+        chunk_frames = int(0.02 * self.device_sr)           # samples per 20 ms chunk
+        chunks_needed = max(1, int(hold_duration / 0.02))   # consecutive quiet chunks
+        chunks_limit  = max(1, int(timeout / 0.02))         # total chunks before timeout
+
+        try:
+            with sd.InputStream(
+                samplerate=self.device_sr,
+                channels=1,
+                device=self.device_id,
+                dtype="float32",
+                blocksize=chunk_frames,
+            ) as stream:
+                consecutive_quiet = 0
+                for _ in range(chunks_limit):
+                    chunk, _ = stream.read(chunk_frames)
+                    rms = float(np.sqrt(np.mean(chunk[:, 0] ** 2)))
+                    if rms < rms_threshold:
+                        consecutive_quiet += 1
+                        if consecutive_quiet >= chunks_needed:
+                            return True
+                    else:
+                        consecutive_quiet = 0
+        except Exception as exc:
+            logger.warning(f"wait_for_silence: stream error ({exc}), proceeding")
+            return False
+
+        logger.warning(
+            f"wait_for_silence: timed out after {timeout:.1f}s "
+            f"(threshold={rms_threshold:.4f}, hold={hold_duration:.2f}s)"
+        )
+        return False
+
     def close(self) -> None:
         """Release any held audio resources. Safe to call multiple times."""
         try:
