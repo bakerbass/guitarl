@@ -29,7 +29,13 @@ TORQUE_OPTIMAL_HARMONIC = 70.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
 TORQUE_SAFE_MIN = 60.0
 
-FRET_TOLERANCE = 0.35             # ~1/3 of a fret is acceptable
+FRET_TOLERANCE = 0.35             # legacy alias (= FRET_TOLERANCE_ABOVE)
+# Asymmetric fret Gaussian: being slightly above the target fret is more
+# acceptable than being below it (below = wrong side of the harmonic node).
+# σ_above is the same as the old symmetric FRET_TOLERANCE so existing
+# behaviour is preserved on the high side.
+FRET_TOLERANCE_ABOVE = 0.35   # generous — 7.1 is fine
+FRET_TOLERANCE_BELOW = 0.10   # tighter  — 6.9 is penalised more
 TORQUE_TOLERANCE = 75.0          # Within 75 units of optimal
 
 # Classifier label order (must match train_cnn.py label_map)
@@ -62,14 +68,40 @@ ABLATION_NO_AUDIO_TORQUE_WEIGHT = 0.5
 # At σ=1.5  (pretrain): reward at 1 fret away ≈ 0.80
 #                        reward at 2 frets away ≈ 0.41
 #                        reward at 3 frets away ≈ 0.14 (filtration boundary)
-# This ensures the agent always has a direction signal toward the harmonic node
-# even when exploring far from target.
-PRETRAIN_FRET_TOLERANCE = 1.5
+# The above/below asymmetry is scaled by the same ratio as online.
+PRETRAIN_FRET_TOLERANCE       = 1.5   # pretrain σ_above
+PRETRAIN_FRET_TOLERANCE_BELOW = round(
+    1.5 * FRET_TOLERANCE_BELOW / FRET_TOLERANCE_ABOVE, 4
+)  # ≈ 0.4286 — keeps the above/below ratio consistent with online mode
 
 # Reward mode strings
 REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
 REWARD_MODE_NO_FILTRATION = 'no_filtration'  # Layer 2 only — bypass physics gate
 REWARD_MODE_NO_AUDIO      = 'no_audio'       # Layer 1 + fret/torque shaping only
+
+
+# ── Shared helpers ───────────────────────────────────────────────────
+
+
+def _asymmetric_fret_reward(
+    fret_position: float,
+    target_fret: int,
+    sigma_above: float = FRET_TOLERANCE_ABOVE,
+    sigma_below: float = FRET_TOLERANCE_BELOW,
+) -> float:
+    """
+    Asymmetric Gaussian fret reward.
+
+    Uses σ_above when the agent overshoots the target fret (acceptable —
+    still on the harmonic node or approaching from the safe side) and σ_below
+    when it undershoots (penalised more — wrong side of the node).
+
+        reward = exp(−signed_error² / 2σ²)
+        where σ = sigma_above if fret_pos ≥ target else sigma_below
+    """
+    signed_error = fret_position - float(target_fret)
+    sigma = sigma_above if signed_error >= 0.0 else sigma_below
+    return float(np.exp(-(signed_error ** 2) / (2.0 * sigma ** 2)))
 
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
@@ -148,9 +180,11 @@ def compute_audio_reward(
     # Audio reward: harmonic probability straight from classifier
     audio_reward = float(harmonic_prob)
 
-    # Fret shaping: Gaussian centred on target fret
-    fret_error = abs(fret_position - float(target_fret))
-    fret_reward = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
+    # Fret shaping: asymmetric Gaussian centred on target fret
+    # σ_above=FRET_TOLERANCE_ABOVE on the high side (7.1 is fine)
+    # σ_below=FRET_TOLERANCE_BELOW on the low side (6.9 is penalised more)
+    fret_error  = abs(fret_position - float(target_fret))
+    fret_reward = _asymmetric_fret_reward(fret_position, target_fret)
 
     # Torque shaping: shifted Gaussian, range [-1, +1]
     torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
@@ -289,7 +323,10 @@ def compute_reward_no_audio(
     if target_fret not in HARMONIC_FRETS:
         raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
 
-    _fret_tol = fret_tolerance if fret_tolerance is not None else FRET_TOLERANCE
+    _fret_tol = fret_tolerance if fret_tolerance is not None else FRET_TOLERANCE_ABOVE
+    # Scale the below-tolerance proportionally so the asymmetry ratio is
+    # preserved regardless of which tolerance (online vs pretrain) is active.
+    _fret_tol_below = _fret_tol * (FRET_TOLERANCE_BELOW / FRET_TOLERANCE_ABOVE)
 
     filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
     if not filt['passed']:
@@ -306,7 +343,7 @@ def compute_reward_no_audio(
         }
 
     fret_error    = abs(fret_position - float(target_fret))
-    fret_reward   = np.exp(-(fret_error ** 2) / (2 * _fret_tol ** 2))
+    fret_reward   = _asymmetric_fret_reward(fret_position, target_fret, _fret_tol, _fret_tol_below)
     torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
     torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
 

@@ -38,6 +38,45 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Terminal helper
+# ---------------------------------------------------------------------------
+
+def _configure_stdin_single_char():
+    """
+    Configure stdin for single-character reads without full raw mode.
+
+    Disables ICANON (line-buffered input) and ECHO so keypresses are
+    delivered immediately without the user pressing Enter, but deliberately
+    leaves OPOST (output post-processing) untouched.  With OPOST on, the
+    kernel still inserts CR before every LF, so SB3's progress table and all
+    other stdout output prints correctly regardless of when the listener
+    thread runs.
+
+    tty.setraw() also clears OPOST, which is what causes the staircase
+    output: if any other thread writes to stdout while raw mode is active
+    (even briefly), every \\n lands without a preceding \\r.
+
+    Returns (fd, old_settings).  The caller must restore with::
+
+        termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+
+    Raises if stdin is not a tty (pipes, CI runners, etc.).
+    """
+    import termios
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    # Index 3 is c_lflag — only clear ICANON and ECHO, leave everything else
+    # (especially OPOST in c_oflag / index 1) completely alone.
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    # c_cc: require 1 byte with no timeout so read() blocks until a byte arrives
+    new[6][termios.VMIN]  = 1
+    new[6][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+    return fd, old
+
+
 class HarmonicProgressCallback(CallbackList):
     """Custom callback to log harmonic-specific metrics."""
     
@@ -304,34 +343,24 @@ class AudioHistoryCallback(BaseCallback):
     def _stdin_listener(self) -> None:
         """Daemon thread: poll stdin for the trigger key without blocking.
 
-        Raw mode is entered only for the instant a character is read, then
-        immediately restored.  This prevents tty.setraw() from holding the
-        terminal in raw mode while SB3 prints its progress table (raw mode
-        suppresses CR insertion, producing staircase output).
+        Single-char mode (ICANON+ECHO disabled, OPOST kept) is entered once
+        for the lifetime of this thread and restored in the finally block.
+        Keeping OPOST enabled means the kernel still inserts CR before every
+        LF, so SB3's progress table prints correctly at all times.
         """
         try:
-            import tty
             import termios
-            fd  = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
+            fd, old = _configure_stdin_single_char()
         except Exception:
             # No real tty (pipes, CI, etc.) — listener is a no-op
             return
 
-        while not self._stop_event.is_set():
-            # Wait up to 100 ms for a keypress — terminal stays in cooked mode
+        try:
+          while not self._stop_event.is_set():
             ready, _, _ = select.select([sys.stdin], [], [], 0.1)
             if not ready:
                 continue
-            # Enter raw mode only for the single read, then restore immediately
-            try:
-                tty.setraw(fd)
-                ch = sys.stdin.read(1)
-            finally:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                except Exception:
-                    pass
+            ch = sys.stdin.read(1)
 
             if ch == self.trigger_key:
                 if not self._dump_event.is_set():
@@ -341,18 +370,25 @@ class AudioHistoryCallback(BaseCallback):
                         f"{len(self._buffer)}/{self.history_size} clips queued.\n"
                     )
                     sys.stdout.flush()
-            # Dispatch override keys to RewardOverrideCallback when it is active
-            # alongside --audio-history.  Handling them here avoids two threads
-            # racing on the same stdin file descriptor.
+            # Dispatch override/skip keys to RewardOverrideCallback when it is
+            # active alongside --audio-history.  Handling them here avoids two
+            # threads racing on the same stdin file descriptor.
             elif ch == RewardOverrideCallback.CONFIRM_KEY and self.reward_override_cb is not None:
                 self.reward_override_cb.request_override(self.reward_override_cb.confirm_reward)
             elif ch == RewardOverrideCallback.REJECT_KEY and self.reward_override_cb is not None:
                 self.reward_override_cb.request_override(self.reward_override_cb.reject_reward)
+            elif ch in (' ', '\r', '\n') and self.reward_override_cb is not None:
+                self.reward_override_cb.release_step()
             elif ch in ('\x03', 'q'):   # Ctrl+C or q — let SB3 handle it
                 self._stop_event.set()
                 import signal, os
                 os.kill(os.getpid(), signal.SIGINT)
                 break
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # SB3 callback hooks
@@ -543,8 +579,23 @@ class RewardOverrideCallback(BaseCallback):
         self.reject_reward  = reject_reward
         self.standalone     = standalone
         self._pending: Optional[float] = None
-        self._lock          = threading.Lock()
-        self._stop_event    = threading.Event()
+        self._lock            = threading.Lock()
+        self._stop_event      = threading.Event()
+        # Gate that blocks _on_step after each real robot step until researcher
+        # presses y, n, or SPACE/ENTER.  Pre-set so filtered/instant steps
+        # that never hit the blocking path are unaffected.
+        self._step_gate       = threading.Event()
+        self._step_gate.set()
+        self._last_robot_step   = 0
+        # Buffer position pinned at the moment a robot step is detected.
+        # SB3 calls on_step() BEFORE _store_transition(), so the transition
+        # hasn't been written yet.  We save buf.pos (the slot it WILL occupy)
+        # and apply the override at the TOP of the NEXT on_step() call, by
+        # which time buf.add() has already run for that slot.
+        self._target_buf_pos: Optional[int] = None
+        # Classification / reward context saved at block-time so the apply
+        # log is accurate even though it runs a step later.
+        self._target_reward_info: dict = {}
         self._listener_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
@@ -552,57 +603,81 @@ class RewardOverrideCallback(BaseCallback):
     # ------------------------------------------------------------------
 
     def request_override(self, value: float) -> None:
-        """Queue a reward override.  Thread-safe; safe to call from any thread."""
+        """Queue a reward override and release the step gate.
+
+        Only accepted while we are actively waiting (gate is clear).
+        Keypresses that arrive between steps are discarded to prevent
+        stale presses from being applied to the wrong replay buffer entry.
+        """
+        if self._step_gate.is_set():
+            # Gate is already open — no robot step is waiting for a response.
+            sys.stdout.write(
+                f'\n[override] Key ignored — no robot step is currently waiting.\n'
+                f'           Press y/n/SPACE only after the step prompt appears.\n'
+            )
+            sys.stdout.flush()
+            return
         with self._lock:
-            if self._pending is not None:
-                logger.warning(
-                    f'[override] Previous override ({self._pending:+.1f}) was not yet applied '
-                    f'— replacing with {value:+.1f}.'
-                )
             self._pending = value
         label = f'CONFIRM (+{value:.1f})' if value >= 0 else f'REJECT ({value:+.1f})'
-        sys.stdout.write(
-            f'\n[override] {label} queued — will inject into replay buffer on next step.\n'
-            f'           Press during the robot action to target the current step.\n'
-        )
+        sys.stdout.write(f'\n[override] {label} — unblocking.\n')
         sys.stdout.flush()
+        self._step_gate.set()
+
+    def release_step(self) -> None:
+        """Pass this step without any override.
+
+        Only accepted while we are actively waiting (gate is clear).
+        """
+        if self._step_gate.is_set():
+            sys.stdout.write(
+                f'\n[override] Key ignored — no robot step is currently waiting.\n'
+            )
+            sys.stdout.flush()
+            return
+        sys.stdout.write('\n[override] pass — continuing.\n')
+        sys.stdout.flush()
+        self._step_gate.set()
 
     # ------------------------------------------------------------------
     # Standalone stdin listener (used when --audio-history is off)
     # ------------------------------------------------------------------
 
     def _stdin_listener(self) -> None:
-        """Daemon thread: poll stdin for 'y' / 'n' without blocking training."""
+        """Daemon thread: poll stdin for 'y' / 'n' without blocking training.
+
+        Single-char mode (ICANON+ECHO disabled, OPOST kept) is entered once
+        for the lifetime of this thread and restored in the finally block.
+        """
         try:
-            import tty
             import termios
-            fd  = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
+            fd, old = _configure_stdin_single_char()
         except Exception:
             return  # No real tty (pipes, CI, etc.)
 
-        while not self._stop_event.is_set():
+        try:
+          while not self._stop_event.is_set():
             ready, _, _ = select.select([sys.stdin], [], [], 0.1)
             if not ready:
                 continue
-            try:
-                tty.setraw(fd)
-                ch = sys.stdin.read(1)
-            finally:
-                try:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                except Exception:
-                    pass
+            ch = sys.stdin.read(1)
 
             if ch == self.CONFIRM_KEY:
                 self.request_override(self.confirm_reward)
             elif ch == self.REJECT_KEY:
                 self.request_override(self.reject_reward)
+            elif ch in (' ', '\r', '\n'):   # SPACE or ENTER — pass without override
+                self.release_step()
             elif ch in ('\x03', 'q'):
                 self._stop_event.set()
                 import signal as _signal, os
                 os.kill(os.getpid(), _signal.SIGINT)
                 break
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # SB3 callback hooks
@@ -624,92 +699,168 @@ class RewardOverrideCallback(BaseCallback):
             self._listener_thread.start()
         logger.info(
             f'[override] Researcher reward override ACTIVE\n'
-            f'           Press  "{self.CONFIRM_KEY}"  to CONFIRM a step as a real harmonic\n'
-            f'             → Injects {self.confirm_reward:+.1f} and marks the transition terminal.\n'
-            f'             → Works on ANY step: use for classifier successes AND false negatives\n'
-            f'               (classifier said "not harmonic" but you heard a real harmonic).\n'
-            f'           Press  "{self.REJECT_KEY}"  to REJECT a classifier false-positive\n'
-            f'             → Injects {self.reject_reward:+.1f} (keeps existing done flag).\n'
-            f'           Both values far exceed the normal reward ceiling (~+2.0).\n'
-            f'           Press during the ~3-second robot action to target that step.'
+            f'           Training PAUSES after every real robot step until you respond.\n'
+            f'           "{self.CONFIRM_KEY}"          → CONFIRM as harmonic '
+            f'(inject {self.confirm_reward:+.1f}, mark terminal; fixes false negatives)\n'
+            f'           "{self.REJECT_KEY}"          → REJECT false-positive '
+            f'(inject {self.reject_reward:+.1f})\n'
+            f'           SPACE / ENTER  → pass, no override\n'
+            f'           Filtered steps (no robot action) are never blocked.'
         )
 
     def _on_step(self) -> bool:
-        with self._lock:
-            val = self._pending
-            self._pending = None
-
-        if val is None:
-            return True
-
-        buf = getattr(self.model, 'replay_buffer', None)
-        if buf is None or buf.size() == 0:
-            logger.warning('[override] Replay buffer empty — override discarded.')
-            return True
-
-        last_pos = (buf.pos - 1) % buf.max_size
-        old_reward  = float(buf.rewards[last_pos, 0])
-        old_done    = bool(buf.dones[last_pos, 0])
-
-        # --- Fetch classification context from the environment ---
         base_env    = self._get_base_env()
         reward_info = getattr(base_env, 'last_reward_info', None) or {}
-        cls         = reward_info.get('classification') or {}
-        h_prob      = cls.get('harmonic_prob')
-        cls_label   = cls.get('predicted_label', 'unknown')
-        filtered    = reward_info.get('filtered', False)
+        buf         = getattr(self.model, 'replay_buffer', None)
 
-        is_confirm = val > 0
+        # Read the per-step filtered flag directly from env.step()'s info dict
+        # (available in self.locals before _store_transition runs).
+        # This is the ground-truth signal for whether OSC was actually sent,
+        # avoids any robot_step_count counter drift, and works correctly across
+        # episode boundaries.
+        step_infos  = (self.locals or {}).get('infos') or [{}]
+        step_info   = step_infos[0] if step_infos else {}
+        is_filtered = step_info.get('filtered', True)   # default True = safe skip
 
-        # For CONFIRM: determine whether this is a false-negative correction
-        # (classifier said non-harmonic but researcher heard a harmonic).
-        # A true classifier success has old_done=True and h_prob >= success_threshold.
-        success_threshold = getattr(base_env, 'success_threshold', 0.8)
-        classifier_said_harmonic = (h_prob is not None and h_prob >= success_threshold)
-        is_false_negative = is_confirm and (not classifier_said_harmonic) and (not filtered)
+        # ── Apply any pending override from the previous blocked step ─────────
+        # SB3's ordering:  on_step()  →  _store_transition()  →  on_step() ...
+        # So by the time we arrive here, buf.add() has already written the
+        # transition that was pending from the last blocked call, and
+        # _target_buf_pos holds the exact slot it landed in.
+        target_pos = self._target_buf_pos
+        if target_pos is not None:
+            with self._lock:
+                val           = self._pending
+                self._pending = None
+            self._target_buf_pos   = None          # clear regardless of val
+            saved_info             = self._target_reward_info
+            self._target_reward_info = {}
 
-        # --- Patch replay buffer ---
-        buf.rewards[last_pos, 0] = float(val)
+            if val is not None and buf is not None:
+                old_reward = float(buf.rewards[target_pos, 0])
+                old_done   = bool(buf.dones[target_pos, 0])
 
-        # On CONFIRM: mark the transition as terminal — the Q-target becomes
-        # purely the override reward with no next-state bootstrapping.  This
-        # gives the agent an unambiguous terminal success signal even when the
-        # classifier didn't terminate the episode (false negative case).
-        if is_confirm:
-            buf.dones[last_pos, 0] = True
+                h_prob    = saved_info.get('h_prob')
+                cls_label = saved_info.get('cls_label', 'unknown')
+                filtered  = saved_info.get('filtered', False)
 
-        # --- Build human-readable context line ---
-        if filtered:
-            ctx = 'filtered step (no audio captured)'
-        elif h_prob is not None:
-            ctx = (f'classifier={cls_label}  H={h_prob:.3f}')
-        else:
-            ctx = 'no classification available'
+                is_confirm = val > 0
+                success_threshold        = getattr(base_env, 'success_threshold', 0.8)
+                classifier_said_harmonic = (h_prob is not None
+                                            and h_prob >= success_threshold)
+                is_false_negative = (is_confirm
+                                     and not classifier_said_harmonic
+                                     and not filtered)
 
-        tag = 'CONFIRM ✓' if is_confirm else 'REJECT  ✗'
-        fn_note = '  ← FALSE NEGATIVE CORRECTION' if is_false_negative else ''
+                buf.rewards[target_pos, 0] = float(val)
+                # CONFIRM: mark terminal so Q-target = override reward only.
+                if is_confirm:
+                    buf.dones[target_pos, 0] = True
 
-        done_patch = f'{old_done} → True' if (is_confirm and not old_done) else str(old_done)
+                if h_prob is not None:
+                    ctx = f'classifier={cls_label}  H={h_prob:.3f}'
+                elif filtered:
+                    ctx = 'filtered step'
+                else:
+                    ctx = 'no classification'
 
-        logger.info(
-            f'\n{"=" * 60}\n'
-            f'  [override] {tag}{fn_note}\n'
-            f'  Buffer pos {last_pos}:\n'
-            f'    reward: {old_reward:+.4f}  →  {val:+.4f}\n'
-            f'    done:   {done_patch}\n'
-            f'    context: {ctx}\n'
-            f'{"=" * 60}\n'
-        )
-        fn_suffix = ' (false-negative correction)' if is_false_negative else ''
-        sys.stdout.write(
-            f'\n[override] {tag}{fn_suffix}\n'
-            f'  reward {old_reward:+.3f} → {val:+.3f}  |  {ctx}\n'
-        )
-        sys.stdout.flush()
+                tag        = 'CONFIRM ✓' if is_confirm else 'REJECT  ✗'
+                fn_note    = '  ← FALSE NEGATIVE CORRECTION' if is_false_negative else ''
+                done_patch = (f'{old_done} → True'
+                              if (is_confirm and not old_done) else str(old_done))
+
+                logger.info(
+                    f'\n{"=" * 60}\n'
+                    f'  [override] {tag}{fn_note}\n'
+                    f'  Buffer pos {target_pos}:\n'
+                    f'    reward: {old_reward:+.4f}  →  {val:+.4f}\n'
+                    f'    done:   {done_patch}\n'
+                    f'    context: {ctx}\n'
+                    f'{"=" * 60}\n'
+                )
+                fn_suffix = ' (false-negative correction)' if is_false_negative else ''
+                sys.stdout.write(
+                    f'  [override] {tag}{fn_suffix}  '
+                    f'reward {old_reward:+.3f} → {val:+.3f}  |  {ctx}\n'
+                )
+                sys.stdout.flush()
+
+        # ── Gate on new real robot steps ──────────────────────────────────────
+        # Block on every step where OSC was actually sent (not filtered).
+        # We use the per-step filtered flag from env.step()'s info dict
+        # (self.locals['infos'][0]['filtered']) rather than robot_step_count so
+        # there is no counter to drift or reset between episodes / resumes.
+        if not is_filtered:
+            try:
+
+                # Clear any stale pending left over from a previous pass.
+                with self._lock:
+                    self._pending = None
+
+                # Pin the slot where THIS transition WILL be stored.
+                # on_step() fires BEFORE _store_transition(), so buf.pos is the
+                # next-write pointer — exactly where this step's data will land.
+                if buf is not None:
+                    self._target_buf_pos = buf.pos % buf.buffer_size
+                else:
+                    self._target_buf_pos = None
+
+                # Capture classification context NOW (reward_info is stale in the
+                # next on_step() call where we actually apply the override).
+                cls       = reward_info.get('classification') or {}
+                h_prob    = cls.get('harmonic_prob')
+                cls_label = cls.get('predicted_label', 'unknown')
+                # Current reward comes from SB3's locals, NOT the buffer
+                # (the transition hasn't been stored there yet).
+                rewards_arr    = self.locals.get('rewards')
+                current_reward = (float(rewards_arr[0])
+                                  if rewards_arr is not None
+                                  else reward_info.get('total_reward', 0.0))
+                self._target_reward_info = {
+                    'h_prob'    : h_prob,
+                    'cls_label' : cls_label,
+                    'filtered'  : is_filtered,
+                }
+
+                if h_prob is not None:
+                    ctx = (f'classifier={cls_label}  H={h_prob:.3f}  '
+                           f'reward={current_reward:+.3f}  buf_pos={self._target_buf_pos}')
+                else:
+                    ctx = (f'no classification  '
+                           f'reward={current_reward:+.3f}  buf_pos={self._target_buf_pos}')
+
+                # Make sure the gate is in a clean state before we wait.
+                # Guard: if the previous wait released but the key was pressed
+                # in the tiny window before this clear, we clear it here so
+                # we don't skip this step.
+                self._step_gate.clear()
+                sys.stdout.write(
+                    f'\n[override] Robot step complete — {ctx}\n'
+                    f'           y=CONFIRM({self.confirm_reward:+.0f})  '
+                    f'n=REJECT({self.reject_reward:+.0f})  '
+                    f'SPACE/ENTER=pass\n'
+                )
+                sys.stdout.flush()
+
+                # Block until key pressed.  300 s timeout auto-passes so a dead
+                # terminal can't deadlock training indefinitely.
+                triggered = self._step_gate.wait(timeout=300)
+                if not triggered:
+                    sys.stdout.write('\n[override] 5-minute timeout — auto-pass.\n')
+                    sys.stdout.flush()
+                # Do NOT apply here — return now so _store_transition() can run.
+                # The apply happens at the top of the next _on_step() call.
+
+            except Exception as exc:  # pragma: no cover
+                logger.error(f'[override] Unexpected error in gate section: {exc}', exc_info=True)
+                # Ensure gate is open so training doesn't deadlock.
+                self._step_gate.set()
+
         return True
 
     def _on_training_end(self) -> None:
         self._stop_event.set()
+        self._step_gate.set()   # unblock in case training ends while gate is held
 
 
 # ---------------------------------------------------------------------------
