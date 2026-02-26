@@ -94,9 +94,14 @@ class HarmonicEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 3.0       # Total step duration (seconds)
-    CAPTURE_PRE_DELAY = 0.5     # Wait after send_rlfret before recording (robot arm movement + pluck)
+    ACTION_DURATION = 3.0       # Reference step duration (no longer enforced; kept for documentation)
+    CAPTURE_PRE_DELAY = 0.5     # Legacy fallback delay (used only if rolling buffer not available)
     STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
+
+    # Silence-gate constants: wait for harmonics to decay before each step
+    SILENCE_RMS_THRESHOLD = 0.005   # RMS per 20 ms sub-chunk below which signal is "silent"
+    SILENCE_HOLD_DURATION = 0.5     # Seconds of continuous silence required before sending action
+    SILENCE_TIMEOUT       = 8.0     # Max wait (s); step proceeds anyway after this
     
     def __init__(self,
                  model_path: Optional[str] = None,
@@ -142,6 +147,9 @@ class HarmonicEnv(gym.Env):
 
         self.offline = offline
         self.success_recorder = success_recorder
+        # Silence-gate threshold as an instance variable so it can be overridden
+        # after construction (e.g. by --silence-rms auto calibration in train.py).
+        self.silence_rms_threshold = self.SILENCE_RMS_THRESHOLD
         # Resolve string pool — validate every entry has a plucker
         if string_indices is not None:
             for s in string_indices:
@@ -438,18 +446,21 @@ class HarmonicEnv(gym.Env):
             else:
                 # Action passed filtration — send to robot, capture audio, compute reward.
                 self.robot_step_count += 1
+
+                # Wait for any lingering harmonic from the previous step to decay.
+                self.reward_calc.wait_for_silence(
+                    rms_threshold=self.silence_rms_threshold,
+                    hold_duration=self.SILENCE_HOLD_DURATION,
+                    timeout=self.SILENCE_TIMEOUT,
+                )
+
+                # Timestamp the action and fire the OSC command immediately.
+                t_action = time.monotonic()
                 self.osc_client.send_rlfret(rl_action)
 
-                # Short pre-delay for the robot arm to physically move and pluck.
-                time.sleep(self.CAPTURE_PRE_DELAY)
-
-                # Capture audio now — the note is ringing.
-                audio = self.reward_calc.capture_audio()
-
-                # Wait out remaining ACTION_DURATION so total step time is unchanged.
-                remaining = self.ACTION_DURATION - self.CAPTURE_PRE_DELAY - self.reward_calc.capture_duration
-                if remaining > 0:
-                    time.sleep(remaining)
+                # Onset-aligned capture: detects when the string actually rings and
+                # extracts a window anchored at the onset timestamp.
+                audio = self.reward_calc.capture_audio_from_buffer(t_action)
 
                 # Compute reward with the already-captured audio (no second capture).
                 reward_info = self.reward_calc.compute_reward(
@@ -563,6 +574,10 @@ class HarmonicEnv(gym.Env):
             'audio_rms': reward_info.get('audio_rms'),
             'step': self.current_step,
             'is_at_harmonic': rl_action.is_at_harmonic,
+            'latency_ema': (
+                self.reward_calc.latency_ema
+                if self.reward_calc is not None else None
+            ),
         }
         
         return obs, reward, terminated, truncated, info

@@ -564,7 +564,38 @@ def train(args):
         reward_mode=args.reward_mode,
         offline=args.pretrain,
     )
-    
+
+    # ── Silence-gate threshold calibration ────────────────────────────────────
+    # Resolve the --silence-rms value for both envs.  "auto" measures the
+    # ambient noise floor from the rolling buffer that was just started inside
+    # HarmonicRewardCalculator.__init__(); a numeric value is used as-is.
+    if not args.pretrain:
+        silence_rms_str = args.silence_rms
+        train_base: HarmonicEnv = env.unwrapped  # type: ignore[assignment]
+        eval_base:  HarmonicEnv = eval_env.unwrapped  # type: ignore[assignment]
+        if silence_rms_str.lower() == 'auto':
+            if train_base.reward_calc is not None:
+                logger.info("--silence-rms auto: calibrating from ambient noise floor...")
+                threshold = train_base.reward_calc.calibrate_silence_threshold(
+                    duration=2.0, multiplier=1.5
+                )
+                train_base.silence_rms_threshold = threshold
+                eval_base.silence_rms_threshold  = threshold
+                logger.info(f"Silence RMS threshold set to {threshold:.6f}")
+            else:
+                logger.warning("--silence-rms auto: no reward_calc found, using default.")
+        else:
+            try:
+                threshold = float(silence_rms_str)
+                train_base.silence_rms_threshold = threshold
+                eval_base.silence_rms_threshold  = threshold
+                logger.info(f"Silence RMS threshold set to {threshold:.6f} (manual)")
+            except ValueError:
+                logger.error(
+                    f"--silence-rms '{silence_rms_str}' is not a valid float or 'auto'. "
+                    "Using default."
+                )
+
     # Configure SAC agent
     logger.info("Configuring SAC agent...")
     policy_kwargs = dict(
@@ -876,6 +907,13 @@ def main():
     parser.add_argument('--audio-history-size', type=int, default=5, metavar='N',
                         help='Number of recent robot audio captures to keep in the rolling '
                              'buffer for --audio-history (default: 5).')
+
+    # Silence-gate threshold
+    parser.add_argument('--silence-rms', type=str, default='auto', metavar='THRESHOLD',
+                        help='RMS threshold for the pre-step silence gate.  '
+                             'Pass a numeric value (e.g. 0.005) to use it directly, '
+                             'or "auto" (default) to measure the ambient noise floor '
+                             'at startup and set the threshold to 3× that value.')
 
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,
