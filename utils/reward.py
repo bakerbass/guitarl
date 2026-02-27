@@ -364,11 +364,14 @@ def compute_reward_cosine_sim(
     if target_fret not in HARMONIC_FRETS:
         raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
 
-    # Layer 1
+    # Layer 1 — use a stronger penalty in fine-tune mode to keep the agent
+    # near the harmonic node (reward range here is ±5, not ±1).
+    _FT_FILTRATION_PENALTY = -10.0
+
     filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
     if not filt['passed']:
         return {
-            'total_reward':  filt['penalty'],
+            'total_reward':  _FT_FILTRATION_PENALTY,
             'audio_reward':  0.0,
             'fret_reward':   0.0,
             'torque_reward': 0.0,

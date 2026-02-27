@@ -444,7 +444,10 @@ class HarmonicEnv(gym.Env):
 
             if not filt['passed']:
                 filter_reason = filt['reason']
-                reward = FILTRATION_PENALTY
+                # Fine-tune mode uses a stronger penalty scaled to its ±5 reward range.
+                reward = (-10.0 if (self.reward_calc is not None
+                                   and self.reward_calc.reward_mode == REWARD_MODE_COSINE_SIM)
+                          else FILTRATION_PENALTY)
                 reward_info = {
                     'total_reward':  reward,
                     'audio_reward':  0.0,
