@@ -323,9 +323,15 @@ class HarmonicRewardCalculator:
         if self.device_id is None:
             return True  # No device — treat as silent
 
-        chunk_frames = int(0.02 * self.device_sr)           # samples per 20 ms chunk
-        chunks_needed = max(1, int(hold_duration / 0.02))   # consecutive quiet chunks
-        chunks_limit  = max(1, int(timeout / 0.02))         # total chunks before timeout
+        chunk_frames   = int(0.02 * self.device_sr)           # samples per 20 ms chunk
+        chunks_needed  = max(1, int(hold_duration / 0.02))   # consecutive quiet chunks required
+        chunks_limit   = max(1, int(timeout / 0.02))         # total budget before timeout
+        # WASAPI (and some other drivers) pre-fill the InputStream buffer with
+        # zeros before real audio arrives.  Without a warmup, the first
+        # chunks_needed reads all return RMS ≈ 0, triggering a false "silence
+        # confirmed" before any actual audio has been read.  Discarding the
+        # first ~100 ms of reads lets the buffer flush stale zeros.
+        warmup_chunks  = 5                                    # 5 × 20 ms = 100 ms warmup
 
         try:
             with sd.InputStream(
@@ -335,8 +341,11 @@ class HarmonicRewardCalculator:
                 dtype="float32",
                 blocksize=chunk_frames,
             ) as stream:
+                for _ in range(warmup_chunks):
+                    stream.read(chunk_frames)
+
                 consecutive_quiet = 0
-                for _ in range(chunks_limit):
+                for _ in range(max(1, chunks_limit - warmup_chunks)):
                     chunk, _ = stream.read(chunk_frames)
                     rms = float(np.sqrt(np.mean(chunk[:, 0] ** 2)))
                     if rms < rms_threshold:

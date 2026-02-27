@@ -116,6 +116,7 @@ class HarmonicEnv(gym.Env):
                  max_steps: int = MAX_STEPS_PER_EPISODE,
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
+                 fixed_target_fret: int = 7,
                  use_simple_action_space: bool = False,
                  always_press: bool = True,
                  reward_mode: str = REWARD_MODE_FULL,
@@ -138,6 +139,8 @@ class HarmonicEnv(gym.Env):
             max_steps: Maximum steps per episode
             success_threshold: Harmonic probability threshold for success
             curriculum_mode: "random", "easy_to_hard", or "fixed_fret"
+            fixed_target_fret: Fret locked for "fixed_fret" curriculum (default 7).
+                               Must be in HARMONIC_FRETS [4, 5, 7].
             use_simple_action_space: If True, use 3D continuous space instead of 5D
             always_press: If True, remove press_decision from action space (always PRESS)
             reward_mode: 'full', 'no_filtration', or 'no_audio' (see reward.py)
@@ -168,6 +171,11 @@ class HarmonicEnv(gym.Env):
         self.max_steps = max_steps
         self.success_threshold = success_threshold
         self.curriculum_mode = curriculum_mode
+        if fixed_target_fret not in self.HARMONIC_FRETS:
+            raise ValueError(
+                f"fixed_target_fret={fixed_target_fret} is not in HARMONIC_FRETS {self.HARMONIC_FRETS}"
+            )
+        self.fixed_target_fret = fixed_target_fret
         self.use_simple_action_space = use_simple_action_space
         self.always_press = always_press
         
@@ -256,17 +264,21 @@ class HarmonicEnv(gym.Env):
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
         if self.curriculum_mode == "random":
-            return np.random.choice(self.HARMONIC_FRETS)
+            return int(np.random.choice(self.HARMONIC_FRETS))
         elif self.curriculum_mode == "easy_to_hard":
-            # Fret 7 (easiest) -> Fret 5 -> Fret 4 (hardest)
+            # Fret 7 (easiest) -> Fret 5 -> Fret 4 (hardest).
+            # Progress is gated on robot_step_count (real OSC actions) rather
+            # than episode_count.  episode_count climbs instantly when the
+            # random policy generates all-filtered episodes, causing the
+            # curriculum to advance long before the agent has learned anything.
+            # 500 real robot actions ≈ 25 min at ~3 s/step per fret stage.
             curriculum_order = [7, 5, 4]
-            # Progress curriculum every 100 episodes
-            idx = min(self.episode_count // 100, len(curriculum_order) - 1)
+            idx = min(self.robot_step_count // 500, len(curriculum_order) - 1)
             return curriculum_order[idx]
         elif self.curriculum_mode == "fixed_fret":
-            return 7  # Always use fret 7 for initial training
+            return self.fixed_target_fret
         else:
-            return np.random.choice(self.HARMONIC_FRETS)
+            return int(np.random.choice(self.HARMONIC_FRETS))
     
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector (14-dim)."""

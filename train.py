@@ -461,7 +461,7 @@ class AudioHistoryCallback(BaseCallback):
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None):
+             success_recorder=None, fixed_target_fret: int = 7):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -470,6 +470,7 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         osc_port=osc_port,
         audio_device=audio_device,
         curriculum_mode=curriculum_mode,
+        fixed_target_fret=fixed_target_fret,
         max_steps=10,
         success_threshold=0.8,
         reward_mode=reward_mode,
@@ -552,6 +553,7 @@ def train(args):
         reward_mode=args.reward_mode,
         offline=args.pretrain,
         success_recorder=success_recorder,
+        fixed_target_fret=args.fixed_fret,
     )
 
     # Create evaluation environment
@@ -563,6 +565,7 @@ def train(args):
         audio_device=args.audio_device,
         reward_mode=args.reward_mode,
         offline=args.pretrain,
+        fixed_target_fret=args.fixed_fret,
     )
 
     # ── Silence-gate threshold ─────────────────────────────────────────────────
@@ -805,6 +808,10 @@ def main():
     parser.add_argument('--curriculum', type=str, default='easy_to_hard',
                         choices=['random', 'easy_to_hard', 'fixed_fret'],
                         help='Curriculum learning mode')
+    parser.add_argument('--fixed-fret', type=int, default=7,
+                        choices=[4, 5, 7],
+                        help='Target fret when --curriculum fixed_fret is used (default: 7). '
+                             'Must be one of the harmonic frets [4, 5, 7].')
     
     # Training arguments
     parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
