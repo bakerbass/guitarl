@@ -517,16 +517,26 @@ class HarmonicEnv(gym.Env):
                         f"    reward={reward:+.3f}"
                     )
                 elif cls is not None:
-                    label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
-                    logger.info(
-                        f"\n  {step_header}\n"
-                        f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
-                        f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
-                        f"    reward={reward:+.3f}  "
-                        f"(audio={reward_info['audio_reward']:+.3f}  "
-                        f"fret={reward_info['fret_reward']:+.3f}  "
-                        f"torque={reward_info['torque_reward']:+.3f})"
-                    )
+                    assert isinstance(cls, dict)
+                    if 'cosine_sim' in reward_info:
+                        sim = reward_info['cosine_sim']
+                        result = 'harmonic' if reward > 0 else 'near-miss'
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    [{result}]  cosine_sim={sim:.4f}\n"
+                            f"    reward={reward:+.3f}"
+                        )
+                    else:
+                        label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
+                            f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
+                            f"    reward={reward:+.3f}  "
+                            f"(audio={reward_info['audio_reward']:+.3f}  "
+                            f"fret={reward_info['fret_reward']:+.3f}  "
+                            f"torque={reward_info['torque_reward']:+.3f})"
+                        )
                 else:
                     logger.info(
                         f"\n  {step_header}\n"
