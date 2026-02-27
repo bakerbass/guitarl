@@ -70,6 +70,18 @@ PRETRAIN_FRET_TOLERANCE = 1.5
 REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
 REWARD_MODE_NO_FILTRATION = 'no_filtration'  # Layer 2 only — bypass physics gate
 REWARD_MODE_NO_AUDIO      = 'no_audio'       # Layer 1 + fret/torque shaping only
+REWARD_MODE_COSINE_SIM    = 'cosine_sim'     # Layer 1 + onset-aligned mel cosine sim vs reference WAVs
+
+# ── Fine-tune (cosine_sim) reward curve ───────────────────────────────────────
+# cosine_sim >= threshold  →  +5.0 (success bonus)
+# cosine_sim <  threshold  →  -5.0 * (1 - exp(-k * (threshold - sim)))
+#   At 0.79: ≈ -0.15  (not too bad)
+#   At 0.50: ≈ -3.0   (pretty far negative)
+#   At 0.00: ≈ -4.55  (saturates near -5)
+COSINE_SIM_SUCCESS_THRESHOLD = 0.8
+COSINE_SIM_SUCCESS_REWARD    = 5.0
+COSINE_SIM_FLOOR             = -5.0   # minimum (asymptotic) reward
+COSINE_SIM_DECAY_K           = 3.0    # controls how fast reward drops below threshold
 
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
@@ -325,6 +337,68 @@ def compute_reward_no_audio(
         'target_fret':   target_fret,
         'filtered':      False,
         'filter_reason': '',
+    }
+
+
+def compute_reward_cosine_sim(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    cosine_sim: float,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Fine-tune reward: Layer 1 filtration + exponential cosine-similarity curve.
+
+    Layer 1 still runs first — physically nonsensical actions (bad torque /
+    fret way off target) get the flat -1.0 penalty before the audio signal is
+    ever consulted.
+
+    Reward curve (when Layer 1 passes):
+        cosine_sim >= 0.8  →  +5.0   (success)
+        cosine_sim <  0.8  →  -5.0 * (1 − exp(−3.0 × (0.8 − cosine_sim)))
+                               ≈ −0.15 at 0.79  (barely below threshold)
+                               ≈ −3.0  at 0.50  (fairly negative)
+                               ≈ −4.55 at 0.00  (saturates near −5)
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    # Layer 1
+    filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
+    if not filt['passed']:
+        return {
+            'total_reward':  filt['penalty'],
+            'audio_reward':  0.0,
+            'fret_reward':   0.0,
+            'torque_reward': 0.0,
+            'fret_error':    abs(fret_position - float(target_fret)),
+            'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
+            'target_fret':   target_fret,
+            'filtered':      True,
+            'filter_reason': filt['reason'],
+            'cosine_sim':    cosine_sim,
+        }
+
+    # Layer 2: cosine-sim reward curve
+    if cosine_sim >= COSINE_SIM_SUCCESS_THRESHOLD:
+        total_reward = COSINE_SIM_SUCCESS_REWARD
+    else:
+        total_reward = COSINE_SIM_FLOOR * (
+            1.0 - np.exp(-COSINE_SIM_DECAY_K * (COSINE_SIM_SUCCESS_THRESHOLD - cosine_sim))
+        )
+
+    return {
+        'total_reward':  total_reward,
+        'audio_reward':  total_reward,  # cosine_sim is the audio signal in fine-tune mode
+        'fret_reward':   0.0,
+        'torque_reward': 0.0,
+        'fret_error':    abs(fret_position - float(target_fret)),
+        'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
+        'target_fret':   target_fret,
+        'filtered':      False,
+        'filter_reason': '',
+        'cosine_sim':    cosine_sim,
     }
 
 

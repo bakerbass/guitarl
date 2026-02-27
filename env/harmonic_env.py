@@ -42,6 +42,7 @@ if str(_parent_dir) not in sys.path:
 from utils.audio_reward import HarmonicRewardCalculator
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
+    REWARD_MODE_COSINE_SIM,
     compute_reward_no_audio as _compute_reward_no_audio,
     compute_filtration,
     FILTRATION_PENALTY,
@@ -121,7 +122,9 @@ class HarmonicEnv(gym.Env):
                  always_press: bool = True,
                  reward_mode: str = REWARD_MODE_FULL,
                  offline: bool = False,
-                 success_recorder: Optional['SuccessRecorder'] = None):
+                 success_recorder: Optional['SuccessRecorder'] = None,
+                 ref_dir=None,
+                 fret_to_pitch=None):
         """
         Initialize HarmonicEnv.
 
@@ -193,8 +196,11 @@ class HarmonicEnv(gym.Env):
                 "Reward = filtration layer only (fret + torque shaping)."
             )
         else:
-            if model_path is None:
-                raise ValueError("model_path is required when offline=False")
+            if model_path is None and reward_mode != REWARD_MODE_COSINE_SIM:
+                raise ValueError(
+                    "model_path is required when offline=False "
+                    "(omit it only when reward_mode='cosine_sim')"
+                )
             # Initialize OSC client
             self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)
             # Initialize reward calculator
@@ -203,6 +209,8 @@ class HarmonicEnv(gym.Env):
                 device_name=audio_device,
                 capture_duration=capture_duration,
                 reward_mode=reward_mode,
+                ref_dir=ref_dir,
+                fret_to_pitch=fret_to_pitch,
             )
         
         # Define action space dimensions

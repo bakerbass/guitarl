@@ -29,6 +29,10 @@ import torch
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
 
+# D-string (string_index=2) fret → MIDI note number mapping for fine-tune mode.
+# Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
+_D_STRING_FRET_TO_PITCH = {4: 78, 5: 74, 7: 69}
+
 
 # Setup logging
 logging.basicConfig(
@@ -461,7 +465,8 @@ class AudioHistoryCallback(BaseCallback):
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None, fixed_target_fret: int = 7):
+             success_recorder=None, fixed_target_fret: int = 7,
+             ref_dir=None, fret_to_pitch=None):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -476,6 +481,8 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         reward_mode=reward_mode,
         offline=offline,
         success_recorder=success_recorder,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
     env = Monitor(env)
     return env
@@ -542,6 +549,23 @@ def train(args):
     elif args.record_successes and args.pretrain:
         logger.warning("[record-successes] No-op in --pretrain mode (no audio captured).")
 
+    # Resolve fine-tune mode: cosine_sim reward + reference WAV loading
+    reward_mode = args.reward_mode
+    ref_dir = None
+    fret_to_pitch = None
+    if args.fine_tune:
+        reward_mode = 'cosine_sim'
+        ref_dir = Path(args.ref_dir)
+        if not ref_dir.exists():
+            logger.error(f"--ref-dir not found: {ref_dir}")
+            sys.exit(1)
+        # D-string mapping (string_index=2); extend here for other strings if needed
+        fret_to_pitch = _D_STRING_FRET_TO_PITCH
+        logger.info(
+            f"[fine-tune] cosine_sim mode active — ref dir: {ref_dir}, "
+            f"fret→pitch: {fret_to_pitch}"
+        )
+
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
@@ -550,10 +574,12 @@ def train(args):
         string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device,
-        reward_mode=args.reward_mode,
+        reward_mode=reward_mode,
         offline=args.pretrain,
         success_recorder=success_recorder,
         fixed_target_fret=args.fixed_fret,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
 
     # Create evaluation environment
@@ -563,9 +589,11 @@ def train(args):
         string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device,
-        reward_mode=args.reward_mode,
+        reward_mode=reward_mode,
         offline=args.pretrain,
         fixed_target_fret=args.fixed_fret,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
 
     # ── Silence-gate threshold ─────────────────────────────────────────────────
@@ -909,6 +937,21 @@ def main():
                         help='Number of recent robot audio captures to keep in the rolling '
                              'buffer for --audio-history (default: 5).')
 
+    # Fine-tune mode (cosine similarity reward)
+    parser.add_argument('--fine-tune', action='store_true', default=False,
+                        help='Fine-tune using cosine similarity against reference dataset WAVs '
+                             'instead of the CNN classifier.  The agent receives a reward equal '
+                             'to the best mel-spectrogram cosine similarity (0–1) between the '
+                             'captured audio and onset-aligned reference recordings in --ref-dir. '
+                             'cosine_sim >= 0.8 counts as success (same threshold as CNN). '
+                             'Requires --ref-dir.  --model-path becomes optional in this mode.')
+    parser.add_argument('--ref-dir', type=str,
+                        default='../HarmonicsClassifier/note_clips/harmonic',
+                        help='Reference WAV directory for --fine-tune mode. '
+                             'WAVs are matched by pitch pattern derived from the fret-to-pitch '
+                             'mapping for the D string (fret4=pitches78, fret5=pitches74, '
+                             'fret7=pitches69).  Default: %(default)s')
+
     # Silence gate
     parser.add_argument('--silence-rms', type=str, default='auto', metavar='THRESHOLD',
                         help='RMS threshold for the pre-step silence gate that waits for '
@@ -928,15 +971,17 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Validate model path (not required for offline pre-training)
-    if args.pretrain:
+    # Validate model path
+    # Not required for offline pre-training or fine-tune (cosine_sim) mode.
+    if args.pretrain or args.fine_tune:
         if args.model_path is not None and not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")
             sys.exit(1)
     else:
         if args.model_path is None:
             logger.error("--model-path is required for online training. "
-                         "Use --pretrain to run without a robot/audio setup.")
+                         "Use --pretrain to run without a robot/audio setup, "
+                         "or --fine-tune to use cosine similarity instead of the CNN.")
             sys.exit(1)
         if not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")

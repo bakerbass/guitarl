@@ -45,11 +45,24 @@ from utils.reward import (
     REWARD_MODE_FULL,
     REWARD_MODE_NO_FILTRATION,
     REWARD_MODE_NO_AUDIO,
+    REWARD_MODE_COSINE_SIM,
     compute_reward as _compute_reward,
     compute_reward_no_filtration as _compute_reward_no_filtration,
     compute_reward_no_audio as _compute_reward_no_audio,
+    compute_reward_cosine_sim as _compute_reward_cosine_sim,
     is_success as _is_success,
 )
+
+# ── Fine-tune mode: mel spec parameters matching image_analysis.py ────────────
+# Using the same n_fft / fmax as image_analysis so RL spectrograms are directly
+# comparable to the reference dataset spectrograms.
+_FT_SR         = 22050
+_FT_N_FFT      = 4096
+_FT_HOP_LENGTH = 512
+_FT_N_MELS     = 128
+_FT_FMIN       = 80
+_FT_FMAX       = 10000
+_FT_MAX_ONSET  = 1.0   # ignore onsets detected later than this many seconds
 
 
 class HarmonicRewardCalculator:
@@ -64,28 +77,38 @@ class HarmonicRewardCalculator:
     CLASS_NAMES = _CLASS_NAMES
     HARMONIC_CLASS_IDX = _HARMONIC_CLASS_IDX
     
-    def __init__(self, 
-                 model_path: str,
+    def __init__(self,
+                 model_path: Optional[str],
                  device_name: str = "VB-Audio Virtual Cable",
                  capture_duration: float = 1.0,
                  model_sr: int = 22050,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu",
-                 reward_mode: str = REWARD_MODE_FULL):
+                 reward_mode: str = REWARD_MODE_FULL,
+                 ref_dir: Optional[Path] = None,
+                 fret_to_pitch: Optional[Dict[int, int]] = None):
         """
         Initialize reward calculator.
-        
+
         Args:
-            model_path: Path to trained harmonic classifier model (.pt file)
+            model_path: Path to trained harmonic classifier model (.pt file).
+                        May be None when reward_mode='cosine_sim' (CNN not used).
             device_name: Audio input device name (VB-CABLE)
             capture_duration: Audio capture duration in seconds
             model_sr: Sample rate expected by model
             device: Torch device (cuda/cpu)
-            reward_mode: One of 'full', 'no_filtration', 'no_audio'.
-                         'full'           — two-layer reward (default)
-                         'no_filtration'  — bypass physics gate, Layer 2 only
-                         'no_audio'       — Layer 1 + fret/torque shaping, no CNN
+            reward_mode: One of 'full', 'no_filtration', 'no_audio', 'cosine_sim'.
+                         'full'        — two-layer reward (default)
+                         'no_filtration' — bypass physics gate, Layer 2 only
+                         'no_audio'    — Layer 1 + fret/torque shaping, no CNN
+                         'cosine_sim'  — Layer 1 + onset-aligned mel cosine
+                                         similarity vs reference dataset WAVs
+            ref_dir:     Directory of reference WAVs (GB_NH_*.wav).
+                         Required when reward_mode='cosine_sim'.
+            fret_to_pitch: Mapping from target fret → MIDI note number used to
+                           select reference WAVs by pitch.  E.g. {4:78, 5:74, 7:69}
+                           for D string.  Required when reward_mode='cosine_sim'.
         """
-        self.model_path = Path(model_path)
+        self.model_path = Path(model_path) if model_path is not None else None
         self.device_name = device_name
         self.capture_duration = capture_duration
         self.model_sr = model_sr
@@ -119,10 +142,26 @@ class HarmonicRewardCalculator:
         else:
             self.device_sr = 44100  # Default fallback (no_audio mode)
         
-        # Load model
-        self.model = self._load_model()
+        # Load CNN model (not needed in cosine_sim mode)
         self.reward_mode = reward_mode
-        logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
+        if reward_mode == REWARD_MODE_COSINE_SIM and self.model_path is None:
+            self.model = None
+            logger.info("[fine-tune] cosine_sim mode: CNN model not loaded (model_path=None).")
+        else:
+            self.model = self._load_model()
+
+        # Fine-tune mode: pre-load reference mel spectrograms keyed by target fret
+        self._ref_mels: Dict[int, list] = {}
+        if reward_mode == REWARD_MODE_COSINE_SIM:
+            if ref_dir is None or fret_to_pitch is None:
+                raise ValueError(
+                    "ref_dir and fret_to_pitch are required when reward_mode='cosine_sim'"
+                )
+            self._load_ref_mels(Path(ref_dir), fret_to_pitch)
+
+        logger.info(
+            f"HarmonicRewardCalculator initialized: model={model_path}, reward_mode={reward_mode}"
+        )
     
     def _find_audio_device(self) -> Optional[int]:
         """Find audio input device by name substring (input channels required)."""
@@ -188,6 +227,8 @@ class HarmonicRewardCalculator:
     
     def _load_model(self) -> HarmonicsCNN:
         """Load pretrained harmonic classifier."""
+        if self.model_path is None:
+            raise ValueError("model_path is required (set reward_mode='cosine_sim' to run without CNN)")
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
         
@@ -456,7 +497,101 @@ class HarmonicRewardCalculator:
             'general_prob': probs[2],
         }
     
-    def compute_reward(self, 
+    # ── Fine-tune helpers (cosine_sim reward mode) ───────────────────────────
+
+    def _onset_align(self, y: np.ndarray, sr: int = _FT_SR) -> np.ndarray:
+        """Trim audio to the first detected onset (matching image_analysis.py)."""
+        onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=_FT_HOP_LENGTH)
+        onset_sample = 0
+        if len(onset_frames) > 0:
+            candidate = int(librosa.frames_to_samples(onset_frames[0], hop_length=_FT_HOP_LENGTH))
+            if candidate <= int(_FT_MAX_ONSET * sr):
+                onset_sample = candidate
+        return y[onset_sample:]
+
+    @staticmethod
+    def _normalize_01(arr: np.ndarray) -> np.ndarray:
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _compute_ft_mel(self, y: np.ndarray) -> np.ndarray:
+        """Mel spectrogram in dB using image_analysis.py parameters."""
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=_FT_SR, n_fft=_FT_N_FFT, hop_length=_FT_HOP_LENGTH,
+            n_mels=_FT_N_MELS, fmin=_FT_FMIN, fmax=_FT_FMAX,
+        )
+        return librosa.power_to_db(mel, ref=np.max)
+
+    def _load_ref_mels(self, ref_dir: Path, fret_to_pitch: Dict[int, int]) -> None:
+        """Pre-load and cache onset-aligned normalized mel spectrograms for each fret."""
+        total = 0
+        for fret, pitch in fret_to_pitch.items():
+            pattern = f"GB_NH*pitches{pitch}*.wav"
+            ref_wavs = sorted(ref_dir.glob(pattern))
+            if not ref_wavs:
+                logger.warning(f"[fine-tune] No reference WAVs matched {ref_dir / pattern}")
+                continue
+            mels = []
+            for wav_path in ref_wavs:
+                try:
+                    y, _ = librosa.load(str(wav_path), sr=_FT_SR, mono=True)
+                    y = self._onset_align(y)
+                    if len(y) < int(0.5 * _FT_SR):
+                        continue  # skip clips that are too short after alignment
+                    mels.append(self._normalize_01(self._compute_ft_mel(y)))
+                except Exception as exc:
+                    logger.warning(f"[fine-tune] Skipped {wav_path.name}: {exc}")
+            self._ref_mels[fret] = mels
+            logger.info(
+                f"[fine-tune] Fret {fret} (pitch {pitch}): "
+                f"{len(mels)} reference spectrograms loaded from {ref_dir}"
+            )
+            total += len(mels)
+        if total == 0:
+            raise RuntimeError(
+                f"[fine-tune] No reference WAVs loaded from {ref_dir}. "
+                "Check --ref-dir and fret-to-pitch mapping."
+            )
+
+    def _cosine_sim_vs_refs(self, audio: np.ndarray, target_fret: int) -> float:
+        """Return best cosine similarity between captured audio and cached reference mels.
+
+        The captured audio is resampled to _FT_SR, onset-aligned, and converted
+        to a normalized mel spectrogram before comparison, matching the same
+        processing applied to reference WAVs in _load_ref_mels().
+        """
+        ref_mels = self._ref_mels.get(target_fret)
+        if not ref_mels:
+            logger.warning(f"[fine-tune] No reference mels for fret {target_fret}, returning 0.0")
+            return 0.0
+
+        # Resample to fine-tune SR and onset-align
+        if self.device_sr != _FT_SR:
+            audio_ft = librosa.resample(audio, orig_sr=self.device_sr, target_sr=_FT_SR)
+        else:
+            audio_ft = audio.copy()
+        audio_ft = self._onset_align(audio_ft)
+        if len(audio_ft) < int(0.5 * _FT_SR):
+            return 0.0  # silence or near-silent capture
+
+        mel_rl = self._normalize_01(self._compute_ft_mel(audio_ft))
+
+        best_sim = 0.0
+        for mel_ref in ref_mels:
+            # Crop both to the shorter time axis before comparing
+            min_t = min(mel_rl.shape[1], mel_ref.shape[1])
+            v_rl  = mel_rl[:, :min_t].ravel()
+            v_ref = mel_ref[:, :min_t].ravel()
+            dot      = float(np.dot(v_rl, v_ref))
+            norm_rl  = float(np.linalg.norm(v_rl))
+            norm_ref = float(np.linalg.norm(v_ref))
+            sim = dot / (norm_rl * norm_ref + 1e-8)
+            if sim > best_sim:
+                best_sim = sim
+
+        return float(np.clip(best_sim, 0.0, 1.0))
+
+    def compute_reward(self,
                        fret_position: float,
                        torque: float,
                        target_fret: int,
@@ -482,20 +617,36 @@ class HarmonicRewardCalculator:
         classification = None
         harmonic_prob = 0.0
         audio_rms = None
-        
+
         needs_audio = self.reward_mode != REWARD_MODE_NO_AUDIO
-        
+
         if audio is None and capture_audio and needs_audio:
             audio = self.capture_audio()
-        
+
         if audio is not None and needs_audio:
             audio_rms = float(np.sqrt(np.mean(audio ** 2)))
-            classification = self.classify_audio(audio)
-            harmonic_prob = classification['harmonic_prob']
+            if self.reward_mode == REWARD_MODE_COSINE_SIM:
+                # Fine-tune mode: replace CNN with onset-aligned mel cosine similarity
+                cosine_sim = self._cosine_sim_vs_refs(audio, target_fret)
+                # Build a pseudo-classification dict so all downstream success/recording
+                # logic (which checks 'harmonic_prob') continues to work unchanged.
+                classification = {
+                    'predicted_class':  0 if cosine_sim >= 0.8 else 1,
+                    'predicted_label':  'harmonic' if cosine_sim >= 0.8 else 'dead_note',
+                    'confidence':       cosine_sim,
+                    'harmonic_prob':    cosine_sim,
+                    'dead_prob':        1.0 - cosine_sim,
+                    'general_prob':     0.0,
+                    'cosine_sim':       cosine_sim,
+                }
+                harmonic_prob = cosine_sim
+            else:
+                classification = self.classify_audio(audio)
+                harmonic_prob = classification['harmonic_prob']
         elif audio is not None and not needs_audio:
             # Still compute RMS for the silence filtration check
             audio_rms = float(np.sqrt(np.mean(audio ** 2)))
-        
+
         # Dispatch to the appropriate reward function
         if self.reward_mode == REWARD_MODE_NO_FILTRATION:
             reward_info = _compute_reward_no_filtration(
@@ -512,7 +663,16 @@ class HarmonicRewardCalculator:
                 target_fret=target_fret,
                 audio_rms=audio_rms,
             )
-        else:  # REWARD_MODE_FULL (default)
+        elif self.reward_mode == REWARD_MODE_COSINE_SIM:
+            cosine_sim_val = classification['cosine_sim'] if classification else 0.0
+            reward_info = _compute_reward_cosine_sim(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=target_fret,
+                cosine_sim=cosine_sim_val,
+                audio_rms=audio_rms,
+            )
+        else:  # REWARD_MODE_FULL
             reward_info = _compute_reward(
                 fret_position=fret_position,
                 torque=torque,
