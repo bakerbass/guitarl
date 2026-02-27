@@ -12,11 +12,19 @@ from pathlib import Path
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Dict
+from typing import List, Dict, Optional
 import sys
 
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
+from utils.success_recorder import SuccessRecorder
+
+# D-string (string_index=2) fret → MIDI note number mapping.
+# Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
+#   Harmonic #1 (4th fret)  → MNN 78
+#   Harmonic #2 (5th fret)  → MNN 74
+#   Harmonic #3 (7th fret)  → MNN 69
+_D_STRING_FRET_TO_PITCH: Dict[int, int] = {4: 78, 5: 74, 7: 69}
 
 
 logging.basicConfig(level=logging.INFO)
@@ -308,6 +316,85 @@ def print_summary(results: Dict):
     print("=" * 60 + "\n")
 
 
+def _get_success_wavs_for_fret(successes_dir: Path, target_fret: int) -> List[Path]:
+    """Return WAV paths from successes_dir whose JSON sidecar matches target_fret."""
+    import json as _json
+    wavs = []
+    for json_path in sorted(successes_dir.glob("*.json")):
+        try:
+            data = _json.loads(json_path.read_text())
+            if data.get("target_fret") == target_fret:
+                wav_path = json_path.with_suffix(".wav")
+                if wav_path.exists():
+                    wavs.append(wav_path)
+        except Exception:
+            pass
+    return sorted(wavs)
+
+
+def run_image_analysis(
+    results: Dict,
+    output_dir: Path,
+    ref_dir: Path,
+    top_n: int = 1,
+    rank_by: str = "ssim",
+    baseline: bool = False,
+    neg_ctrl_dir: Optional[Path] = None,
+) -> None:
+    """Run image_analysis batch_compare for each fret present in evaluation results.
+
+    For each evaluated target fret, filters the success WAVs by fret (via JSON
+    sidecars), resolves the correct reference pitch for the D string, and calls
+    batch_compare() from image_analysis.py.
+
+    Results are saved to output_dir/image_analysis_fret{N}/.
+    """
+    from image_analysis import batch_compare
+
+    successes_dir = output_dir / "successes"
+    if not successes_dir.exists():
+        logger.warning(
+            f"No successes directory at {successes_dir} — "
+            "skipping image analysis (no success WAVs were recorded)"
+        )
+        return
+
+    evaluated_frets = sorted(set(results['episode_target_frets']))
+
+    for fret in evaluated_frets:
+        pitch = _D_STRING_FRET_TO_PITCH.get(fret)
+        if pitch is None:
+            logger.warning(
+                f"No D-string pitch mapping for fret {fret} — skipping image analysis for this fret"
+            )
+            continue
+
+        rl_wavs = _get_success_wavs_for_fret(successes_dir, fret)
+        if not rl_wavs:
+            logger.info(f"No success WAVs found for fret {fret} — skipping image analysis")
+            continue
+
+        pitch_pattern = f"pitches{pitch}"
+        img_output_dir = output_dir / f"image_analysis_fret{fret}"
+        logger.info(
+            f"Image analysis: fret={fret}, pitch={pitch}, "
+            f"{len(rl_wavs)} RL WAV(s), ref pattern={pitch_pattern}"
+        )
+
+        batch_compare(
+            rl_dir=successes_dir,
+            ref_dir=ref_dir,
+            pitch_pattern=pitch_pattern,
+            rl_wavs=rl_wavs,
+            top_n=top_n,
+            rank_by=rank_by,
+            output_dir=img_output_dir,
+            play_audio=False,
+            baseline=baseline,
+            neg_ctrl_dir=neg_ctrl_dir,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description='Evaluate harmonic RL agent')
     parser.add_argument('--model', required=True, help='Path to trained model (.zip)')
@@ -323,6 +410,22 @@ def main():
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic policy')
     parser.add_argument('--visualize', action='store_true', help='Show visualization plots')
     parser.add_argument('--output-dir', type=str, default='./eval_results', help='Output directory')
+
+    # Image analysis
+    parser.add_argument('--image-analysis', action='store_true',
+                        help='Run image_analysis batch comparison after evaluation')
+    parser.add_argument('--ref-dir', type=str,
+                        default='../HarmonicsClassifier/note_clips/harmonic',
+                        help='Reference WAV directory for image analysis (default: %(default)s)')
+    parser.add_argument('--top-n', type=int, default=1,
+                        help='Number of top pairs to plot in image analysis (default: %(default)s)')
+    parser.add_argument('--rank-by', type=str, default='ssim',
+                        choices=['cosine_sim', 'mse', 'ssim', 'pearson_r'],
+                        help='Ranking metric for image analysis (default: %(default)s)')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Compute ref-vs-ref similarity ceiling in image analysis')
+    parser.add_argument('--neg-ctrl-dir', type=str, default=None, metavar='DIR',
+                        help='Dead-note WAVs directory for negative control in image analysis')
 
     args = parser.parse_args()
 
@@ -348,18 +451,20 @@ def main():
     # Resolve string pool
     string_indices = args.string_indices if args.string_indices else [args.string_index]
 
+    # Create success recorder — saves WAV + JSON for each successful step
+    success_recorder = SuccessRecorder(output_dir / "successes")
+
     # Create environment
     curriculum_mode = 'random' if args.target_fret is None else 'fixed_fret'
+    fixed_target_fret = args.target_fret if args.target_fret is not None else 7
     env = HarmonicEnv(
         model_path=str(classifier_path),
         string_indices=string_indices,
         curriculum_mode=curriculum_mode,
+        fixed_target_fret=fixed_target_fret,
         max_steps=10,
+        success_recorder=success_recorder,
     )
-
-    # Override fret list if a specific fret was requested
-    if args.target_fret is not None:
-        env.HARMONIC_FRETS = [args.target_fret]
 
     # Evaluate
     logger.info(f"Evaluating for {args.episodes} episodes "
@@ -398,6 +503,19 @@ def main():
     logger.info(f"Results saved to {results_path}")
 
     env.close()
+    success_recorder.close()  # drain queue — ensures all WAVs are written before image analysis
+
+    # Image analysis: compare success WAVs against dataset reference harmonics
+    if args.image_analysis:
+        run_image_analysis(
+            results=results,
+            output_dir=output_dir,
+            ref_dir=Path(args.ref_dir),
+            top_n=args.top_n,
+            rank_by=args.rank_by,
+            baseline=args.baseline,
+            neg_ctrl_dir=Path(args.neg_ctrl_dir) if args.neg_ctrl_dir else None,
+        )
 
 
 if __name__ == '__main__':
