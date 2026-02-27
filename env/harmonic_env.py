@@ -531,7 +531,10 @@ class HarmonicEnv(gym.Env):
         self.fret_history.append(fret_position)
         self.torque_history.append(torque)
         self.episode_rewards.append(reward)
-        self.current_step += 1
+        # Only real (unfiltered) robot steps count toward max_steps.
+        # Filtered steps are instant no-ops and should not consume the episode budget.
+        if not reward_info.get('filtered', False):
+            self.current_step += 1
         
         # Check termination conditions
         terminated = False

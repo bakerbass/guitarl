@@ -18,6 +18,7 @@ import sys
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
+from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION
 
 # D-string (string_index=2) fret → MIDI note number mapping.
 # Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
@@ -35,12 +36,19 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
     """
     Evaluate trained policy.
 
+    Filtered steps (actions rejected by the physics gate before reaching the
+    robot) do not count toward max_steps in the env, so each episode runs
+    until the requested number of real robot actions have been attempted.
+    Only unfiltered steps are included in reward / metric accounting.
+
     Returns:
         Dictionary with evaluation metrics, including per-fret and per-string breakdowns.
     """
     episode_rewards = []
     episode_successes = []
-    episode_steps = []
+    episode_step_success_rates = []   # per-episode fraction of robot steps that were harmonics
+    episode_steps = []          # robot (unfiltered) steps only
+    episode_attempts = []       # total step() calls including filtered
     episode_harmonic_probs = []
     episode_target_frets = []
     episode_string_indices = []
@@ -54,7 +62,6 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
         done = False
         truncated = False
         episode_reward = 0
-        step_count = 0
 
         trajectory = {
             'target_fret': info['target_fret'],
@@ -63,16 +70,26 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             'torques': [],
             'rewards': [],
             'harmonic_probs': [],
+            'step_successes': [],   # 1.0 per robot step where harmonic_prob > 0.8
         }
 
         last_info = info
+        robot_steps = 0
+        total_attempts = 0
+
         while not (done or truncated):
             action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, done, truncated, info = env.step(action)
-            last_info = info
+            total_attempts += 1
 
+            # Only score and record steps that actually reached the robot
+            if info.get('filtered', False):
+                last_info = info  # keep target_fret etc. up to date
+                continue
+
+            last_info = info
+            robot_steps += 1
             episode_reward += reward
-            step_count += 1
 
             # Record trajectory — use keys that harmonic_env.step() actually returns
             trajectory['positions'].append(info.get('slider_mm', info.get('fret_position', 0)))
@@ -82,6 +99,9 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             if info['classification'] is not None:
                 harmonic_prob = info['classification']['harmonic_prob']
                 trajectory['harmonic_probs'].append(harmonic_prob)
+                trajectory['step_successes'].append(float(harmonic_prob > 0.8))
+            else:
+                trajectory['step_successes'].append(0.0)
 
             if render:
                 env.render()
@@ -90,22 +110,28 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
         final_classification = last_info['classification']
         if final_classification is not None:
             final_harmonic_prob = final_classification['harmonic_prob']
-            success = final_harmonic_prob > 0.8
+            episode_succeeded = final_harmonic_prob > 0.8   # ended on a harmonic
         else:
             final_harmonic_prob = 0.0
-            success = False
+            episode_succeeded = False
+
+        # Step-level: fraction of robot steps that were harmonics this episode
+        step_succs = trajectory['step_successes']
+        ep_step_success = float(np.mean(step_succs)) if step_succs else 0.0
 
         target_fret = last_info.get('target_fret', trajectory['target_fret'])
         string_index = last_info.get('string_index', trajectory['string_index'])
 
         episode_rewards.append(episode_reward)
-        episode_successes.append(float(success))
-        episode_steps.append(step_count)
+        episode_successes.append(float(episode_succeeded))
+        episode_steps.append(robot_steps)
+        episode_attempts.append(total_attempts)
         episode_harmonic_probs.append(final_harmonic_prob)
         episode_target_frets.append(target_fret)
         episode_string_indices.append(string_index)
         episode_fret_positions.append(np.mean(trajectory['positions']) if trajectory['positions'] else 0.0)
         episode_torques.append(np.mean(trajectory['torques']) if trajectory['torques'] else 0.0)
+        episode_step_success_rates.append(ep_step_success)
 
         all_trajectories.append(trajectory)
 
@@ -113,23 +139,28 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             f"Episode {episode + 1}/{n_episodes}: "
             f"Fret={target_fret}, String={string_index}, "
             f"Reward={episode_reward:.3f}, "
-            f"Success={success}, "
-            f"Harmonic prob={final_harmonic_prob:.3f}, "
-            f"Steps={step_count}"
+            f"Episode success={episode_succeeded}, "
+            f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
+            f"H-prob={final_harmonic_prob:.3f}, "
+            f"Robot steps={robot_steps}/{total_attempts} attempts"
         )
 
     # ── Aggregate metrics ────────────────────────────────────────────
     results = {
         'mean_reward': float(np.mean(episode_rewards)),
         'std_reward': float(np.std(episode_rewards)),
-        'success_rate': float(np.mean(episode_successes)),
+        'episode_success_rate': float(np.mean(episode_successes)),
+        'step_success_rate': float(np.mean(episode_step_success_rates)),
         'mean_steps': float(np.mean(episode_steps)),
+        'mean_attempts': float(np.mean(episode_attempts)),
+        'filter_rate': float(1.0 - np.sum(episode_steps) / max(np.sum(episode_attempts), 1)),
         'mean_harmonic_prob': float(np.mean(episode_harmonic_probs)),
         'mean_position': float(np.mean(episode_fret_positions)),
         'mean_torque': float(np.mean(episode_torques)),
         'n_episodes': n_episodes,
         'episode_rewards': episode_rewards,
         'episode_successes': episode_successes,
+        'episode_step_success_rates': episode_step_success_rates,
         'episode_harmonic_probs': episode_harmonic_probs,
         'episode_target_frets': episode_target_frets,
         'episode_string_indices': episode_string_indices,
@@ -144,7 +175,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             continue
         results_by_fret[str(fret)] = {
             'n_episodes': len(mask),
-            'success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'episode_success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'step_success_rate': float(np.mean([episode_step_success_rates[i] for i in mask])),
             'mean_harmonic_prob': float(np.mean([episode_harmonic_probs[i] for i in mask])),
             'mean_reward': float(np.mean([episode_rewards[i] for i in mask])),
             'mean_steps': float(np.mean([episode_steps[i] for i in mask])),
@@ -159,7 +191,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             continue
         results_by_string[str(string)] = {
             'n_episodes': len(mask),
-            'success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'episode_success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'step_success_rate': float(np.mean([episode_step_success_rates[i] for i in mask])),
             'mean_harmonic_prob': float(np.mean([episode_harmonic_probs[i] for i in mask])),
             'mean_reward': float(np.mean([episode_rewards[i] for i in mask])),
             'mean_steps': float(np.mean([episode_steps[i] for i in mask])),
@@ -291,27 +324,30 @@ def print_summary(results: Dict):
     print("=" * 60)
     print(f"Episodes:            {results['n_episodes']}")
     print(f"Mean Reward:         {results['mean_reward']:.3f} ± {results['std_reward']:.3f}")
-    print(f"Success Rate:        {results['success_rate']:.1%}")
+    print(f"Episode Success:     {results['episode_success_rate']:.1%}  (≥1 harmonic step per episode)")
+    print(f"Step Success:        {results['step_success_rate']:.1%}  (harmonic steps / total robot steps)")
     print(f"Mean Harmonic Prob:  {results['mean_harmonic_prob']:.3f}")
-    print(f"Mean Steps/Episode:  {results['mean_steps']:.1f}")
+    print(f"Mean Robot Steps:    {results['mean_steps']:.1f}  "
+          f"(attempts: {results.get('mean_attempts', results['mean_steps']):.1f}, "
+          f"filter rate: {results.get('filter_rate', 0.0):.1%})")
     print(f"Mean Position:       {results['mean_position']:.1f} mm")
     print(f"Mean Torque:         {results['mean_torque']:.1f}")
 
     if results.get('results_by_fret'):
         print("\n── Per-fret breakdown ──────────────────────────────────")
-        print(f"  {'Fret':>5}  {'N':>5}  {'Success':>8}  {'H-prob':>7}  {'Reward':>8}")
+        print(f"  {'Fret':>5}  {'N':>5}  {'Ep.Succ':>8}  {'StpSucc':>8}  {'H-prob':>7}  {'Reward':>8}")
         for fret, d in sorted(results['results_by_fret'].items(), key=lambda x: int(x[0])):
             print(f"  {fret:>5}  {d['n_episodes']:>5}  "
-                  f"{d['success_rate']:>8.1%}  {d['mean_harmonic_prob']:>7.3f}  "
-                  f"{d['mean_reward']:>8.3f}")
+                  f"{d['episode_success_rate']:>8.1%}  {d['step_success_rate']:>8.1%}  "
+                  f"{d['mean_harmonic_prob']:>7.3f}  {d['mean_reward']:>8.3f}")
 
     if results.get('results_by_string'):
         print("\n── Per-string breakdown ────────────────────────────────")
-        print(f"  {'String':>6}  {'N':>5}  {'Success':>8}  {'H-prob':>7}  {'Reward':>8}")
+        print(f"  {'String':>6}  {'N':>5}  {'Ep.Succ':>8}  {'StpSucc':>8}  {'H-prob':>7}  {'Reward':>8}")
         for string, d in sorted(results['results_by_string'].items(), key=lambda x: int(x[0])):
             print(f"  {string:>6}  {d['n_episodes']:>5}  "
-                  f"{d['success_rate']:>8.1%}  {d['mean_harmonic_prob']:>7.3f}  "
-                  f"{d['mean_reward']:>8.3f}")
+                  f"{d['episode_success_rate']:>8.1%}  {d['step_success_rate']:>8.1%}  "
+                  f"{d['mean_harmonic_prob']:>7.3f}  {d['mean_reward']:>8.3f}")
 
     print("=" * 60 + "\n")
 
@@ -427,6 +463,12 @@ def main():
     parser.add_argument('--neg-ctrl-dir', type=str, default=None, metavar='DIR',
                         help='Dead-note WAVs directory for negative control in image analysis')
 
+    parser.add_argument('--no-filtration', action='store_true', default=False,
+                        help='Disable the physics filtration gate (Layer 1) so that every action '
+                             'is sent to the robot regardless of torque/fret range.  Useful when '
+                             'evaluating a model trained with different filtration thresholds that '
+                             'would otherwise block all steps.')
+
     args = parser.parse_args()
 
     # Check paths
@@ -457,6 +499,13 @@ def main():
     # Create environment
     curriculum_mode = 'random' if args.target_fret is None else 'fixed_fret'
     fixed_target_fret = args.target_fret if args.target_fret is not None else 7
+    reward_mode = REWARD_MODE_NO_FILTRATION if args.no_filtration else REWARD_MODE_FULL
+    if args.no_filtration:
+        logger.info(
+            '[eval] --no-filtration: physics gate disabled — all actions will be sent to the robot.'
+        )
+    # max_steps=10 means 10 real robot steps per episode — filtered steps
+    # do not count (harmonic_env only increments current_step when unfiltered).
     env = HarmonicEnv(
         model_path=str(classifier_path),
         string_indices=string_indices,
@@ -464,6 +513,7 @@ def main():
         fixed_target_fret=fixed_target_fret,
         max_steps=10,
         success_recorder=success_recorder,
+        reward_mode=reward_mode,
     )
 
     # Evaluate
@@ -484,23 +534,30 @@ def main():
         viz_path = output_dir / f"evaluation_{model_path.stem}.png"
         visualize_results(results, output_path=viz_path)
 
-    # Save results JSON
+    # Save results JSON (non-fatal — image analysis still runs if this fails)
     import json
     results_path = output_dir / f"results_{model_path.stem}.json"
 
-    # Strip non-serialisable fields
-    json_results = {
-        k: (v.tolist() if isinstance(v, np.ndarray) else
-            float(v) if isinstance(v, (np.float32, np.float64)) else
-            v)
-        for k, v in results.items()
-        if k != 'trajectories'  # too large for JSON
-    }
+    class _NumpyEncoder(json.JSONEncoder):
+        """Recursively coerce numpy scalars/arrays to native Python types."""
+        def default(self, obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            return super().default(obj)
 
-    with open(results_path, 'w') as f:
-        json.dump(json_results, f, indent=2)
-
-    logger.info(f"Results saved to {results_path}")
+    try:
+        json_results = {k: v for k, v in results.items() if k != 'trajectories'}
+        with open(results_path, 'w') as f:
+            json.dump(json_results, f, indent=2, cls=_NumpyEncoder)
+        logger.info(f"Results saved to {results_path}")
+    except Exception as exc:
+        logger.error(f"Failed to save results JSON: {exc}")
 
     env.close()
     success_recorder.close()  # drain queue — ensures all WAVs are written before image analysis

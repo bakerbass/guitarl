@@ -7,4 +7,4 @@ python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resum
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history --silence-rms auto
 ./scripts/fix_audio.sh --reload
 
-python evaluate.py --model runs/good_run/best_model.zip --target-fret 7 --episodes 20 --image-analysis --baseline --neg-ctrl-dir ../HarmonicsClassifier/note_clips/dead_note --top-n 3
+python evaluate.py --model runs/good_run_2/best_model/best_model.zip --target-fret 7 --episodes 20 --image-analysis --baseline --neg-ctrl-dir ../HarmonicsClassifier/note_clips/dead_note --top-n 3
