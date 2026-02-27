@@ -102,7 +102,7 @@ class HarmonicProgressCallback(CallbackList):
 
 def _plot_episode_audio(audio: np.ndarray, reward_info: dict, rl_action,
                         episode_num: int, model_sr: int = 22050,
-                        capture_duration: float = 2.0) -> None:
+                        capture_duration: float = 4.0) -> None:
     """Plot waveform + mel spectrogram for one episode step (blocking)."""
     import matplotlib.pyplot as plt
     import librosa

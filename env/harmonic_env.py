@@ -94,7 +94,7 @@ class HarmonicEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 3.0       # Total step duration (seconds)
+    ACTION_DURATION = 5.0       # Total step duration (seconds): 0.5 pre + 4.0 capture + 0.5 pad
     CAPTURE_PRE_DELAY = 0.5     # Wait after send_rlfret before recording (robot arm movement + pluck)
     STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
 
@@ -112,7 +112,7 @@ class HarmonicEnv(gym.Env):
                  osc_host: str = "127.0.0.1",
                  osc_port: int = 12000,
                  audio_device: str = "Scarlett",
-                 capture_duration: float = 2.0,
+                 capture_duration: float = 4.0,
                  max_steps: int = MAX_STEPS_PER_EPISODE,
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
