@@ -119,7 +119,9 @@ class HarmonicEnv(gym.Env):
                  reward_mode: str = REWARD_MODE_FULL,
                  offline: bool = False,
                  success_recorder: Optional['SuccessRecorder'] = None,
-                 temperature: float = 1.5):
+                 temperature: float = 1.5,
+                 shared_rolling_buffer=None,
+                 audio_device_id: Optional[int] = None):
         """
         Initialize HarmonicEnv.
 
@@ -198,6 +200,8 @@ class HarmonicEnv(gym.Env):
                 capture_duration=capture_duration,
                 reward_mode=reward_mode,
                 temperature=temperature,
+                shared_rolling_buffer=shared_rolling_buffer,
+                device_id=audio_device_id,
             )
         
         # Define action space dimensions

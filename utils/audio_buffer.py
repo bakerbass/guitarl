@@ -74,16 +74,29 @@ class RollingAudioBuffer:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Set once the InputStream has been successfully opened for the first
+        # time.  Callers can block on this before using the buffer.
+        self._ready_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start the background recording thread."""
+    def start(self, open_timeout: float = 15.0) -> None:
+        """Start the background recording thread and wait for it to open.
+
+        Parameters
+        ----------
+        open_timeout : float
+            Seconds to wait for the hardware stream to successfully open before
+            raising ``RuntimeError``.  Set to 0 to return immediately (no wait).
+            Default 15 s is generous enough for USB devices that take a moment
+            to reinitialise after being released by another process.
+        """
         if self._running:
             return
         self._running = True
+        self._ready_event.clear()
         self._thread = threading.Thread(
             target=self._record_loop, daemon=True, name="RollingAudioBuffer"
         )
@@ -92,6 +105,16 @@ class RollingAudioBuffer:
             f"RollingAudioBuffer started (device={self.device_id}, "
             f"sr={self.device_sr}, buf={self.buffer_samples/self.device_sr:.0f}s)"
         )
+        if self.device_id is None or open_timeout <= 0:
+            return
+        if not self._ready_event.wait(timeout=open_timeout):
+            self._running = False
+            raise RuntimeError(
+                f"RollingAudioBuffer: audio device {self.device_id} did not open "
+                f"within {open_timeout:.0f}s.  Is the Scarlett held by another "
+                f"process?  Run:\n"
+                f"  sudo fuser -k /dev/snd/*  (or  ./scripts/fix_audio.sh)"
+            )
 
     def stop(self) -> None:
         """Signal the recording thread to stop and wait for it to exit."""
@@ -112,33 +135,60 @@ class RollingAudioBuffer:
                 time.sleep(0.05)
             return
 
-        try:
-            with sd.InputStream(
-                samplerate=self.device_sr,
-                channels=1,
-                device=self.device_id,
-                dtype="float32",
-                blocksize=self.chunk_size,
-            ) as stream:
-                self._t_stream_start = time.monotonic()
-                while self._running:
-                    chunk, _ = stream.read(self.chunk_size)
-                    samples = chunk[:, 0]
-                    n = len(samples)
-                    with self._lock:
-                        pos = self._abs_write_pos % self.buffer_samples
-                        end = pos + n
-                        if end <= self.buffer_samples:
-                            self._buf[pos:end] = samples
-                        else:
-                            # Wrap around
-                            first = self.buffer_samples - pos
-                            self._buf[pos:] = samples[:first]
-                            self._buf[: n - first] = samples[first:]
-                        self._abs_write_pos += n
-        except Exception as exc:
-            logger.error(f"RollingAudioBuffer recording error: {exc}")
-            self._running = False
+        MAX_RETRIES   = 10
+        RETRY_DELAYS  = [1, 2, 4, 8, 8, 8, 8, 8, 8, 8]  # seconds between attempts
+        attempt       = 0
+
+        while self._running and attempt <= MAX_RETRIES:
+            if attempt > 0:
+                delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
+                logger.warning(
+                    f"RollingAudioBuffer: retrying device open "
+                    f"(attempt {attempt}/{MAX_RETRIES}, waiting {delay}s)..."
+                )
+                time.sleep(delay)
+
+            try:
+                with sd.InputStream(
+                    samplerate=self.device_sr,
+                    channels=1,
+                    device=self.device_id,
+                    dtype="float32",
+                    blocksize=self.chunk_size,
+                ) as stream:
+                    if attempt > 0:
+                        logger.info(
+                            f"RollingAudioBuffer: device reopened successfully "
+                            f"(attempt {attempt})."
+                        )
+                    attempt = 0  # reset on successful open
+                    self._ready_event.set()  # unblock start() / wait_until_ready()
+                    self._t_stream_start = time.monotonic()
+                    while self._running:
+                        chunk, _ = stream.read(self.chunk_size)
+                        samples = chunk[:, 0]
+                        n = len(samples)
+                        with self._lock:
+                            pos = self._abs_write_pos % self.buffer_samples
+                            end = pos + n
+                            if end <= self.buffer_samples:
+                                self._buf[pos:end] = samples
+                            else:
+                                # Wrap around
+                                first = self.buffer_samples - pos
+                                self._buf[pos:] = samples[:first]
+                                self._buf[: n - first] = samples[first:]
+                            self._abs_write_pos += n
+            except Exception as exc:
+                logger.error(f"RollingAudioBuffer recording error: {exc}")
+                attempt += 1
+
+        if attempt > MAX_RETRIES:
+            logger.error(
+                f"RollingAudioBuffer: gave up after {MAX_RETRIES} retries — "
+                f"audio capture disabled for this run."
+            )
+        self._running = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -241,6 +291,15 @@ class RollingAudioBuffer:
         if self.device_id is None:
             logger.warning("calibrate_silence_threshold: no device, returning default 0.005")
             return 0.005
+
+        # Block until the stream is actually open.  start() may already have
+        # waited, but calibrate_silence_threshold can also be called later when
+        # the stream drops and reconnects, so we wait here too.
+        if not self._ready_event.wait(timeout=15.0):
+            raise RuntimeError(
+                "calibrate_silence_threshold: audio device never opened. "
+                "Cannot calibrate silence threshold."
+            )
 
         logger.info(
             f"Calibrating silence threshold: recording {duration:.1f}s of ambient audio..."

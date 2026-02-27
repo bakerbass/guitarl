@@ -85,7 +85,9 @@ class HarmonicRewardCalculator:
                  model_sr: int = 22050,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu",
                  reward_mode: str = REWARD_MODE_FULL,
-                 temperature: float = 1.5):
+                 temperature: float = 1.5,
+                 shared_rolling_buffer=None,
+                 device_id: Optional[int] = None):
         """
         Initialize reward calculator.
         
@@ -101,6 +103,9 @@ class HarmonicRewardCalculator:
                          'no_audio'       — Layer 1 + fret/torque shaping, no CNN
             temperature: Temperature for logit scaling before softmax (default 1.5).
                          Values > 1 produce softer, less overconfident probabilities.
+            shared_rolling_buffer: Optional pre-built RollingAudioBuffer to reuse.
+                         When two envs share one device (e.g. train + eval), pass the
+                         first env's buffer here so only one InputStream is opened.
         """
         self.model_path = Path(model_path)
         self.device_name = device_name
@@ -108,14 +113,17 @@ class HarmonicRewardCalculator:
         self.model_sr = model_sr
         self.device = torch.device(device)
         self.temperature = temperature
+        self._preferred_device_id = device_id  # optional override
         
         # Audio processing parameters
         self.n_mels = 128
         self.n_fft = 2048
         self.hop_length = 512
         
-        # Find audio device
-        self.device_id = self._find_audio_device()
+        # Find audio device (with test-open and PipeWire fallback)
+        self.device_id = self._find_audio_device(
+            preferred_device_id=self._preferred_device_id
+        )
         if self.device_id is None:
             if reward_mode == REWARD_MODE_NO_AUDIO:
                 # Audio not used in this mode — skip device requirement
@@ -142,37 +150,121 @@ class HarmonicRewardCalculator:
         self.reward_mode = reward_mode
         logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}, temperature={temperature}")
 
-        # Rolling audio buffer (always-on background recording)
-        self._rolling_buffer = RollingAudioBuffer(
-            device_id=self.device_id,
-            device_sr=self.device_sr,
-            buffer_duration=ROLLING_BUFFER_DURATION,
-        )
-        self._rolling_buffer.start()
+        # Rolling audio buffer (always-on background recording).
+        # If a shared buffer is provided (e.g. from the training env), reuse it
+        # directly so we don't try to open the same hw device twice.
+        if shared_rolling_buffer is not None:
+            self._rolling_buffer = shared_rolling_buffer
+            self._owns_rolling_buffer = False
+            logger.info("HarmonicRewardCalculator: reusing shared RollingAudioBuffer.")
+        else:
+            self._rolling_buffer = RollingAudioBuffer(
+                device_id=self.device_id,
+                device_sr=self.device_sr,
+                buffer_duration=ROLLING_BUFFER_DURATION,
+            )
+            self._rolling_buffer.start()
+            self._owns_rolling_buffer = True
 
         # Latency estimate: EMA of (onset_time - action_time)
         self._latency_ema: float = 0.5  # Sensible initial guess (seconds)
 
         logger.info(f"HarmonicRewardCalculator initialized with model: {model_path}, reward_mode={reward_mode}")
 
-    def _find_audio_device(self) -> Optional[int]:
-        """Find audio input device by name substring (input channels required)."""
+    def _find_audio_device(self, preferred_device_id: Optional[int] = None) -> Optional[int]:
+        """Find a working audio input device.
+
+        Strategy:
+        1. If ``preferred_device_id`` is given, use it directly after verifying
+           it has input channels.
+        2. Otherwise search by ``device_name`` substring.
+        3. In either case, **test-open** the candidate device.  If that fails
+           (common under PipeWire when the raw hw: device is held), fall back
+           to the first working device whose name contains 'sysdefault',
+           'pipewire', or 'default', then to any device that opens.
+        """
         devices = sd.query_devices()
-        for idx, device in enumerate(devices):
-            if (self.device_name.lower() in device['name'].lower()
-                    and device['max_input_channels'] > 0):
-                logger.info(f"Found audio device: {device['name']} (ID: {idx})")
-                return idx
-        # Second pass: warn about any matching output-only devices so the user
-        # understands why the substring matched but was rejected.
-        for idx, device in enumerate(devices):
-            if (self.device_name.lower() in device['name'].lower()
-                    and device['max_input_channels'] == 0):
+
+        # ── Resolve candidate ID ──────────────────────────────────────────────
+        candidate_id: Optional[int] = None
+
+        if preferred_device_id is not None:
+            dev = devices[preferred_device_id]
+            if dev['max_input_channels'] > 0:
+                candidate_id   = preferred_device_id
+                candidate_name = dev['name']
+                logger.info(
+                    f'Using forced audio device ID={candidate_id}: {candidate_name}')
+            else:
                 logger.warning(
-                    f"Skipped output-only device '{device['name']}' (ID: {idx}) — "
-                    "no input channels. Check ALSA / PulseAudio routing."
-                )
-        return None
+                    f'--audio-device-id {preferred_device_id} ({dev["name"]}) has no '
+                    'input channels — falling back to name search.')
+
+        if candidate_id is None:
+            for idx, device in enumerate(devices):
+                if (self.device_name.lower() in device['name'].lower()
+                        and device['max_input_channels'] > 0):
+                    candidate_id   = idx
+                    candidate_name = device['name']
+                    logger.info(f"Found audio device: {candidate_name} (ID: {idx})")
+                    break
+            # Warn about output-only name matches
+            if candidate_id is None:
+                for idx, device in enumerate(devices):
+                    if (self.device_name.lower() in device['name'].lower()
+                            and device['max_input_channels'] == 0):
+                        logger.warning(
+                            f"Skipped output-only device '{device['name']}' (ID: {idx}) — "
+                            "no input channels. Check ALSA / PulseAudio routing."
+                        )
+
+        # ── Test-open the candidate ────────────────────────────────────────────
+        if candidate_id is not None and self._test_open_device(candidate_id):
+            return candidate_id
+
+        if candidate_id is not None:
+            logger.warning(
+                f'Audio device ID={candidate_id} found but failed test-open '
+                f'(likely held by PipeWire/PulseAudio on hw: path). '
+                f'Searching for a PipeWire-mediated fallback...')
+
+        # ── Fallback: prefer PipeWire/sysdefault virtual devices ──────────────
+        FALLBACK_KEYWORDS = ('sysdefault', 'pipewire', 'pulse', 'default')
+        for kw in FALLBACK_KEYWORDS:
+            for idx, device in enumerate(devices):
+                if (kw in device['name'].lower()
+                        and device['max_input_channels'] > 0
+                        and idx != candidate_id):
+                    if self._test_open_device(idx):
+                        logger.info(
+                            f"Fallback audio device: '{device['name']}' (ID: {idx}, "
+                            f"SR will be {int(device['default_samplerate'])} Hz)."
+                        )
+                        return idx
+
+        # ── Last resort: any input device that opens ───────────────────────────
+        for idx, device in enumerate(devices):
+            if device['max_input_channels'] > 0 and idx != candidate_id:
+                if self._test_open_device(idx):
+                    logger.warning(
+                        f"Last-resort audio device: '{device['name']}' (ID: {idx})."
+                    )
+                    return idx
+
+        return None  # nothing worked
+
+    def _test_open_device(self, device_id: int) -> bool:
+        """Return True if the device can be opened as an InputStream."""
+        try:
+            dev_info = sd.query_devices(device_id, 'input')
+            sr = int(dev_info['default_samplerate'])
+            with sd.InputStream(device=device_id, samplerate=sr, channels=1,
+                                dtype='float32', blocksize=512):
+                pass
+            return True
+        except Exception as exc:
+            logger.debug(f'_test_open_device({device_id}): {exc}')
+            return False
 
     def _prompt_select_device(self) -> int:
         """Interactively prompt the user to choose an input device or quit."""
