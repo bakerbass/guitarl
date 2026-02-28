@@ -1,4 +1,5 @@
 /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917
+python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef 0.3 --learning-starts 2000 --total-timesteps 10000 --pretrain
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
 python train.py --classifier svm --svm-model-path ../HarmonicsClassifier/models/svm --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --string-index 2 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
@@ -17,10 +18,10 @@ python image_analysis.py --rl  ./runs/fine_tuned/successes/ --top-n 10 --batch -
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history --silence-rms auto --fine-tune
 
 ### eval for ablation: just pretrained
-python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917/best_model/best_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --cosine-success --output-dir ./eval_results_pretrained
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/pretrained/best_model/best_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_pretrained
 
 ### eval for ablation: untuned model
-python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/classifier_no_fine_tune/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --cosine-success --output-dir ./eval_results_untuned
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/classifier_no_fine_tune/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_untuned
 
 ### eval: fine tuned model
-python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/fine_tuned/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --cosine-success --output-dir ./eval_results_fine_tuned
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/fine_tuned/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_fine_tuned
