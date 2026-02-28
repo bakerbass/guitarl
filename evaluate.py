@@ -203,7 +203,15 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
                 cos_sim = _cosine_sim_for_audio(step_audio, fret, ref_mels, device_sr) \
                     if step_audio is not None else 0.0
                 trajectory['cosine_sims'].append(cos_sim)
-                trajectory['step_successes'].append(float(cos_sim >= COSINE_SIM_SUCCESS_THRESHOLD))
+                step_success = cos_sim >= COSINE_SIM_SUCCESS_THRESHOLD
+                trajectory['step_successes'].append(float(step_success))
+                logger.info(
+                    f"  Step {robot_steps}: pos={info.get('slider_mm', info.get('fret_position', 0)):.1f}  "
+                    f"torque={info.get('torque', 0):.0f}  "
+                    f"cos_sim={cos_sim:.4f}  "
+                    f"h_prob={harmonic_prob:.3f}  "
+                    f"{'SUCCESS' if step_success else 'fail'}"
+                )
             else:
                 trajectory['step_successes'].append(float(harmonic_prob > 0.8))
 
@@ -244,15 +252,29 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
 
         all_trajectories.append(trajectory)
 
-        logger.info(
-            f"Episode {episode + 1}/{n_episodes}: "
-            f"Fret={target_fret}, String={string_index}, "
-            f"Reward={episode_reward:.3f}, "
-            f"Episode success={episode_succeeded}, "
-            f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
-            f"H-prob={final_harmonic_prob:.3f}, "
-            f"Robot steps={robot_steps}/{total_attempts} attempts"
-        )
+        if ref_mels is not None:
+            final_cos_sim = trajectory['cosine_sims'][-1] if trajectory['cosine_sims'] else 0.0
+            mean_cos_sim = float(np.mean(trajectory['cosine_sims'])) if trajectory['cosine_sims'] else 0.0
+            logger.info(
+                f"Episode {episode + 1}/{n_episodes}: "
+                f"Fret={target_fret}, String={string_index}, "
+                f"Reward={episode_reward:.3f}, "
+                f"Episode success={episode_succeeded}, "
+                f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
+                f"cos_sim final={final_cos_sim:.4f}  mean={mean_cos_sim:.4f}, "
+                f"H-prob={final_harmonic_prob:.3f}, "
+                f"Robot steps={robot_steps}/{total_attempts} attempts"
+            )
+        else:
+            logger.info(
+                f"Episode {episode + 1}/{n_episodes}: "
+                f"Fret={target_fret}, String={string_index}, "
+                f"Reward={episode_reward:.3f}, "
+                f"Episode success={episode_succeeded}, "
+                f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
+                f"H-prob={final_harmonic_prob:.3f}, "
+                f"Robot steps={robot_steps}/{total_attempts} attempts"
+            )
 
     # ── Aggregate metrics ────────────────────────────────────────────
     results = {
