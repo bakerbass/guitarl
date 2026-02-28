@@ -567,7 +567,7 @@ class HarmonicEnv(gym.Env):
         # Success termination: only award bonus for unfiltered actions that actually
         # reached the classifier.  A filtered step (no OSC sent) cannot be a success.
         if not reward_info.get('filtered', False) and reward_info['classification'] is not None:
-            is_success = self.reward_calc.is_success(reward_info['classification'])
+            is_success = reward_info['classification']['harmonic_prob'] > self.success_threshold
             if is_success:
                 terminated = True
                 reward += 1.0  # Bonus for success
