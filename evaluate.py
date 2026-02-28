@@ -212,6 +212,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
                     f"h_prob={harmonic_prob:.3f}  "
                     f"{'SUCCESS' if step_success else 'fail'}"
                 )
+                if step_success:
+                    break  # terminate episode on first cosine success
             else:
                 trajectory['step_successes'].append(float(harmonic_prob > 0.8))
 
