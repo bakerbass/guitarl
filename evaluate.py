@@ -774,12 +774,17 @@ def main():
         )
     # max_steps=10 means 10 real robot steps per episode — filtered steps
     # do not count (harmonic_env only increments current_step when unfiltered).
+    # In cosine-success mode the env must not self-terminate on harmonic_prob —
+    # episode termination is controlled entirely by the cosine threshold break
+    # in evaluate_policy. Set success_threshold=2.0 (unreachable) to disable it.
+    success_threshold = 2.0 if args.cosine_success else 0.8
     env = HarmonicEnv(
         model_path=str(classifier_path),
         string_indices=string_indices,
         curriculum_mode=curriculum_mode,
         fixed_target_fret=fixed_target_fret,
         max_steps=10,
+        success_threshold=success_threshold,
         success_recorder=success_recorder,
         reward_mode=reward_mode,
     )
