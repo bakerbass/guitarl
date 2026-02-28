@@ -18,7 +18,7 @@ import sys
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
-from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION
+from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, COSINE_SIM_SUCCESS_THRESHOLD
 
 # D-string (string_index=2) fret → MIDI note number mapping.
 # Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
@@ -32,7 +32,97 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False):
+def _load_ref_mels(ref_dir: Path, fret_to_pitch: Dict[int, int]) -> Dict[int, list]:
+    """Pre-load and mel-encode reference WAVs, keyed by fret. Returns {} on import error."""
+    try:
+        import librosa
+        from image_analysis import compute_mel_db
+    except ImportError as exc:
+        logger.warning(f"[cosine-success] Cannot load reference mels: {exc}")
+        return {}
+
+    _SR = 22050
+    _HOP = 512
+    _MAX_ONSET_SAMPLES = _SR
+
+    def _norm01(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y):
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    ref_mels: Dict[int, list] = {}
+    for fret, pitch in fret_to_pitch.items():
+        wavs = sorted(ref_dir.glob(f"GB_NH*pitches{pitch}*.wav"))
+        mels = []
+        for wav in wavs:
+            try:
+                y, _ = librosa.load(str(wav), sr=_SR, mono=True)
+                y = _onset_align(y)
+                if len(y) >= int(0.5 * _SR):
+                    mels.append(_norm01(compute_mel_db(y, sr=_SR)))
+            except Exception as exc:
+                logger.warning(f"[cosine-success] Skipped ref {wav.name}: {exc}")
+        ref_mels[fret] = mels
+        logger.info(f"[cosine-success] Fret {fret} (pitch {pitch}): {len(mels)} reference spectrograms loaded")
+    return ref_mels
+
+
+def _cosine_sim_for_audio(audio: np.ndarray, fret: int, ref_mels: Dict[int, list],
+                           device_sr: int = 44100) -> float:
+    """Compute best cosine similarity between one audio capture and reference mels for a fret."""
+    try:
+        import librosa
+        from image_analysis import compute_mel_db, compute_similarity_metrics
+    except ImportError:
+        return 0.0
+
+    _SR = 22050
+    _HOP = 512
+    _MAX_ONSET_SAMPLES = _SR
+
+    def _norm01(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y):
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    refs = ref_mels.get(fret, [])
+    if not refs:
+        return 0.0
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+    y = _onset_align(y)
+    if len(y) < int(0.5 * _SR):
+        return 0.0
+
+    mel_rl = _norm01(compute_mel_db(y, sr=_SR))
+    best_cos = 0.0
+    for mel_ref in refs:
+        t = min(mel_rl.shape[1], mel_ref.shape[1])
+        m = compute_similarity_metrics(mel_rl[:, :t], mel_ref[:, :t])
+        if m['cosine_sim'] > best_cos:
+            best_cos = m['cosine_sim']
+    return float(np.clip(best_cos, 0.0, 1.0))
+
+
+def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
+                    ref_mels: Optional[Dict[int, list]] = None, device_sr: int = 44100):
     """
     Evaluate trained policy.
 
@@ -70,7 +160,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             'torques': [],
             'rewards': [],
             'harmonic_probs': [],
-            'step_successes': [],   # 1.0 per robot step where harmonic_prob > 0.8
+            'cosine_sims': [],      # populated only in --cosine-success mode
+            'step_successes': [],   # 1.0 per robot step where success criterion is met
             'audios': [],           # raw numpy float32 captures at device_sr (for image analysis)
         }
 
@@ -100,13 +191,21 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             if info['classification'] is not None:
                 harmonic_prob = info['classification']['harmonic_prob']
                 trajectory['harmonic_probs'].append(harmonic_prob)
-                trajectory['step_successes'].append(float(harmonic_prob > 0.8))
             else:
-                trajectory['step_successes'].append(0.0)
+                harmonic_prob = 0.0
 
             # Store raw audio for post-hoc image analysis
             step_audio = getattr(env, 'last_audio', None)
             trajectory['audios'].append(step_audio.copy() if step_audio is not None else None)
+
+            if ref_mels is not None:
+                fret = info.get('target_fret', trajectory['target_fret'])
+                cos_sim = _cosine_sim_for_audio(step_audio, fret, ref_mels, device_sr) \
+                    if step_audio is not None else 0.0
+                trajectory['cosine_sims'].append(cos_sim)
+                trajectory['step_successes'].append(float(cos_sim >= COSINE_SIM_SUCCESS_THRESHOLD))
+            else:
+                trajectory['step_successes'].append(float(harmonic_prob > 0.8))
 
             if render:
                 env.render()
@@ -115,10 +214,15 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
         final_classification = last_info['classification']
         if final_classification is not None:
             final_harmonic_prob = final_classification['harmonic_prob']
-            episode_succeeded = final_harmonic_prob > 0.8   # ended on a harmonic
         else:
             final_harmonic_prob = 0.0
-            episode_succeeded = False
+
+        if ref_mels is not None:
+            # Cosine-success mode: episode succeeds if the final step met the cosine threshold
+            episode_succeeded = bool(trajectory['cosine_sims'] and
+                                     trajectory['cosine_sims'][-1] >= COSINE_SIM_SUCCESS_THRESHOLD)
+        else:
+            episode_succeeded = final_harmonic_prob > 0.8
 
         # Step-level: fraction of robot steps that were harmonics this episode
         step_succs = trajectory['step_successes']
@@ -598,6 +702,11 @@ def main():
     parser.add_argument('--neg-ctrl-dir', type=str, default=None, metavar='DIR',
                         help='Dead-note WAVs directory for negative control in image analysis')
 
+    parser.add_argument('--cosine-success', action='store_true', default=False,
+                        help='Use cosine similarity >= 0.85 (vs reference WAVs in --ref-dir) as '
+                             'the success criterion instead of the CNN classifier harmonic '
+                             'probability. Requires --ref-dir. Applied per-step and per-episode.')
+
     parser.add_argument('--no-filtration', action='store_true', default=False,
                         help='Disable the physics filtration gate (Layer 1) so that every action '
                              'is sent to the robot regardless of torque/fret range.  Useful when '
@@ -651,6 +760,22 @@ def main():
         reward_mode=reward_mode,
     )
 
+    # Pre-load reference mels for cosine-success mode
+    ref_mels_for_eval: Optional[Dict[int, list]] = None
+    if args.cosine_success:
+        ref_dir_path = Path(args.ref_dir)
+        if not ref_dir_path.exists():
+            logger.error(f"--cosine-success requires --ref-dir, but {ref_dir_path} does not exist.")
+            sys.exit(1)
+        ref_mels_for_eval = _load_ref_mels(ref_dir_path, _D_STRING_FRET_TO_PITCH)
+        if not any(ref_mels_for_eval.values()):
+            logger.error("No reference spectrograms loaded — cannot use --cosine-success.")
+            sys.exit(1)
+        logger.info("[cosine-success] Success criterion: cosine_sim >= "
+                    f"{COSINE_SIM_SUCCESS_THRESHOLD} (vs reference WAVs)")
+
+    device_sr: int = getattr(getattr(env, 'reward_calc', None), 'device_sr', 44100)
+
     # Evaluate
     logger.info(f"Evaluating for {args.episodes} episodes "
                 f"(strings={string_indices}, fret={args.target_fret or 'random'})...")
@@ -659,6 +784,8 @@ def main():
         env,
         n_episodes=args.episodes,
         deterministic=args.deterministic,
+        ref_mels=ref_mels_for_eval,
+        device_sr=device_sr,
     )
 
     # Print summary
@@ -698,7 +825,6 @@ def main():
 
     _save_json()
 
-    device_sr: int = getattr(getattr(env, 'reward_calc', None), 'device_sr', 44100)
     env.close()
     success_recorder.close()  # drain queue — ensures all WAVs are written before image analysis
 
