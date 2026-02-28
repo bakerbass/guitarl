@@ -1,0 +1,158 @@
+INFO:__main__:[cosine-success] Fret 4 (pitch 78): 21 reference spectrograms loaded
+INFO:__main__:[cosine-success] Fret 5 (pitch 74): 11 reference spectrograms loaded
+INFO:__main__:[cosine-success] Fret 7 (pitch 69): 11 reference spectrograms loaded
+INFO:__main__:[cosine-success] Success criterion: cosine_sim >= 0.85 (vs reference WAVs)
+INFO:__main__:Evaluating for 20 episodes (strings=[2], fret=7)...
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.98, torque=211
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.98 torque=211
+    class=harmonic  H=0.862  D=0.000  G=0.138
+    reward=+0.358  (audio=+0.862  fret=+0.998  torque=-0.655)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.862
+INFO:__main__:  Step 1: pos=186.5  torque=211  cos_sim=0.6728  h_prob=0.862  fail
+INFO:__main__:Episode 1/20: Fret=7, String=2, Reward=1.358, Episode success=False, Step success=0.0% (0/1 steps), cos_sim final=0.6728  mean=0.6728, H-prob=0.862, Robot steps=1/1 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.96, torque=250
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.96 torque=250
+    class=general_note  H=0.359  D=0.000  G=0.641
+    reward=+0.049  (audio=+0.359  fret=+0.994  torque=-0.889)
+INFO:__main__:  Step 1: pos=186.1  torque=250  cos_sim=0.6984  h_prob=0.359  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.02, torque=217
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=7.02 torque=217
+    class=general_note  H=0.101  D=0.000  G=0.899
+    reward=-0.003  (audio=+0.101  fret=+0.999  torque=-0.710)
+INFO:__main__:  Step 2: pos=187.4  torque=217  cos_sim=0.6812  h_prob=0.101  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.22, torque=37
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.22 torque=37
+    class=general_note  H=0.000  D=0.000  G=1.000
+    reward=+0.451  (audio=+0.000  fret=+0.821  torque=+0.820)
+INFO:__main__:  Step 3: pos=192.3  torque=37  cos_sim=0.7480  h_prob=0.000  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.23, torque=63
+INFO:env.harmonic_env:
+  Step 4/10 | str=2 target=7 fret=7.23 torque=63
+    class=harmonic  H=0.939  D=0.000  G=0.061
+    reward=+0.932  (audio=+0.939  fret=+0.812  torque=+0.992)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.939
+INFO:__main__:  Step 4: pos=192.4  torque=63  cos_sim=0.6783  h_prob=0.939  fail
+INFO:__main__:Episode 2/20: Fret=7, String=2, Reward=2.429, Episode success=False, Step success=0.0% (0/4 steps), cos_sim final=0.6783  mean=0.7015, H-prob=0.939, Robot steps=4/4 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.94, torque=230
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.94 torque=230
+    class=general_note  H=0.050  D=0.000  G=0.950
+    reward=-0.057  (audio=+0.050  fret=+0.987  torque=-0.792)
+INFO:__main__:  Step 1: pos=185.7  torque=230  cos_sim=0.7097  h_prob=0.050  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.19, torque=215
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=7.19 torque=215
+    class=general_note  H=0.011  D=0.000  G=0.989
+    reward=-0.067  (audio=+0.011  fret=+0.857  torque=-0.694)
+INFO:__main__:  Step 2: pos=191.7  torque=215  cos_sim=0.6810  h_prob=0.011  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.19, torque=43
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.19 torque=43
+    class=general_note  H=0.094  D=0.000  G=0.906
+    reward=+0.520  (audio=+0.094  fret=+0.861  torque=+0.874)
+INFO:__main__:  Step 3: pos=191.6  torque=43  cos_sim=0.7418  h_prob=0.094  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.28, torque=63
+INFO:env.harmonic_env:
+  Step 4/10 | str=2 target=7 fret=7.28 torque=63
+    class=harmonic  H=0.931  D=0.000  G=0.069
+    reward=+0.910  (audio=+0.931  fret=+0.723  torque=+0.992)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.931
+INFO:__main__:  Step 4: pos=193.8  torque=63  cos_sim=0.6856  h_prob=0.931  fail
+INFO:__main__:Episode 3/20: Fret=7, String=2, Reward=2.307, Episode success=False, Step success=0.0% (0/4 steps), cos_sim final=0.6856  mean=0.7045, H-prob=0.931, Robot steps=4/4 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.01, torque=229
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=7.01 torque=229
+    class=general_note  H=0.001  D=0.000  G=0.999
+    reward=-0.075  (audio=+0.001  fret=+1.000  torque=-0.786)
+INFO:__main__:  Step 1: pos=187.3  torque=229  cos_sim=0.7106  h_prob=0.001  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.91, torque=203
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=6.91 torque=203
+    class=general_note  H=0.306  D=0.000  G=0.694
+    reward=+0.127  (audio=+0.306  fret=+0.968  torque=-0.585)
+INFO:__main__:  Step 2: pos=184.9  torque=203  cos_sim=0.6655  h_prob=0.306  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.18, torque=97
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.18 torque=97
+    class=general_note  H=0.020  D=0.000  G=0.980
+    reward=+0.490  (audio=+0.020  fret=+0.870  torque=+0.875)
+INFO:__main__:  Step 3: pos=191.4  torque=97  cos_sim=0.7460  h_prob=0.020  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.24, torque=85
+INFO:env.harmonic_env:
+  Step 4/10 | str=2 target=7 fret=7.24 torque=85
+    class=harmonic  H=0.977  D=0.000  G=0.023
+    reward=+0.934  (audio=+0.977  fret=+0.798  torque=+0.958)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.977
+INFO:__main__:  Step 4: pos=192.6  torque=85  cos_sim=0.6622  h_prob=0.977  fail
+INFO:__main__:Episode 4/20: Fret=7, String=2, Reward=2.476, Episode success=False, Step success=0.0% (0/4 steps), cos_sim final=0.6622  mean=0.6961, H-prob=0.977, Robot steps=4/4 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.86, torque=221
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.86 torque=221
+    class=general_note  H=0.000  D=0.000  G=1.000
+    reward=-0.072  (audio=+0.000  fret=+0.924  torque=-0.735)
+INFO:__main__:  Step 1: pos=183.8  torque=221  cos_sim=0.7075  h_prob=0.000  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.09, torque=202
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=7.09 torque=202
+    class=general_note  H=0.050  D=0.000  G=0.950
+    reward=+0.013  (audio=+0.050  fret=+0.964  torque=-0.578)
+INFO:__main__:  Step 2: pos=189.3  torque=202  cos_sim=0.6615  h_prob=0.050  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.20, torque=68
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.20 torque=68
+    class=harmonic  H=0.978  D=0.000  G=0.022
+    reward=+0.959  (audio=+0.978  fret=+0.845  torque=+0.999)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.978
+INFO:__main__:  Step 3: pos=191.9  torque=68  cos_sim=0.7437  h_prob=0.978  fail
+INFO:__main__:Episode 5/20: Fret=7, String=2, Reward=1.899, Episode success=False, Step success=0.0% (0/3 steps), cos_sim final=0.7437  mean=0.7042, H-prob=0.978, Robot steps=3/3 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.80, torque=233
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.80 torque=233
+    class=general_note  H=0.186  D=0.000  G=0.814
+    reward=-0.030  (audio=+0.186  fret=+0.852  torque=-0.811)
+INFO:__main__:  Step 1: pos=182.4  torque=233  cos_sim=0.6765  h_prob=0.186  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.10, torque=190
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=7.10 torque=190
+    class=general_note  H=0.164  D=0.000  G=0.836
+    reward=+0.110  (audio=+0.164  fret=+0.959  torque=-0.445)
+INFO:__main__:  Step 2: pos=189.4  torque=190  cos_sim=0.7298  h_prob=0.164  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.21, torque=34
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.21 torque=34
+    class=general_note  H=0.000  D=0.000  G=1.000
+    reward=+0.442  (audio=+0.000  fret=+0.836  torque=+0.785)
+INFO:__main__:  Step 3: pos=192.0  torque=34  cos_sim=0.6317  h_prob=0.000  fail
+WARNING:utils.audio_reward:wait_for_silence: timed out after 8.0s (threshold=0.0050, hold=0.50s)
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.29, torque=73
+INFO:env.harmonic_env:
+  Step 4/10 | str=2 target=7 fret=7.29 torque=73
+    class=harmonic  H=0.929  D=0.000  G=0.071
+    reward=+0.910  (audio=+0.929  fret=+0.715  torque=+0.999)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.929
+INFO:__main__:  Step 4: pos=193.9  torque=73  cos_sim=0.7573  h_prob=0.929  fail
+INFO:__main__:Episode 6/20: Fret=7, String=2, Reward=2.432, Episode success=False, Step success=0.0% (0/4 steps), cos_sim final=0.7573  mean=0.6988, H-prob=0.929, Robot steps=4/4 attempts
+INFO:env.osc_client:Sent /RLFret: string=2, fret=6.90, torque=228
+INFO:env.harmonic_env:
+  Step 1/10 | str=2 target=7 fret=6.90 torque=228
+    class=general_note  H=0.004  D=0.000  G=0.996
+    reward=-0.081  (audio=+0.004  fret=+0.957  torque=-0.784)
+INFO:__main__:  Step 1: pos=184.6  torque=228  cos_sim=0.6531  h_prob=0.004  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.11, torque=179
+INFO:env.harmonic_env:
+  Step 2/10 | str=2 target=7 fret=7.11 torque=179
+    class=general_note  H=0.003  D=0.000  G=0.997
+    reward=+0.083  (audio=+0.003  fret=+0.949  torque=-0.309)
+INFO:__main__:  Step 2: pos=189.7  torque=179  cos_sim=0.7330  h_prob=0.003  fail
+INFO:env.osc_client:Sent /RLFret: string=2, fret=7.16, torque=49
+INFO:env.harmonic_env:
+  Step 3/10 | str=2 target=7 fret=7.16 torque=49
+    class=harmonic  H=0.996  D=0.000  G=0.004
+    reward=+0.952  (audio=+0.996  fret=+0.906  torque=+0.923)
+INFO:env.harmonic_env:Success! Harmonic prob: 0.996
+INFO:__main__:  Step 3: pos=190.7  torque=49  cos_sim=0.6520  h_prob=0.996  fail
+INFO:__main__:Episode 7/20: Fret=7, String=2, Reward=1.954, Episode success=False, Step success=0.0% (0/3 steps), cos_sim f
