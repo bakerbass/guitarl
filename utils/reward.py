@@ -78,7 +78,7 @@ REWARD_MODE_COSINE_SIM    = 'cosine_sim'     # Layer 1 + onset-aligned mel cosin
 #   At 0.79: ≈ -0.15  (not too bad)
 #   At 0.50: ≈ -3.0   (pretty far negative)
 #   At 0.00: ≈ -4.55  (saturates near -5)
-COSINE_SIM_SUCCESS_THRESHOLD = 0.8
+COSINE_SIM_SUCCESS_THRESHOLD = 0.85
 COSINE_SIM_SUCCESS_REWARD    = 5.0
 COSINE_SIM_FLOOR             = -5.0   # minimum (asymptotic) reward
 COSINE_SIM_DECAY_K           = 3.0    # controls how fast reward drops below threshold
