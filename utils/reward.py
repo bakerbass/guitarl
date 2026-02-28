@@ -44,7 +44,7 @@ TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string o
 FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
-FILTRATION_PENALTY = -1.0   # Flat penalty when filtration rejects an action
+FILTRATION_PENALTY = -10.0   # Flat penalty when filtration rejects an action
 
 # ── Layer 2 weights (audio layer) ─────────────────────────────────────
 REWARD_WEIGHT_AUDIO  = 0.45  # Classifier is the primary signal

@@ -241,6 +241,7 @@ class HarmonicEnv(gym.Env):
         
         # Episode state
         self.current_step = 0
+        self._step_attempts = 0   # total step() calls this episode (filtered + unfiltered)
         self.target_fret = None
         self.current_fret = 0.0
         self.current_torque = 0.0
@@ -349,6 +350,7 @@ class HarmonicEnv(gym.Env):
         
         # Reset episode state
         self.current_step = 0
+        self._step_attempts = 0   # total step() calls this episode (filtered + unfiltered)
         self.current_fret = 0.0
         self.current_torque = 0.0
         self.fret_history = []
@@ -556,6 +558,7 @@ class HarmonicEnv(gym.Env):
         # Filtered steps are instant no-ops and should not consume the episode budget.
         if not reward_info.get('filtered', False):
             self.current_step += 1
+        self._step_attempts += 1
         
         # Check termination conditions
         terminated = False
@@ -595,9 +598,24 @@ class HarmonicEnv(gym.Env):
                         },
                     )
         
-        # Max steps truncation
+        # Max steps truncation (robot steps only)
         if self.current_step >= self.max_steps:
             truncated = True
+
+        # Safety cap: if the policy generates nothing but filtered actions the episode
+        # would loop forever because current_step never advances.  Force-truncate after
+        # max_steps * 200 total attempts so training/eval can always make progress.
+        # (At a 99.7% filter rate, 10 real steps need ~3333 attempts, well below 2000.
+        # This only fires when virtually every action is out of range.)
+        _max_attempts = self.max_steps * 200
+        if not truncated and not terminated and self._step_attempts >= _max_attempts:
+            truncated = True
+            logger.warning(
+                f"Episode {self.episode_count}: force-truncated after {self._step_attempts} "
+                f"attempts with only {self.current_step}/{self.max_steps} real robot steps "
+                f"(filter rate {100*(1 - self.current_step/max(self._step_attempts,1)):.1f}%). "
+                f"Policy may be stuck outside the filtration window."
+            )
         
         # Get next observation
         obs = self._get_observation()
