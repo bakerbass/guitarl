@@ -1,6 +1,6 @@
 __pycache__/*
 /utils/__pycache__/*
 runs/*
-eval_results/*
+*.wav
 *.zip
 *.pyc

@@ -71,6 +71,7 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             'rewards': [],
             'harmonic_probs': [],
             'step_successes': [],   # 1.0 per robot step where harmonic_prob > 0.8
+            'audios': [],           # raw numpy float32 captures at device_sr (for image analysis)
         }
 
         last_info = info
@@ -102,6 +103,10 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
                 trajectory['step_successes'].append(float(harmonic_prob > 0.8))
             else:
                 trajectory['step_successes'].append(0.0)
+
+            # Store raw audio for post-hoc image analysis
+            step_audio = getattr(env, 'last_audio', None)
+            trajectory['audios'].append(step_audio.copy() if step_audio is not None else None)
 
             if render:
                 env.render()
@@ -368,6 +373,136 @@ def _get_success_wavs_for_fret(successes_dir: Path, target_fret: int) -> List[Pa
     return sorted(wavs)
 
 
+def run_step_image_analysis(
+    trajectories: List[Dict],
+    ref_dir: Path,
+    fret_to_pitch: Dict[int, int],
+    device_sr: int = 44100,
+) -> Dict:
+    """Compute cosine similarity and MSE between every captured robot-step audio and
+    the matching reference WAVs.  Operates fully in-memory — no disk writes needed.
+
+    Uses the same onset-alignment and mel-spectrogram parameters as image_analysis.py
+    so results are directly comparable to batch_compare() output.
+
+    Returns a summary dict (also printed to stdout).
+    """
+    from image_analysis import compute_mel_db, compute_similarity_metrics
+    import librosa
+
+    _SR     = 22050   # image_analysis.SR
+    _HOP    = 512     # image_analysis.HOP_LENGTH
+    _MAX_ONSET_SAMPLES = _SR   # MAX_ONSET_SEC = 1 second
+
+    def _norm01(arr: np.ndarray) -> np.ndarray:
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y: np.ndarray) -> np.ndarray:
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    # ── Pre-load reference mel spectrograms per fret ─────────────────
+    ref_mels: Dict[int, List[np.ndarray]] = {}
+    for fret, pitch in fret_to_pitch.items():
+        wavs = sorted(ref_dir.glob(f"GB_NH*pitches{pitch}*.wav"))
+        mels = []
+        for wav in wavs:
+            try:
+                y, _ = librosa.load(str(wav), sr=_SR, mono=True)
+                y = _onset_align(y)
+                if len(y) >= int(0.5 * _SR):
+                    mels.append(_norm01(compute_mel_db(y, sr=_SR)))
+            except Exception as exc:
+                logger.warning(f"[image-analysis] Skipped ref {wav.name}: {exc}")
+        ref_mels[fret] = mels
+        logger.info(
+            f"[image-analysis] Fret {fret} (pitch {pitch}): {len(mels)} reference spectrograms"
+        )
+
+    # ── Score every recorded robot step ──────────────────────────────
+    step_metrics: List[Dict] = []
+    for traj in trajectories:
+        fret = traj['target_fret']
+        refs = ref_mels.get(fret, [])
+        for audio in traj.get('audios', []):
+            if audio is None:
+                continue
+            # Resample → onset-align → mel
+            y = librosa.resample(
+                audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR
+            ) if device_sr != _SR else audio.astype(np.float32)
+            y = _onset_align(y)
+            if len(y) < int(0.5 * _SR):
+                step_metrics.append({'fret': fret, 'cosine_sim': 0.0, 'mse': 1.0})
+                continue
+            if not refs:
+                step_metrics.append({'fret': fret, 'cosine_sim': 0.0, 'mse': 1.0})
+                continue
+            mel_rl = _norm01(compute_mel_db(y, sr=_SR))
+            best_cos, best_mse = -1.0, 1.0
+            for mel_ref in refs:
+                t = min(mel_rl.shape[1], mel_ref.shape[1])
+                m = compute_similarity_metrics(mel_rl[:, :t], mel_ref[:, :t])
+                if m['cosine_sim'] > best_cos:
+                    best_cos, best_mse = m['cosine_sim'], m['mse']
+            step_metrics.append({
+                'fret': fret,
+                'cosine_sim': float(np.clip(best_cos, 0.0, 1.0)),
+                'mse': float(best_mse),
+            })
+
+    if not step_metrics:
+        logger.warning('[image-analysis] No audio captured — nothing to analyze.')
+        return {}
+
+    cos_all = np.array([m['cosine_sim'] for m in step_metrics])
+    mse_all = np.array([m['mse']        for m in step_metrics])
+
+    per_fret: Dict[int, Dict] = {}
+    for fret in sorted({m['fret'] for m in step_metrics}):
+        fc = np.array([m['cosine_sim'] for m in step_metrics if m['fret'] == fret])
+        fm = np.array([m['mse']        for m in step_metrics if m['fret'] == fret])
+        per_fret[fret] = {
+            'n':              int(len(fc)),
+            'mean_cosine_sim': float(fc.mean()),
+            'std_cosine_sim':  float(fc.std(ddof=1) if len(fc) > 1 else 0.0),
+            'mean_mse':        float(fm.mean()),
+            'std_mse':         float(fm.std(ddof=1) if len(fm) > 1 else 0.0),
+        }
+
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print("IMAGE ANALYSIS  (every robot step vs reference WAVs)")
+    print(sep)
+    print(f"  Total steps:  {len(step_metrics)}")
+    print(f"  Cosine sim:   {cos_all.mean():.4f} \u00b1 {cos_all.std(ddof=1):.4f}  "
+          f"(min {cos_all.min():.4f}  max {cos_all.max():.4f})")
+    print(f"  MSE:          {mse_all.mean():.4f} \u00b1 {mse_all.std(ddof=1):.4f}  "
+          f"(min {mse_all.min():.4f}  max {mse_all.max():.4f})")
+    if per_fret:
+        print(f"\n  {'Fret':>5}  {'N':>5}  {'CosSim':>8}  {'±':>7}  {'MSE':>8}  {'±':>7}")
+        for fret, d in sorted(per_fret.items()):
+            print(f"  {fret:>5}  {d['n']:>5}  {d['mean_cosine_sim']:>8.4f}  "
+                  f"{d['std_cosine_sim']:>7.4f}  {d['mean_mse']:>8.4f}  {d['std_mse']:>7.4f}")
+    print(sep + "\n")
+
+    return {
+        'mean_cosine_sim': float(cos_all.mean()),
+        'std_cosine_sim':  float(cos_all.std(ddof=1)),
+        'mean_mse':        float(mse_all.mean()),
+        'std_mse':         float(mse_all.std(ddof=1)),
+        'n_steps':         len(step_metrics),
+        'per_fret':        {str(k): v for k, v in per_fret.items()},
+        'step_metrics':    step_metrics,
+    }
+
+
 def run_image_analysis(
     results: Dict,
     output_dir: Path,
@@ -551,23 +686,43 @@ def main():
                 return bool(obj)
             return super().default(obj)
 
-    try:
-        json_results = {k: v for k, v in results.items() if k != 'trajectories'}
-        with open(results_path, 'w') as f:
-            json.dump(json_results, f, indent=2, cls=_NumpyEncoder)
-        logger.info(f"Results saved to {results_path}")
-    except Exception as exc:
-        logger.error(f"Failed to save results JSON: {exc}")
+    json_results = {k: v for k, v in results.items() if k != 'trajectories'}
 
+    def _save_json():
+        try:
+            with open(results_path, 'w') as f:
+                json.dump(json_results, f, indent=2, cls=_NumpyEncoder)
+            logger.info(f"Results saved to {results_path}")
+        except Exception as exc:
+            logger.error(f"Failed to save results JSON: {exc}")
+
+    _save_json()
+
+    device_sr: int = getattr(getattr(env, 'reward_calc', None), 'device_sr', 44100)
     env.close()
     success_recorder.close()  # drain queue — ensures all WAVs are written before image analysis
 
-    # Image analysis: compare success WAVs against dataset reference harmonics
+    # Image analysis
     if args.image_analysis:
+        ref_dir_path = Path(args.ref_dir)
+
+        # ── 1. Per-step inline metrics (cosine sim + MSE for every robot step) ──
+        img_stats = run_step_image_analysis(
+            trajectories=results['trajectories'],
+            ref_dir=ref_dir_path,
+            fret_to_pitch=_D_STRING_FRET_TO_PITCH,
+            device_sr=device_sr,
+        )
+        if img_stats:
+            results['image_analysis'] = img_stats
+            json_results['image_analysis'] = img_stats
+            _save_json()
+
+        # ── 2. Visual batch comparison against success WAVs (plots + stats table) ──
         run_image_analysis(
             results=results,
             output_dir=output_dir,
-            ref_dir=Path(args.ref_dir),
+            ref_dir=ref_dir_path,
             top_n=args.top_n,
             rank_by=args.rank_by,
             baseline=args.baseline,
