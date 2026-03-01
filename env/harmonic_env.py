@@ -42,7 +42,8 @@ if str(_parent_dir) not in sys.path:
 from utils.audio_reward import HarmonicRewardCalculator
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
-    REWARD_MODE_COSINE_SIM,
+    REWARD_MODE_COSINE_SIM, REWARD_MODE_SPECTRAL,
+    SPECTRAL_SUCCESS_THRESHOLD,
     compute_reward_no_audio as _compute_reward_no_audio,
     compute_filtration,
     FILTRATION_PENALTY,
@@ -172,7 +173,11 @@ class HarmonicEnv(gym.Env):
         # Active string for the current episode (set at reset)
         self.string_index = self.string_indices[0]
         self.max_steps = max_steps
-        self.success_threshold = success_threshold
+        # Use spectral-specific threshold unless caller explicitly overrode it
+        if reward_mode == REWARD_MODE_SPECTRAL and success_threshold == 0.8:
+            self.success_threshold = SPECTRAL_SUCCESS_THRESHOLD
+        else:
+            self.success_threshold = success_threshold
         self.curriculum_mode = curriculum_mode
         if fixed_target_fret not in self.HARMONIC_FRETS:
             raise ValueError(
@@ -196,10 +201,10 @@ class HarmonicEnv(gym.Env):
                 "Reward = filtration layer only (fret + torque shaping)."
             )
         else:
-            if model_path is None and reward_mode != REWARD_MODE_COSINE_SIM:
+            if model_path is None and reward_mode not in (REWARD_MODE_COSINE_SIM, REWARD_MODE_SPECTRAL):
                 raise ValueError(
                     "model_path is required when offline=False "
-                    "(omit it only when reward_mode='cosine_sim')"
+                    "(omit it only when reward_mode='cosine_sim' or 'spectral')"
                 )
             # Initialize OSC client
             self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)

@@ -899,11 +899,13 @@ def main():
                              'Default: ON (robot resets on exit).')    
     # Reward / ablation
     parser.add_argument('--reward-mode', type=str, default='full',
-                        choices=['full', 'no_filtration', 'no_audio'],
+                        choices=['full', 'no_filtration', 'no_audio', 'spectral'],
                         help='Reward function variant for ablation studies. '
                              '"full" (default): two-layer reward (filtration + CNN). '
                              '"no_filtration": skip physics gate, all actions reach the CNN. '
-                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights).')    
+                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights). '
+                             '"spectral": filtration + direct spectral content analysis (harmonic energy ratio). '
+                             'No CNN model required.')    
     # Device
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
@@ -972,8 +974,9 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     # Validate model path
-    # Not required for offline pre-training or fine-tune (cosine_sim) mode.
-    if args.pretrain or args.fine_tune:
+    # Not required for offline pre-training, fine-tune (cosine_sim), or spectral mode.
+    _no_cnn_modes = ('spectral',)
+    if args.pretrain or args.fine_tune or args.reward_mode in _no_cnn_modes:
         if args.model_path is not None and not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")
             sys.exit(1)
@@ -981,7 +984,8 @@ def main():
         if args.model_path is None:
             logger.error("--model-path is required for online training. "
                          "Use --pretrain to run without a robot/audio setup, "
-                         "or --fine-tune to use cosine similarity instead of the CNN.")
+                         "--fine-tune to use cosine similarity, "
+                         "or --reward-mode spectral for direct spectral analysis.")
             sys.exit(1)
         if not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")

@@ -18,7 +18,14 @@ import sys
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
-from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, COSINE_SIM_SUCCESS_THRESHOLD
+from utils.reward import (
+    REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION,
+    COSINE_SIM_SUCCESS_THRESHOLD, SPECTRAL_SUCCESS_THRESHOLD,
+    D_STRING_OPEN_FREQ, FRET_TO_HARMONIC_NUMBER,
+    SPECTRAL_BANDWIDTH_RATIO, SPECTRAL_HER_WEIGHT,
+    SPECTRAL_FUND_SUPPRESS_WEIGHT, SPECTRAL_SIGNAL_WEIGHT,
+    SPECTRAL_NOISE_FLOOR_HZ,
+)
 
 # D-string (string_index=2) fret → MIDI note number mapping.
 # Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
@@ -26,6 +33,7 @@ from utils.reward import REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, COSINE_SIM
 #   Harmonic #2 (5th fret)  → MNN 74
 #   Harmonic #3 (7th fret)  → MNN 69
 _D_STRING_FRET_TO_PITCH: Dict[int, int] = {4: 78, 5: 74, 7: 69}
+_D_STRING_OPEN_MIDI: int = 50  # D3, open D string (~146.83 Hz)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -121,8 +129,111 @@ def _cosine_sim_for_audio(audio: np.ndarray, fret: int, ref_mels: Dict[int, list
     return float(np.clip(best_cos, 0.0, 1.0))
 
 
+def _detect_pitch_hz(audio: np.ndarray, device_sr: int = 44100) -> Optional[float]:
+    """Return median F0 (Hz) from voiced frames after onset alignment, or None if undetected."""
+    try:
+        import librosa
+    except ImportError:
+        return None
+
+    _SR = 22050
+    _HOP = 512
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+
+    frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+    onset = 0
+    if len(frames):
+        cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+        if cand <= _SR:  # ignore onsets > 1 s
+            onset = cand
+    y = y[onset:]
+
+    if len(y) < int(0.5 * _SR):
+        return None
+
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=float(librosa.note_to_hz('A1')),   # ~55 Hz — below open D3
+        fmax=float(librosa.note_to_hz('C6')),    # ~1047 Hz — above fret-4 harmonic
+        sr=_SR,
+        hop_length=_HOP,
+    )
+    voiced_f0 = f0[voiced_flag]
+    if len(voiced_f0) == 0:
+        return None
+    return float(np.median(voiced_f0))
+
+
+def _spectral_score_for_audio(audio: np.ndarray, fret: int,
+                               device_sr: int = 44100) -> float:
+    """Compute spectral score (HER) for one audio capture at the given target fret."""
+    try:
+        import librosa
+        from scipy.signal import welch as scipy_welch
+    except ImportError:
+        return 0.0
+
+    _SR = 22050
+    _HOP = 512
+
+    harmonic_n = FRET_TO_HARMONIC_NUMBER.get(fret)
+    if harmonic_n is None:
+        return 0.0
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+
+    # Onset-align
+    frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+    onset = 0
+    if len(frames):
+        cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+        if cand <= _SR:
+            onset = cand
+    y = y[onset:]
+
+    # Skip transient (300 ms), take up to 2 s of steady-state
+    skip = int(0.3 * _SR)
+    window = int(2.0 * _SR)
+    y = y[skip: skip + window]
+    if len(y) < int(0.25 * _SR):
+        return 0.0
+
+    nperseg = min(4096, len(y))
+    freqs, psd = scipy_welch(y, fs=_SR, nperseg=nperseg, noverlap=nperseg // 2)
+
+    f0 = D_STRING_OPEN_FREQ
+    harmonic_fund = harmonic_n * f0
+    bw = SPECTRAL_BANDWIDTH_RATIO
+
+    desired_energy = 0.0
+    partial = harmonic_fund
+    while partial < _SR / 2:
+        lo, hi = partial * (1 - bw), partial * (1 + bw)
+        mask = (freqs >= lo) & (freqs <= hi)
+        desired_energy += float(psd[mask].sum())
+        partial += harmonic_fund
+
+    f0_lo, f0_hi = f0 * (1 - bw), f0 * (1 + bw)
+    f0_energy = float(psd[(freqs >= f0_lo) & (freqs <= f0_hi)].sum())
+
+    total_energy = float(psd[freqs >= SPECTRAL_NOISE_FLOOR_HZ].sum()) + 1e-12
+
+    her = desired_energy / total_energy
+    fund_suppression = 1.0 - float(np.clip((f0_energy / total_energy) * 5.0, 0.0, 1.0))
+    signal_presence = float(np.clip(total_energy / 1e-4, 0.0, 1.0))
+
+    score = (SPECTRAL_HER_WEIGHT * her
+             + SPECTRAL_FUND_SUPPRESS_WEIGHT * fund_suppression
+             + SPECTRAL_SIGNAL_WEIGHT * signal_presence)
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
-                    ref_mels: Optional[Dict[int, list]] = None, device_sr: int = 44100):
+                    ref_mels: Optional[Dict[int, list]] = None, device_sr: int = 44100,
+                    spectral_success: bool = False):
     """
     Evaluate trained policy.
 
@@ -144,6 +255,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
     episode_string_indices = []
     episode_fret_positions = []
     episode_torques = []
+    episode_pitch_accuracies = []   # fraction of steps with pitch within ±50 cents of target
+    episode_open_string_rates = []  # fraction of steps where open string pitch detected
 
     all_trajectories = []
 
@@ -161,8 +274,12 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
             'rewards': [],
             'harmonic_probs': [],
             'cosine_sims': [],      # populated only in --cosine-success mode
+            'spectral_scores': [],  # populated only in --spectral-success mode
             'step_successes': [],   # 1.0 per robot step where success criterion is met
             'audios': [],           # raw numpy float32 captures at device_sr (for image analysis)
+            'detected_pitches': [], # median F0 in Hz (or None) per robot step
+            'pitch_corrects': [],   # 1.0 if within ±50 cents of target pitch
+            'open_string_flags': [],# 1.0 if within ±100 cents of open D string (~147 Hz)
         }
 
         last_info = info
@@ -202,18 +319,57 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
                 fret = info.get('target_fret', trajectory['target_fret'])
                 cos_sim = _cosine_sim_for_audio(step_audio, fret, ref_mels, device_sr) \
                     if step_audio is not None else 0.0
+
+                # Pitch detection
+                detected_hz = _detect_pitch_hz(step_audio, device_sr) \
+                    if step_audio is not None else None
+                target_midi = _D_STRING_FRET_TO_PITCH.get(fret, 69)
+                target_hz = 440.0 * 2 ** ((target_midi - 69) / 12.0)
+                open_hz = 440.0 * 2 ** ((_D_STRING_OPEN_MIDI - 69) / 12.0)
+                pitch_correct = False
+                open_string = False
+                if detected_hz is not None and detected_hz > 0:
+                    cents_from_target = abs(1200.0 * np.log2(detected_hz / target_hz))
+                    cents_from_open   = abs(1200.0 * np.log2(detected_hz / open_hz))
+                    pitch_correct = cents_from_target <= 50.0
+                    open_string   = cents_from_open   <= 100.0
+
                 trajectory['cosine_sims'].append(cos_sim)
+                trajectory['detected_pitches'].append(detected_hz)
+                trajectory['pitch_corrects'].append(float(pitch_correct))
+                trajectory['open_string_flags'].append(float(open_string))
                 step_success = cos_sim >= COSINE_SIM_SUCCESS_THRESHOLD
                 trajectory['step_successes'].append(float(step_success))
+
+                pitch_tag = (
+                    'OPEN_STRING' if open_string
+                    else ('pitch_ok' if pitch_correct else 'wrong_pitch')
+                )
+                pitch_str = f"{detected_hz:.1f}Hz" if detected_hz is not None else "---Hz"
                 logger.info(
                     f"  Step {robot_steps}: pos={info.get('slider_mm', info.get('fret_position', 0)):.1f}  "
                     f"torque={info.get('torque', 0):.0f}  "
-                    f"cos_sim={cos_sim:.4f}  "
-                    f"h_prob={harmonic_prob:.3f}  "
+                    f"cos_sim={cos_sim:.4f}  h_prob={harmonic_prob:.3f}  "
+                    f"pitch={pitch_str} [{pitch_tag}]  "
                     f"{'SUCCESS' if step_success else 'fail'}"
                 )
                 if step_success:
                     break  # terminate episode on first cosine success
+            elif spectral_success:
+                fret = info.get('target_fret', trajectory['target_fret'])
+                spec_score = _spectral_score_for_audio(step_audio, fret, device_sr) \
+                    if step_audio is not None else 0.0
+                trajectory['spectral_scores'].append(spec_score)
+                step_success = spec_score >= SPECTRAL_SUCCESS_THRESHOLD
+                trajectory['step_successes'].append(float(step_success))
+                logger.info(
+                    f"  Step {robot_steps}: pos={info.get('slider_mm', info.get('fret_position', 0)):.1f}  "
+                    f"torque={info.get('torque', 0):.0f}  "
+                    f"spectral={spec_score:.4f}  h_prob={harmonic_prob:.3f}  "
+                    f"{'SUCCESS' if step_success else 'fail'}"
+                )
+                if step_success:
+                    break  # terminate episode on first spectral success
             else:
                 trajectory['step_successes'].append(float(harmonic_prob > 0.8))
 
@@ -231,6 +387,9 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
             # Cosine-success mode: episode succeeds if the final step met the cosine threshold
             episode_succeeded = bool(trajectory['cosine_sims'] and
                                      trajectory['cosine_sims'][-1] >= COSINE_SIM_SUCCESS_THRESHOLD)
+        elif spectral_success:
+            episode_succeeded = bool(trajectory['spectral_scores'] and
+                                     trajectory['spectral_scores'][-1] >= SPECTRAL_SUCCESS_THRESHOLD)
         else:
             episode_succeeded = final_harmonic_prob > 0.8
 
@@ -252,6 +411,11 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
         episode_torques.append(np.mean(trajectory['torques']) if trajectory['torques'] else 0.0)
         episode_step_success_rates.append(ep_step_success)
 
+        ep_pitch_acc  = float(np.mean(trajectory['pitch_corrects']))   if trajectory['pitch_corrects']    else 0.0
+        ep_open_rate  = float(np.mean(trajectory['open_string_flags'])) if trajectory['open_string_flags'] else 0.0
+        episode_pitch_accuracies.append(ep_pitch_acc)
+        episode_open_string_rates.append(ep_open_rate)
+
         all_trajectories.append(trajectory)
 
         if ref_mels is not None:
@@ -265,6 +429,7 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
                 f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
                 f"cos_sim final={final_cos_sim:.4f}  mean={mean_cos_sim:.4f}, "
                 f"H-prob={final_harmonic_prob:.3f}, "
+                f"pitch_acc={ep_pitch_acc:.1%}  open_string={ep_open_rate:.1%}, "
                 f"Robot steps={robot_steps}/{total_attempts} attempts"
             )
         else:
@@ -290,6 +455,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
         'mean_harmonic_prob': float(np.mean(episode_harmonic_probs)),
         'mean_position': float(np.mean(episode_fret_positions)),
         'mean_torque': float(np.mean(episode_torques)),
+        'mean_pitch_accuracy': float(np.mean(episode_pitch_accuracies)),
+        'mean_open_string_rate': float(np.mean(episode_open_string_rates)),
         'n_episodes': n_episodes,
         'episode_rewards': episode_rewards,
         'episode_successes': episode_successes,
@@ -730,6 +897,10 @@ def main():
                         help='Use cosine similarity >= 0.85 (vs reference WAVs in --ref-dir) as '
                              'the success criterion instead of the CNN classifier harmonic '
                              'probability. Requires --ref-dir. Applied per-step and per-episode.')
+    parser.add_argument('--spectral-success', action='store_true', default=False,
+                        help='Use spectral content analysis (harmonic energy ratio) as the '
+                             'success criterion instead of CNN classifier. No reference WAVs '
+                             'needed. Applied per-step and per-episode.')
 
     parser.add_argument('--no-filtration', action='store_true', default=False,
                         help='Disable the physics filtration gate (Layer 1) so that every action '
@@ -777,7 +948,7 @@ def main():
     # In cosine-success mode the env must not self-terminate on harmonic_prob —
     # episode termination is controlled entirely by the cosine threshold break
     # in evaluate_policy. Set success_threshold=2.0 (unreachable) to disable it.
-    success_threshold = 2.0 if args.cosine_success else 0.8
+    success_threshold = 2.0 if (args.cosine_success or args.spectral_success) else 0.8
     env = HarmonicEnv(
         model_path=str(classifier_path),
         string_indices=string_indices,
@@ -803,6 +974,10 @@ def main():
         logger.info("[cosine-success] Success criterion: cosine_sim >= "
                     f"{COSINE_SIM_SUCCESS_THRESHOLD} (vs reference WAVs)")
 
+    if args.spectral_success:
+        logger.info(f"[spectral-success] Success criterion: spectral_score >= "
+                    f"{SPECTRAL_SUCCESS_THRESHOLD}")
+
     device_sr: int = getattr(getattr(env, 'reward_calc', None), 'device_sr', 44100)
 
     # Evaluate
@@ -815,6 +990,7 @@ def main():
         deterministic=args.deterministic,
         ref_mels=ref_mels_for_eval,
         device_sr=device_sr,
+        spectral_success=args.spectral_success,
     )
 
     # Print summary

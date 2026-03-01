@@ -38,9 +38,11 @@ HARMONIC_CLASS_IDX = 0
 
 SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 
-# ── Filtration layer thresholds ───────────────────────────────────────
-TORQUE_HARD_MAX   = 300.0   # Anything above this is too aggressive for harmonics
-TORQUE_HARD_MIN   = 15.0    # Below this the presser barely touches the string or triggers a weird edge case
+# ── Filtration layer thresholds ─────────────────────────────────────
+# Expressed as normalized presser force [0.0, 1.0] to match the plugin's
+# formerly-normalized /fret input (force = torque / TORQUE_MAX).
+FORCE_HARD_MAX    = 300.0 / TORQUE_MAX   # raw 300 → ≈ 0.462
+FORCE_HARD_MIN    = 15.0  / TORQUE_MAX   # raw 15  → ≈ 0.023
 FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
@@ -71,6 +73,7 @@ REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
 REWARD_MODE_NO_FILTRATION = 'no_filtration'  # Layer 2 only — bypass physics gate
 REWARD_MODE_NO_AUDIO      = 'no_audio'       # Layer 1 + fret/torque shaping only
 REWARD_MODE_COSINE_SIM    = 'cosine_sim'     # Layer 1 + onset-aligned mel cosine sim vs reference WAVs
+REWARD_MODE_SPECTRAL      = 'spectral'       # Layer 1 + direct spectral content analysis (HER)
 
 # ── Fine-tune (cosine_sim) reward curve ───────────────────────────────────────
 # cosine_sim >= threshold  →  +5.0 (success bonus)
@@ -82,6 +85,30 @@ COSINE_SIM_SUCCESS_THRESHOLD = 0.85
 COSINE_SIM_SUCCESS_REWARD    = 5.0
 COSINE_SIM_FLOOR             = -5.0   # minimum (asymptotic) reward
 COSINE_SIM_DECAY_K           = 3.0    # controls how fast reward drops below threshold
+
+# ── Spectral content reward ─────────────────────────────────────────────
+# Physics-based: given a target fret we know the exact frequencies a natural
+# harmonic should produce.  The spectral score measures how much energy is
+# at those frequencies vs everywhere else.
+
+# D-string open frequency (Hz).  Other strings can be added later.
+D_STRING_OPEN_FREQ = 146.83  # D3, MIDI 50
+
+# Which harmonic of the open string each fret produces.
+# Fret 7 = 1/3 node → 3rd harmonic, Fret 5 = 1/4 → 4th, Fret 4 = 1/5 → 5th.
+FRET_TO_HARMONIC_NUMBER = {
+    4: 5,   # 5 × 146.83 ≈ 734 Hz
+    5: 4,   # 4 × 146.83 ≈ 587 Hz
+    7: 3,   # 3 × 146.83 ≈ 440 Hz
+    9: 4,   # same node as fret 5 (mirror side)
+}
+
+SPECTRAL_BANDWIDTH_RATIO      = 0.03   # ±3% around each partial (~50 cents)
+SPECTRAL_HER_WEIGHT           = 0.60   # Harmonic Energy Ratio
+SPECTRAL_FUND_SUPPRESS_WEIGHT = 0.25   # Fundamental suppression
+SPECTRAL_SIGNAL_WEIGHT        = 0.15   # Signal presence (anti-silence)
+SPECTRAL_SUCCESS_THRESHOLD    = 0.65   # spectral_score above this = success
+SPECTRAL_NOISE_FLOOR_HZ       = 80.0   # ignore energy below this
 
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
@@ -96,8 +123,13 @@ def compute_filtration(
     Physics-based gate.  Returns whether the action is sane enough to
     bother running the classifier on.
 
-    Checks: torque range, fret distance from target.
+    Checks: torque range (normalized to [0, 1]), fret distance from target.
     Silence detection (RMS) was removed — too inconsistent in practice.
+
+    The torque parameter is the raw RL torque [16..650]; it is normalized to
+    presser force [0, 1] (force = torque / TORQUE_MAX) before comparing against
+    the FORCE_HARD_MIN / FORCE_HARD_MAX thresholds, which live in the same
+    normalized space as the plugin's former /fret presserForce input.
 
     Returns:
         Dict with:
@@ -105,19 +137,22 @@ def compute_filtration(
             reason (str):   Why it was rejected (empty if passed)
             penalty (float): Reward to use when rejected
     """
-    # Check: excessive torque
-    if torque > TORQUE_HARD_MAX:
+    # Normalize raw torque to presser force [0, 1] — matches plugin's /fret scale
+    norm_force = torque / TORQUE_MAX
+
+    # Check: excessive force
+    if norm_force > FORCE_HARD_MAX:
         return {
             'passed': False,
-            'reason': f'torque_too_high ({torque:.0f} > {TORQUE_HARD_MAX:.0f})',
+            'reason': f'force_too_high ({norm_force:.3f} > {FORCE_HARD_MAX:.3f}, raw torque={torque:.0f})',
             'penalty': FILTRATION_PENALTY,
         }
 
-    # Check: torque too low (presser barely engaged)
-    if torque < TORQUE_HARD_MIN:
+    # Check: force too low (presser barely engaged)
+    if norm_force < FORCE_HARD_MIN:
         return {
             'passed': False,
-            'reason': f'torque_too_low ({torque:.0f} < {TORQUE_HARD_MIN:.0f})',
+            'reason': f'force_too_low ({norm_force:.3f} < {FORCE_HARD_MIN:.3f}, raw torque={torque:.0f})',
             'penalty': FILTRATION_PENALTY,
         }
 
@@ -403,6 +438,52 @@ def compute_reward_cosine_sim(
         'filter_reason': '',
         'cosine_sim':    cosine_sim,
     }
+
+
+def compute_reward_spectral(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    spectral_score: float,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Spectral content reward: Layer 1 filtration + spectral score in weighted formula.
+
+    The spectral_score [0, 1] replaces harmonic_prob in the standard audio
+    reward formula.  It measures how much energy is at the expected harmonic
+    partials vs total energy, with bonuses for fundamental suppression and
+    signal presence.
+
+    Reward = 0.45 * spectral_score + 0.20 * fret_shaping + 0.35 * torque_shaping
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
+    if not filt['passed']:
+        return {
+            'total_reward':    filt['penalty'],
+            'audio_reward':    0.0,
+            'fret_reward':     0.0,
+            'torque_reward':   0.0,
+            'fret_error':      abs(fret_position - float(target_fret)),
+            'torque_error':    abs(torque - TORQUE_OPTIMAL_HARMONIC),
+            'target_fret':     target_fret,
+            'filtered':        True,
+            'filter_reason':   filt['reason'],
+            'spectral_score':  spectral_score,
+        }
+
+    # Reuse the same weighted formula — spectral_score slots into harmonic_prob
+    reward_info = compute_audio_reward(
+        fret_position, torque, target_fret, spectral_score
+    )
+    reward_info['target_fret']    = target_fret
+    reward_info['filtered']       = False
+    reward_info['filter_reason']  = ''
+    reward_info['spectral_score'] = spectral_score
+    return reward_info
 
 
 def is_success(harmonic_prob: float) -> bool:

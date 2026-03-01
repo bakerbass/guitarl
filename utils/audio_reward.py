@@ -46,11 +46,21 @@ from utils.reward import (
     REWARD_MODE_NO_FILTRATION,
     REWARD_MODE_NO_AUDIO,
     REWARD_MODE_COSINE_SIM,
+    REWARD_MODE_SPECTRAL,
     compute_reward as _compute_reward,
     compute_reward_no_filtration as _compute_reward_no_filtration,
     compute_reward_no_audio as _compute_reward_no_audio,
     compute_reward_cosine_sim as _compute_reward_cosine_sim,
+    compute_reward_spectral as _compute_reward_spectral,
     is_success as _is_success,
+    D_STRING_OPEN_FREQ,
+    FRET_TO_HARMONIC_NUMBER,
+    SPECTRAL_BANDWIDTH_RATIO,
+    SPECTRAL_HER_WEIGHT,
+    SPECTRAL_FUND_SUPPRESS_WEIGHT,
+    SPECTRAL_SIGNAL_WEIGHT,
+    SPECTRAL_NOISE_FLOOR_HZ,
+    SPECTRAL_SUCCESS_THRESHOLD,
 )
 
 # ── Fine-tune mode: mel spec parameters matching image_analysis.py ────────────
@@ -96,12 +106,14 @@ class HarmonicRewardCalculator:
             capture_duration: Audio capture duration in seconds
             model_sr: Sample rate expected by model
             device: Torch device (cuda/cpu)
-            reward_mode: One of 'full', 'no_filtration', 'no_audio', 'cosine_sim'.
+            reward_mode: One of 'full', 'no_filtration', 'no_audio', 'cosine_sim', 'spectral'.
                          'full'        — two-layer reward (default)
                          'no_filtration' — bypass physics gate, Layer 2 only
                          'no_audio'    — Layer 1 + fret/torque shaping, no CNN
                          'cosine_sim'  — Layer 1 + onset-aligned mel cosine
                                          similarity vs reference dataset WAVs
+                         'spectral'    — Layer 1 + direct spectral content
+                                         analysis (harmonic energy ratio)
             ref_dir:     Directory of reference WAVs (GB_NH_*.wav).
                          Required when reward_mode='cosine_sim'.
             fret_to_pitch: Mapping from target fret → MIDI note number used to
@@ -144,9 +156,9 @@ class HarmonicRewardCalculator:
         
         # Load CNN model (not needed in cosine_sim mode)
         self.reward_mode = reward_mode
-        if reward_mode == REWARD_MODE_COSINE_SIM and self.model_path is None:
+        if reward_mode in (REWARD_MODE_COSINE_SIM, REWARD_MODE_SPECTRAL) and self.model_path is None:
             self.model = None
-            logger.info("[fine-tune] cosine_sim mode: CNN model not loaded (model_path=None).")
+            logger.info(f"[{reward_mode}] CNN model not loaded (model_path=None).")
         else:
             self.model = self._load_model()
 
@@ -553,6 +565,95 @@ class HarmonicRewardCalculator:
                 "Check --ref-dir and fret-to-pitch mapping."
             )
 
+    # ── Spectral content reward mode ────────────────────────────────────────
+
+    def _compute_spectral_score(
+        self, audio: np.ndarray, target_fret: int,
+    ) -> float:
+        """Compute spectral reward score based on harmonic energy ratio.
+
+        Analyses the power spectrum of the captured audio and measures:
+        1. Harmonic Energy Ratio (HER): energy at expected partials / total energy
+        2. Fundamental suppression: penalises energy at the open-string fundamental
+        3. Signal presence: prevents rewarding silence
+
+        Returns a score in [0.0, 1.0].
+        """
+        from scipy.signal import welch as scipy_welch
+
+        f0 = D_STRING_OPEN_FREQ
+        harmonic_n = FRET_TO_HARMONIC_NUMBER.get(target_fret)
+        if harmonic_n is None:
+            logger.warning(
+                f"[spectral] No harmonic number for fret {target_fret}, returning 0.0"
+            )
+            return 0.0
+
+        # Resample to analysis SR and onset-align
+        sr = _FT_SR
+        if self.device_sr != sr:
+            y = librosa.resample(audio.astype(np.float32), orig_sr=self.device_sr, target_sr=sr)
+        else:
+            y = audio.astype(np.float32)
+        y = self._onset_align(y, sr=sr)
+
+        # Skip the initial transient (300 ms) and take up to 2 s of steady-state
+        skip_samples = int(0.3 * sr)
+        window_samples = int(2.0 * sr)
+        y = y[skip_samples: skip_samples + window_samples]
+
+        if len(y) < int(0.25 * sr):
+            return 0.0  # too short to analyse
+
+        # Power spectrum via Welch's method (robust averaging)
+        nperseg = min(4096, len(y))
+        freqs, psd = scipy_welch(y, fs=sr, nperseg=nperseg, noverlap=nperseg // 2)
+
+        # -- Desired partials: n*f0, 2n*f0, 3n*f0, ... up to Nyquist --
+        harmonic_fundamental = harmonic_n * f0
+        desired_energy = 0.0
+        partial = harmonic_fundamental
+        bw = SPECTRAL_BANDWIDTH_RATIO
+        while partial < sr / 2:
+            lo = partial * (1.0 - bw)
+            hi = partial * (1.0 + bw)
+            mask = (freqs >= lo) & (freqs <= hi)
+            desired_energy += float(psd[mask].sum())
+            partial += harmonic_fundamental
+
+        # -- Fundamental energy (should be suppressed for a clean harmonic) --
+        f0_lo = f0 * (1.0 - bw)
+        f0_hi = f0 * (1.0 + bw)
+        f0_mask = (freqs >= f0_lo) & (freqs <= f0_hi)
+        f0_energy = float(psd[f0_mask].sum())
+
+        # -- Total energy above noise floor --
+        signal_mask = freqs >= SPECTRAL_NOISE_FLOOR_HZ
+        total_energy = float(psd[signal_mask].sum()) + 1e-12
+
+        # Sub-scores
+        her = desired_energy / total_energy
+        f0_ratio = f0_energy / total_energy
+        fund_suppression = 1.0 - float(np.clip(f0_ratio * 5.0, 0.0, 1.0))
+
+        # Signal presence: ramp up from 0 at very low energy to 1.0
+        # Use a threshold relative to a quiet but audible signal (~1e-5 avg power)
+        signal_presence = float(np.clip(total_energy / 1e-4, 0.0, 1.0))
+
+        score = (
+            SPECTRAL_HER_WEIGHT * her
+            + SPECTRAL_FUND_SUPPRESS_WEIGHT * fund_suppression
+            + SPECTRAL_SIGNAL_WEIGHT * signal_presence
+        )
+        score = float(np.clip(score, 0.0, 1.0))
+
+        logger.debug(
+            f"[spectral] fret={target_fret} n={harmonic_n} "
+            f"HER={her:.3f} fund_sup={fund_suppression:.3f} "
+            f"sig={signal_presence:.3f} → score={score:.3f}"
+        )
+        return score
+
     def _cosine_sim_vs_refs(self, audio: np.ndarray, target_fret: int) -> float:
         """Return best cosine similarity between captured audio and cached reference mels.
 
@@ -640,6 +741,18 @@ class HarmonicRewardCalculator:
                     'cosine_sim':       cosine_sim,
                 }
                 harmonic_prob = cosine_sim
+            elif self.reward_mode == REWARD_MODE_SPECTRAL:
+                spectral_score = self._compute_spectral_score(audio, target_fret)
+                classification = {
+                    'predicted_class':  0 if spectral_score >= SPECTRAL_SUCCESS_THRESHOLD else 1,
+                    'predicted_label':  'harmonic' if spectral_score >= SPECTRAL_SUCCESS_THRESHOLD else 'dead_note',
+                    'confidence':       spectral_score,
+                    'harmonic_prob':    spectral_score,
+                    'dead_prob':        1.0 - spectral_score,
+                    'general_prob':     0.0,
+                    'spectral_score':   spectral_score,
+                }
+                harmonic_prob = spectral_score
             else:
                 classification = self.classify_audio(audio)
                 harmonic_prob = classification['harmonic_prob']
@@ -670,6 +783,15 @@ class HarmonicRewardCalculator:
                 torque=torque,
                 target_fret=target_fret,
                 cosine_sim=cosine_sim_val,
+                audio_rms=audio_rms,
+            )
+        elif self.reward_mode == REWARD_MODE_SPECTRAL:
+            spectral_val = classification['spectral_score'] if classification else 0.0
+            reward_info = _compute_reward_spectral(
+                fret_position=fret_position,
+                torque=torque,
+                target_fret=target_fret,
+                spectral_score=spectral_val,
                 audio_rms=audio_rms,
             )
         else:  # REWARD_MODE_FULL
