@@ -52,7 +52,20 @@ python train.py \
   --fixed-fret 7 \
   --total-timesteps 20000 \
   --learning-starts 50 \
-  --osc-port 12000
+  --osc-port 12000 \
+  --record-successes
+
+
+
+python train.py \
+  --resume   /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260301_114227 \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 20000 \
+  --learning-starts 50 \
+  --osc-port 12000 \
+  --record-successes
 
 # ── Phase 3: spectral, easy-to-hard fret curriculum ──────────────────────────
 python train.py \

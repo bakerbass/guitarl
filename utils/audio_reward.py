@@ -58,6 +58,7 @@ from utils.reward import (
     SPECTRAL_BANDWIDTH_RATIO,
     SPECTRAL_HER_WEIGHT,
     SPECTRAL_FUND_SUPPRESS_WEIGHT,
+    SPECTRAL_FRET_FUND_SUPPRESS_WEIGHT,
     SPECTRAL_SIGNAL_WEIGHT,
     SPECTRAL_NOISE_FLOOR_HZ,
     SPECTRAL_SUCCESS_THRESHOLD,
@@ -574,8 +575,12 @@ class HarmonicRewardCalculator:
 
         Analyses the power spectrum of the captured audio and measures:
         1. Harmonic Energy Ratio (HER): energy at expected partials / total energy
-        2. Fundamental suppression: penalises energy at the open-string fundamental
-        3. Signal presence: prevents rewarding silence
+        2. Open-string fundamental suppression: penalises energy at f0 (presser not
+           contacting the string at all — string rings open)
+        3. Fretted-note fundamental suppression: penalises energy at f0*2^(fret/12)
+           (presser pressing too hard — string sounds as a normal fretted note
+           rather than a natural harmonic)
+        4. Signal presence: prevents rewarding silence
 
         Returns a score in [0.0, 1.0].
         """
@@ -621,11 +626,21 @@ class HarmonicRewardCalculator:
             desired_energy += float(psd[mask].sum())
             partial += harmonic_fundamental
 
-        # -- Fundamental energy (should be suppressed for a clean harmonic) --
+        # -- Open-string fundamental (should be absent — presser not contacting string) --
         f0_lo = f0 * (1.0 - bw)
         f0_hi = f0 * (1.0 + bw)
         f0_mask = (freqs >= f0_lo) & (freqs <= f0_hi)
         f0_energy = float(psd[f0_mask].sum())
+
+        # -- Fretted-note fundamental (should be absent — presser too heavy) --
+        # If pressed at fret N with normal force the string sounds at f0 * 2^(N/12).
+        # A natural harmonic requires a light touch, so strong energy here means
+        # the presser is depressing the string rather than lightly touching the node.
+        fret_fund_freq = f0 * (2.0 ** (target_fret / 12.0))
+        fret_fund_lo = fret_fund_freq * (1.0 - bw)
+        fret_fund_hi = fret_fund_freq * (1.0 + bw)
+        fret_fund_mask = (freqs >= fret_fund_lo) & (freqs <= fret_fund_hi)
+        fret_fund_energy = float(psd[fret_fund_mask].sum())
 
         # -- Total energy above noise floor --
         signal_mask = freqs >= SPECTRAL_NOISE_FLOOR_HZ
@@ -633,24 +648,31 @@ class HarmonicRewardCalculator:
 
         # Sub-scores
         her = desired_energy / total_energy
+
+        # Open-string suppression: any energy at f0 hurts (scaled so f0_ratio=0.2 → 0)
         f0_ratio = f0_energy / total_energy
         fund_suppression = 1.0 - float(np.clip(f0_ratio * 5.0, 0.0, 1.0))
 
+        # Fretted-note suppression: same scaling — ratio=0.2 collapses this term to 0
+        fret_fund_ratio = fret_fund_energy / total_energy
+        fret_fund_suppression = 1.0 - float(np.clip(fret_fund_ratio * 5.0, 0.0, 1.0))
+
         # Signal presence: ramp up from 0 at very low energy to 1.0
-        # Use a threshold relative to a quiet but audible signal (~1e-5 avg power)
         signal_presence = float(np.clip(total_energy / 1e-4, 0.0, 1.0))
 
         score = (
             SPECTRAL_HER_WEIGHT * her
             + SPECTRAL_FUND_SUPPRESS_WEIGHT * fund_suppression
+            + SPECTRAL_FRET_FUND_SUPPRESS_WEIGHT * fret_fund_suppression
             + SPECTRAL_SIGNAL_WEIGHT * signal_presence
         )
         score = float(np.clip(score, 0.0, 1.0))
 
         logger.debug(
-            f"[spectral] fret={target_fret} n={harmonic_n} "
-            f"HER={her:.3f} fund_sup={fund_suppression:.3f} "
-            f"sig={signal_presence:.3f} → score={score:.3f}"
+            f"[spectral] fret={target_fret} n={harmonic_n} f0_fund={f0:.1f}Hz "
+            f"fret_fund={fret_fund_freq:.1f}Hz "
+            f"HER={her:.3f} open_sup={fund_suppression:.3f} "
+            f"fret_sup={fret_fund_suppression:.3f} sig={signal_presence:.3f} → score={score:.3f}"
         )
         return score, her
 
