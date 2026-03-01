@@ -652,7 +652,7 @@ class HarmonicRewardCalculator:
             f"HER={her:.3f} fund_sup={fund_suppression:.3f} "
             f"sig={signal_presence:.3f} → score={score:.3f}"
         )
-        return score
+        return score, her
 
     def _cosine_sim_vs_refs(self, audio: np.ndarray, target_fret: int) -> float:
         """Return best cosine similarity between captured audio and cached reference mels.
@@ -742,7 +742,7 @@ class HarmonicRewardCalculator:
                 }
                 harmonic_prob = cosine_sim
             elif self.reward_mode == REWARD_MODE_SPECTRAL:
-                spectral_score = self._compute_spectral_score(audio, target_fret)
+                spectral_score, her = self._compute_spectral_score(audio, target_fret)
                 classification = {
                     'predicted_class':  0 if spectral_score >= SPECTRAL_SUCCESS_THRESHOLD else 1,
                     'predicted_label':  'harmonic' if spectral_score >= SPECTRAL_SUCCESS_THRESHOLD else 'dead_note',
@@ -751,6 +751,7 @@ class HarmonicRewardCalculator:
                     'dead_prob':        1.0 - spectral_score,
                     'general_prob':     0.0,
                     'spectral_score':   spectral_score,
+                    'HER':              her,
                 }
                 harmonic_prob = spectral_score
             else:

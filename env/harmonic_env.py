@@ -536,6 +536,18 @@ class HarmonicEnv(gym.Env):
                             f"    [{result}]  cosine_sim={sim:.4f}\n"
                             f"    reward={reward:+.3f}"
                         )
+                    elif self.reward_mode == REWARD_MODE_SPECTRAL:
+                        spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
+                        her  = cls.get('HER', 0.0)
+                        result = 'PASS' if spec >= self.success_threshold else 'fail'
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    [{result}]  spectral={spec:.3f}  HER={her:.3f}\n"
+                            f"    reward={reward:+.3f}  "
+                            f"(audio={reward_info['audio_reward']:+.3f}  "
+                            f"fret={reward_info['fret_reward']:+.3f}  "
+                            f"torque={reward_info['torque_reward']:+.3f})"
+                        )
                     else:
                         label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
                         logger.info(
@@ -577,7 +589,11 @@ class HarmonicEnv(gym.Env):
                 terminated = True
                 reward += 1.0  # Bonus for success
                 cls = reward_info['classification']
-                logger.info(f"Success! Harmonic prob: {cls['harmonic_prob']:.3f}")
+                if self.reward_mode == REWARD_MODE_SPECTRAL:
+                    spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
+                    logger.info(f"Success! Spectral score: {spec:.3f}")
+                else:
+                    logger.info(f"Success! Harmonic prob: {cls['harmonic_prob']:.3f}")
 
                 # Non-blocking: hand audio + metadata to the background writer.
                 if self.success_recorder is not None and self.last_audio is not None:

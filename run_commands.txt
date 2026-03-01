@@ -25,3 +25,67 @@ python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/classif
 
 ### eval: fine tuned model
 python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/fine_tuned/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_fine_tuned
+
+
+# guitaRL training commands
+# Run from the guitaRL/ directory inside the guitaRL conda env.
+
+# ── Spectral reward mode (no CNN required) ────────────────────────────────────
+# Live robot, Scarlett audio, easy-to-hard curriculum
+python train.py \
+  --reward-mode spectral \
+  --curriculum easy_to_hard \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# String simulator (VB-Audio CABLE output as audio source)
+python train.py
+  --reward-mode spectral
+  --string-sim
+  --curriculum easy_to_hard
+  --total-timesteps 50000
+  --learning-starts 200
+  --osc-port 12000
+
+# Fixed fret 7 (fret lock for targeted training)
+python train.py \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# String sim + fixed fret 7
+python train.py \
+  --reward-mode spectral \
+  --string-sim \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# ── Classic CNN classifier reward modes ───────────────────────────────────────
+# Full reward (CNN + filtration)
+python train.py \
+  --reward-mode full \
+  --model-path ../HarmonicsClassifier/model/best_model.pt \
+  --curriculum easy_to_hard \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# ── Analysis ──────────────────────────────────────────────────────────────────
+# Score all archived audio in runs copy/
+python analyze_runs_audio.py
+
+# Verbose per-clip detail for a specific run
+python analyze_runs_audio.py --run fine_tuned --type success --verbose
+
+# Filter to fret-7 clips only
+python analyze_runs_audio.py --min-fret 6.5 --max-fret 7.5
+
+# Ground-truth spectral test on HarmonicsClassifier reference recordings
+python test_spectral_groundtruth.py

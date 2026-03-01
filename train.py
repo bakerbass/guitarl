@@ -833,6 +833,9 @@ def main():
                         help='OSC port (default: 12000 for GuitarBot, 8000 for StringSim)')
     parser.add_argument('--audio-device', type=str, default='Scarlett',
                         help='Audio input device name substring (default: Scarlett)')
+    parser.add_argument('--string-sim', action='store_true',
+                        help='Use VB-Audio CABLE output as audio device (string simulator mode). '
+                             'Sets --audio-device to "CABLE output" unless overridden explicitly.')
     parser.add_argument('--curriculum', type=str, default='easy_to_hard',
                         choices=['random', 'easy_to_hard', 'fixed_fret'],
                         help='Curriculum learning mode')
@@ -969,6 +972,9 @@ def main():
                              'terminal readable.')
 
     args = parser.parse_args()
+
+    if args.string_sim and args.audio_device == 'Scarlett':
+        args.audio_device = 'CABLE output'
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
