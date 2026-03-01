@@ -1,4 +1,4 @@
-"""Spectral analysis of all audio in './runs copy' (successes + audio dumps).
+"""Spectral analysis of all audio in './runs' (successes + audio dumps).
 
 Parses metadata from filenames and paths, scores each clip, and reports
 per-run summaries plus a global leaderboard.
@@ -154,10 +154,10 @@ def parse_metadata(wav_path: Path, runs_root: Path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description='Spectral analysis of runs copy audio')
+    ap = argparse.ArgumentParser(description='Spectral analysis of runs audio')
     ap.add_argument('--runs-dir', type=str,
-                    default=str(Path(__file__).parent / 'runs copy'),
-                    help='Root directory of runs (default: ./runs copy)')
+                    default=str(Path(__file__).parent / 'runs'),
+                    help='Root directory of runs (default: ./runs)')
     ap.add_argument('--run', type=str, default=None,
                     help='Analyse only runs matching this substring')
     ap.add_argument('--type', choices=['success', 'dump', 'all'], default='all',
@@ -168,6 +168,8 @@ def main():
                     help='Only include clips where fret_raw <= this value')
     ap.add_argument('--verbose', '-v', action='store_true',
                     help='Print every clip (not just summaries)')
+    ap.add_argument('--worst', action='store_true',
+                    help='Report the lowest-scoring clips instead of the highest')
     ap.add_argument('--threshold', type=float, default=THRESHOLD,
                     help=f'Spectral pass threshold (default: {THRESHOLD})')
     args = ap.parse_args()
@@ -252,8 +254,9 @@ def main():
                     fsup = bd.get('fund_sup', float('nan'))
                     fret = r['fret_raw']
                     torq = r['torque']
+                    rel = r['path'].relative_to(Path.cwd()) if r['path'].is_relative_to(Path.cwd()) else r['path']
                     print(f"      {ok} seq={r['seq']:>4}{ep}  f{r['fret_harmonic']}({fret:.2f})  "
-                          f"t={torq:>5.0f}  score={s:.3f}  HER={her:.3f}  Fsup={fsup:.3f}")
+                          f"t={torq:>5.0f}  score={s:.3f}  HER={her:.3f}  Fsup={fsup:.3f}  {rel}")
                 print()
 
             global_rows.extend(valid)
@@ -281,19 +284,24 @@ def main():
         a_h   = np.mean([r['breakdown'].get('HER', float('nan')) for r in sub if r['breakdown']])
         print(f"  fret {fret:<2} {len(sub):>4}  {n_p:>5}  {100*n_p/len(sub):>5.1f}%  {a_s:>9.3f}  {a_h:>7.3f}")
 
-    # ── Top 10 highest spectral scores (success clips only) ──────────────────
+    # ── Top 10 best / worst spectral scores (success clips only) ────────────
     successes_only = [r for r in global_rows if r['clip_type'] == 'success']
     if successes_only:
-        print(f"\n  TOP 10 SUCCESS CLIPS BY SPECTRAL SCORE")
+        if args.worst:
+            ranked = sorted(successes_only, key=lambda r: r['score'])[:10]
+            print(f"\n  BOTTOM 10 SUCCESS CLIPS BY SPECTRAL SCORE")
+        else:
+            ranked = sorted(successes_only, key=lambda r: r['score'], reverse=True)[:10]
+            print(f"\n  TOP 10 SUCCESS CLIPS BY SPECTRAL SCORE")
         print('  ' + '-' * 72)
-        top10 = sorted(successes_only, key=lambda r: r['score'], reverse=True)[:10]
-        for r in top10:
-            bd = r['breakdown']
+        for r in ranked:
+            bd  = r['breakdown']
+            rel = r['path'].relative_to(Path.cwd()) if r['path'].is_relative_to(Path.cwd()) else r['path']
             print(f"    score={r['score']:.3f}  HER={bd.get('HER',0):.3f}  "
                   f"Fsup={bd.get('fund_sup',0):.3f}  "
                   f"f{r['fret_harmonic']}({r['fret_raw']:.2f})  "
                   f"t={r['torque']:>5.0f}  "
-                  f"{r['run'][:28]}  {r['path'].name[-32:]}")
+                  f"{rel}")
 
     print()
 

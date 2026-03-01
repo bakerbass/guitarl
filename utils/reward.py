@@ -41,7 +41,7 @@ SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 # ── Filtration layer thresholds ─────────────────────────────────────
 # Expressed as normalized presser force [0.0, 1.0] to match the plugin's
 # formerly-normalized /fret input (force = torque / TORQUE_MAX).
-FORCE_HARD_MAX    = 300.0 / TORQUE_MAX   # raw 300 → ≈ 0.462
+FORCE_HARD_MAX    = 120.0 / TORQUE_MAX   # raw 120 → ≈ 0.185  (data: best harmonics ≤60, nothing good >80)
 FORCE_HARD_MIN    = 15.0  / TORQUE_MAX   # raw 15  → ≈ 0.023
 FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
@@ -109,6 +109,11 @@ SPECTRAL_FUND_SUPPRESS_WEIGHT = 0.25   # Fundamental suppression
 SPECTRAL_SIGNAL_WEIGHT        = 0.15   # Signal presence (anti-silence)
 SPECTRAL_SUCCESS_THRESHOLD    = 0.65   # spectral_score above this = success
 SPECTRAL_NOISE_FLOOR_HZ       = 80.0   # ignore energy below this
+
+# Spectral reward coupling: torque factor sigma (tighter than TORQUE_TOLERANCE).
+# At σ=50: torque=70 → factor=1.0, torque=120 → factor=0.57, torque=177 → factor=0.10
+# Spectral and fret rewards are multiplied by this — bad torque collapses the total.
+SPECTRAL_TORQUE_SIGMA         = 50.0
 
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
@@ -448,14 +453,23 @@ def compute_reward_spectral(
     audio_rms: Optional[float] = None,
 ) -> Dict[str, object]:
     """
-    Spectral content reward: Layer 1 filtration + spectral score in weighted formula.
+    Spectral content reward: Layer 1 filtration + multiplicative coupling formula.
 
-    The spectral_score [0, 1] replaces harmonic_prob in the standard audio
-    reward formula.  It measures how much energy is at the expected harmonic
-    partials vs total energy, with bonuses for fundamental suppression and
-    signal presence.
+    Torque, fret accuracy, and spectral score are coupled multiplicatively so that
+    each dimension is a prerequisite for reward — a bad torque collapses the total
+    even when fret and spectrum look good.  This matches the physics: a natural
+    harmonic requires correct node position AND a light touch simultaneously.
 
-    Reward = 0.45 * spectral_score + 0.20 * fret_shaping + 0.35 * torque_shaping
+    torque_factor = exp(-(torque_error² / (2 × SPECTRAL_TORQUE_SIGMA²)))
+      → 1.0 at optimal torque, ~0.10 at torque 177, 0.0 far from optimal
+
+    audio_component = spectral_score² × torque_factor
+      → squaring sharpens the gradient around the attractor
+
+    fret_component  = fret_Gaussian × spectral_score
+      → fret only pays out if audio confirms a harmonic is present
+
+    Reward = 0.80 × audio_component + 0.20 × fret_component
     """
     if target_fret not in HARMONIC_FRETS:
         raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
@@ -475,15 +489,33 @@ def compute_reward_spectral(
             'spectral_score':  spectral_score,
         }
 
-    # Reuse the same weighted formula — spectral_score slots into harmonic_prob
-    reward_info = compute_audio_reward(
-        fret_position, torque, target_fret, spectral_score
-    )
-    reward_info['target_fret']    = target_fret
-    reward_info['filtered']       = False
-    reward_info['filter_reason']  = ''
-    reward_info['spectral_score'] = spectral_score
-    return reward_info
+    fret_error    = abs(fret_position - float(target_fret))
+    torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
+
+    # Torque factor: tight Gaussian, collapses reward when touch is heavy
+    torque_factor = float(np.exp(-(torque_error ** 2) / (2.0 * SPECTRAL_TORQUE_SIGMA ** 2)))
+
+    # Audio: spectral² × torque_factor  (physics: both must be right together)
+    audio_component = float(spectral_score ** 2) * torque_factor
+
+    # Fret: Gaussian × spectral_score  (no free credit for correct fret alone)
+    fret_gaussian   = float(np.exp(-(fret_error ** 2) / (2.0 * FRET_TOLERANCE ** 2)))
+    fret_component  = fret_gaussian * float(spectral_score)
+
+    total_reward = 0.80 * audio_component + 0.20 * fret_component
+
+    return {
+        'total_reward':    total_reward,
+        'audio_reward':    audio_component,
+        'fret_reward':     fret_component,
+        'torque_reward':   torque_factor,   # expose factor for logging
+        'fret_error':      fret_error,
+        'torque_error':    torque_error,
+        'target_fret':     target_fret,
+        'filtered':        False,
+        'filter_reason':   '',
+        'spectral_score':  spectral_score,
+    }
 
 
 def is_success(harmonic_prob: float) -> bool:
