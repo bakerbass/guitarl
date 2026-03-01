@@ -67,6 +67,13 @@ python train.py \
   --osc-port 12000 \
   --record-successes
 
+## report:
+=== Last 100 Episodes ===
+Success rate: 0.910
+Avg reward: 4.044
+Avg fret pos: 7.22
+Avg torque: 64
+episodes: 1,381
 # ── Phase 3: spectral, easy-to-hard fret curriculum ──────────────────────────
 python train.py \
   --reward-mode spectral \

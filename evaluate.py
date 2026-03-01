@@ -20,6 +20,7 @@ from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION,
+    REWARD_MODE_SPECTRAL, REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO,
     COSINE_SIM_SUCCESS_THRESHOLD, SPECTRAL_SUCCESS_THRESHOLD,
     D_STRING_OPEN_FREQ, FRET_TO_HARMONIC_NUMBER,
     SPECTRAL_BANDWIDTH_RATIO, SPECTRAL_HER_WEIGHT,
@@ -866,7 +867,15 @@ def main():
     parser.add_argument('--model', required=True, help='Path to trained model (.zip)')
     parser.add_argument('--model-classifier',
                         default='../HarmonicsClassifier/models/best_model.pt',
-                        help='Path to HarmonicsClassifier model')
+                        help='Path to HarmonicsClassifier model (only needed for '
+                             'reward-mode full / no_audio)')
+    parser.add_argument('--reward-mode',
+                        default=REWARD_MODE_SPECTRAL,
+                        choices=[REWARD_MODE_FULL, REWARD_MODE_SPECTRAL,
+                                 REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO,
+                                 REWARD_MODE_NO_FILTRATION],
+                        help='Reward mode for the evaluation env (default: spectral). '
+                             'Spectral and cosine_sim modes do not require a CNN classifier.')
     parser.add_argument('--episodes', type=int, default=10, help='Number of evaluation episodes')
     parser.add_argument('--string-index', type=int, default=2, help='String to evaluate on')
     parser.add_argument('--string-indices', type=int, nargs='+', default=None,
@@ -916,10 +925,15 @@ def main():
         logger.error(f"Model not found: {model_path}")
         sys.exit(1)
 
+    # Classifier is only needed for CNN-based reward modes
+    _classifier_free_modes = (REWARD_MODE_SPECTRAL, REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO)
     classifier_path = Path(args.model_classifier)
-    if not classifier_path.exists():
-        logger.error(f"Classifier model not found: {classifier_path}")
-        sys.exit(1)
+    if args.reward_mode not in _classifier_free_modes:
+        if not classifier_path.exists():
+            logger.error(f"Classifier model not found: {classifier_path}")
+            sys.exit(1)
+    else:
+        classifier_path = None
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -938,19 +952,26 @@ def main():
     # Create environment
     curriculum_mode = 'random' if args.target_fret is None else 'fixed_fret'
     fixed_target_fret = args.target_fret if args.target_fret is not None else 7
-    reward_mode = REWARD_MODE_NO_FILTRATION if args.no_filtration else REWARD_MODE_FULL
+
+    # reward_mode: --no-filtration overrides to no_filtration regardless of --reward-mode
     if args.no_filtration:
-        logger.info(
-            '[eval] --no-filtration: physics gate disabled — all actions will be sent to the robot.'
-        )
+        reward_mode = REWARD_MODE_NO_FILTRATION
+        logger.info('[eval] --no-filtration: physics gate disabled — all actions will be sent to the robot.')
+    else:
+        reward_mode = args.reward_mode
+        logger.info(f'[eval] reward_mode={reward_mode}')
+
+    # spectral_success: auto-enable when reward_mode is spectral, or if explicitly requested
+    spectral_success = args.spectral_success or (reward_mode == REWARD_MODE_SPECTRAL)
+    cosine_success   = args.cosine_success   or (reward_mode == REWARD_MODE_COSINE_SIM)
     # max_steps=10 means 10 real robot steps per episode — filtered steps
     # do not count (harmonic_env only increments current_step when unfiltered).
     # In cosine-success mode the env must not self-terminate on harmonic_prob —
     # episode termination is controlled entirely by the cosine threshold break
     # in evaluate_policy. Set success_threshold=2.0 (unreachable) to disable it.
-    success_threshold = 2.0 if (args.cosine_success or args.spectral_success) else 0.8
+    success_threshold = 2.0 if (cosine_success or spectral_success) else 0.8
     env = HarmonicEnv(
-        model_path=str(classifier_path),
+        model_path=str(classifier_path) if classifier_path else None,
         string_indices=string_indices,
         curriculum_mode=curriculum_mode,
         fixed_target_fret=fixed_target_fret,
@@ -962,7 +983,7 @@ def main():
 
     # Pre-load reference mels for cosine-success mode
     ref_mels_for_eval: Optional[Dict[int, list]] = None
-    if args.cosine_success:
+    if cosine_success:
         ref_dir_path = Path(args.ref_dir)
         if not ref_dir_path.exists():
             logger.error(f"--cosine-success requires --ref-dir, but {ref_dir_path} does not exist.")
@@ -974,7 +995,7 @@ def main():
         logger.info("[cosine-success] Success criterion: cosine_sim >= "
                     f"{COSINE_SIM_SUCCESS_THRESHOLD} (vs reference WAVs)")
 
-    if args.spectral_success:
+    if spectral_success:
         logger.info(f"[spectral-success] Success criterion: spectral_score >= "
                     f"{SPECTRAL_SUCCESS_THRESHOLD}")
 
@@ -990,7 +1011,7 @@ def main():
         deterministic=args.deterministic,
         ref_mels=ref_mels_for_eval,
         device_sr=device_sr,
-        spectral_success=args.spectral_success,
+        spectral_success=spectral_success,
     )
 
     # Print summary
