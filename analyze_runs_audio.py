@@ -172,6 +172,8 @@ def main():
                     help='Report the lowest-scoring clips instead of the highest')
     ap.add_argument('--threshold', type=float, default=THRESHOLD,
                     help=f'Spectral pass threshold (default: {THRESHOLD})')
+    ap.add_argument('--top-n', type=int, default=10,
+                    help='Number of clips to show in the top/bottom list (default: 10)')
     args = ap.parse_args()
 
     runs_root = Path(args.runs_dir)
@@ -287,12 +289,13 @@ def main():
     # ── Top 10 best / worst spectral scores (success clips only) ────────────
     successes_only = [r for r in global_rows if r['clip_type'] == 'success']
     if successes_only:
+        n = args.top_n
         if args.worst:
-            ranked = sorted(successes_only, key=lambda r: r['score'])[:10]
-            print(f"\n  BOTTOM 10 SUCCESS CLIPS BY SPECTRAL SCORE")
+            ranked = sorted(successes_only, key=lambda r: r['score'])[:n]
+            print(f"\n  BOTTOM {n} SUCCESS CLIPS BY SPECTRAL SCORE")
         else:
-            ranked = sorted(successes_only, key=lambda r: r['score'], reverse=True)[:10]
-            print(f"\n  TOP 10 SUCCESS CLIPS BY SPECTRAL SCORE")
+            ranked = sorted(successes_only, key=lambda r: r['score'], reverse=True)[:n]
+            print(f"\n  TOP {n} SUCCESS CLIPS BY SPECTRAL SCORE")
         print('  ' + '-' * 72)
         for r in ranked:
             bd  = r['breakdown']
