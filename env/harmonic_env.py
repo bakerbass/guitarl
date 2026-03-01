@@ -536,7 +536,7 @@ class HarmonicEnv(gym.Env):
                             f"    [{result}]  cosine_sim={sim:.4f}\n"
                             f"    reward={reward:+.3f}"
                         )
-                    elif self.reward_mode == REWARD_MODE_SPECTRAL:
+                    elif self.reward_calc.reward_mode == REWARD_MODE_SPECTRAL:
                         spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
                         her  = cls.get('HER', 0.0)
                         result = 'PASS' if spec >= self.success_threshold else 'fail'
@@ -589,7 +589,7 @@ class HarmonicEnv(gym.Env):
                 terminated = True
                 reward += 1.0  # Bonus for success
                 cls = reward_info['classification']
-                if self.reward_mode == REWARD_MODE_SPECTRAL:
+                if self.reward_calc.reward_mode == REWARD_MODE_SPECTRAL:
                     spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
                     logger.info(f"Success! Spectral score: {spec:.3f}")
                 else:

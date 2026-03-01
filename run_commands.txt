@@ -46,11 +46,12 @@ python train.py \
 
 # ── Phase 2: spectral reward, fixed fret 7 ───────────────────────────────────
 python train.py \
+  --resume runs/harmonic_sac_20260224_140917 \
   --reward-mode spectral \
   --curriculum fixed_fret \
   --fixed-fret 7 \
   --total-timesteps 20000 \
-  --learning-starts 200 \
+  --learning-starts 50 \
   --osc-port 12000
 
 # ── Phase 3: spectral, easy-to-hard fret curriculum ──────────────────────────
