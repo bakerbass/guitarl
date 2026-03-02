@@ -74,6 +74,16 @@ Avg reward: 4.044
 Avg fret pos: 7.22
 Avg torque: 64
 episodes: 1,381
+
+python train.py \
+  --resume   /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260301_114227 \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 1500 \
+  --learning-starts 50 \
+  --osc-port 12000 \
+  --record-all
 # ── Phase 3: spectral, easy-to-hard fret curriculum ──────────────────────────
 python train.py \
   --reward-mode spectral \

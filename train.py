@@ -465,7 +465,7 @@ class AudioHistoryCallback(BaseCallback):
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None, fixed_target_fret: int = 7,
+             success_recorder=None, all_steps_recorder=None, fixed_target_fret: int = 7,
              ref_dir=None, fret_to_pitch=None):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
@@ -481,6 +481,7 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         reward_mode=reward_mode,
         offline=offline,
         success_recorder=success_recorder,
+        all_steps_recorder=all_steps_recorder,
         ref_dir=ref_dir,
         fret_to_pitch=fret_to_pitch,
     )
@@ -549,6 +550,13 @@ def train(args):
     elif args.record_successes and args.pretrain:
         logger.warning("[record-successes] No-op in --pretrain mode (no audio captured).")
 
+    all_steps_recorder = None
+    if args.record_all and not args.pretrain:
+        all_steps_recorder = SuccessRecorder(output_dir / "all_steps")
+        logger.info("[record-all] Recording every unfiltered step to all_steps/")
+    elif args.record_all and args.pretrain:
+        logger.warning("[record-all] No-op in --pretrain mode (no audio captured).")
+
     # Resolve fine-tune mode: cosine_sim reward + reference WAV loading
     reward_mode = args.reward_mode
     ref_dir = None
@@ -577,6 +585,7 @@ def train(args):
         reward_mode=reward_mode,
         offline=args.pretrain,
         success_recorder=success_recorder,
+        all_steps_recorder=all_steps_recorder,
         fixed_target_fret=args.fixed_fret,
         ref_dir=ref_dir,
         fret_to_pitch=fret_to_pitch,
@@ -791,6 +800,10 @@ def train(args):
             logger.info("[record-successes] Flushing pending writes...")
             success_recorder.close()
 
+        if all_steps_recorder is not None:
+            logger.info("[record-all] Flushing pending writes...")
+            all_steps_recorder.close()
+
         if args.pretrain:
             logger.info("Offline pre-training complete. No robot reset needed.")
         elif args.reset_on_exit:
@@ -922,6 +935,11 @@ def main():
                              'Output: <run-dir>/successes/  — review with --slow or any audio '
                              'player, edit suggested_label in the JSON, then feed back into '
                              'HarmonicsClassifier retraining. No-op in --pretrain mode.')
+    parser.add_argument('--record-all', action='store_true', default=False,
+                        help='Record every unfiltered robot step (not just successes) as '
+                             'WAV + JSON to <run-dir>/all_steps/. Same format as successes/ '
+                             'but includes dead_note and general_note outcomes with '
+                             'outcome/is_success tags. No-op in --pretrain mode.')
 
     # Slow / debug
     parser.add_argument('--slow', action='store_true', default=False,

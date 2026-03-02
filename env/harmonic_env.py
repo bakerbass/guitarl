@@ -124,6 +124,7 @@ class HarmonicEnv(gym.Env):
                  reward_mode: str = REWARD_MODE_FULL,
                  offline: bool = False,
                  success_recorder: Optional['SuccessRecorder'] = None,
+                 all_steps_recorder: Optional['SuccessRecorder'] = None,
                  ref_dir=None,
                  fret_to_pitch=None):
         """
@@ -156,6 +157,7 @@ class HarmonicEnv(gym.Env):
 
         self.offline = offline
         self.success_recorder = success_recorder
+        self.all_steps_recorder = all_steps_recorder
         # Instance-level silence threshold — can be updated by train.py after
         # construction (e.g. --silence-rms auto calibration).
         self.silence_rms_threshold: float = self.SILENCE_RMS_THRESHOLD
@@ -618,6 +620,41 @@ class HarmonicEnv(gym.Env):
                             'device_sr':      self.reward_calc.device_sr,
                         },
                     )
+
+        # Record every unfiltered step (success or not) when all_steps_recorder is set.
+        if (self.all_steps_recorder is not None
+                and not reward_info.get('filtered', False)
+                and self.last_audio is not None
+                and reward_info.get('classification') is not None):
+            _cls = reward_info['classification']
+            _is_success = _cls.get('harmonic_prob', 0.0) > self.success_threshold
+            self.all_steps_recorder.record(
+                audio=self.last_audio,
+                metadata={
+                    'episode':          self.episode_count,
+                    'step':             self.current_step,
+                    'string_index':     self.string_index,
+                    'target_fret':      self.target_fret,
+                    'fret_position':    fret_position,
+                    'torque':           torque,
+                    'outcome':          'success' if _is_success else _cls.get('predicted_label', 'unknown'),
+                    'is_success':       _is_success,
+                    'harmonic_prob':    _cls.get('harmonic_prob', 0.0),
+                    'dead_prob':        _cls.get('dead_prob', 0.0),
+                    'general_prob':     _cls.get('general_prob', 0.0),
+                    'spectral_score':   reward_info.get('spectral_score', _cls.get('spectral_score', None)),
+                    'cosine_sim':       reward_info.get('cosine_sim', None),
+                    'confidence':       _cls.get('confidence', 0.0),
+                    'predicted_label':  _cls.get('predicted_label', 'unknown'),
+                    'total_reward':     reward_info.get('total_reward', 0.0),
+                    'audio_reward':     reward_info.get('audio_reward', 0.0),
+                    'fret_reward':      reward_info.get('fret_reward', 0.0),
+                    'torque_reward':    reward_info.get('torque_reward', 0.0),
+                    'device_sr':        self.reward_calc.device_sr,
+                    'suggested_label':  'harmonic' if _is_success else _cls.get('predicted_label', 'unknown'),
+                    'reviewed':         False,
+                },
+            )
         
         # Max steps truncation (robot steps only)
         if self.current_step >= self.max_steps:
