@@ -42,6 +42,8 @@ if str(_parent_dir) not in sys.path:
 from utils.audio_reward import HarmonicRewardCalculator
 from utils.reward import (
     REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION, REWARD_MODE_NO_AUDIO,
+    REWARD_MODE_COSINE_SIM, REWARD_MODE_SPECTRAL,
+    SPECTRAL_SUCCESS_THRESHOLD,
     compute_reward_no_audio as _compute_reward_no_audio,
     compute_filtration,
     FILTRATION_PENALTY,
@@ -94,14 +96,16 @@ class HarmonicEnv(gym.Env):
     # Environment constants
     HARMONIC_FRETS = HARMONIC_FRETS_IN_RANGE  # [4, 5, 7]
     MAX_STEPS_PER_EPISODE = 10
-    ACTION_DURATION = 3.0       # Reference step duration (no longer enforced; kept for documentation)
-    CAPTURE_PRE_DELAY = 0.5     # Legacy fallback delay (used only if rolling buffer not available)
+    ACTION_DURATION = 5.0       # Total step duration (seconds): 0.5 pre + 4.0 capture + 0.5 pad
+    CAPTURE_PRE_DELAY = 0.5     # Wait after send_rlfret before recording (robot arm movement + pluck)
     STRING_SWITCH_WAIT = 4.0    # Seconds to pause after a /Reset between strings
 
-    # Silence-gate constants: wait for harmonics to decay before each step
-    SILENCE_RMS_THRESHOLD = 0.005   # RMS per 20 ms sub-chunk below which signal is "silent"
-    SILENCE_HOLD_DURATION = 0.5     # Seconds of continuous silence required before sending action
-    SILENCE_TIMEOUT       = 8.0     # Max wait (s); step proceeds anyway after this
+    # Silence gate: wait for harmonic bleed to decay before the next step.
+    # silence_rms_threshold is stored as an instance variable so train.py can
+    # override it with --silence-rms auto or a numeric value after construction.
+    SILENCE_RMS_THRESHOLD = 0.005  # default; overridden by instance var below
+    SILENCE_HOLD_DURATION = 0.5    # seconds of continuous quiet required
+    SILENCE_TIMEOUT       = 8.0    # max wait before proceeding anyway
     
     def __init__(self,
                  model_path: Optional[str] = None,
@@ -110,18 +114,19 @@ class HarmonicEnv(gym.Env):
                  osc_host: str = "127.0.0.1",
                  osc_port: int = 12000,
                  audio_device: str = "Scarlett",
-                 capture_duration: float = 2.0,
+                 capture_duration: float = 4.0,
                  max_steps: int = MAX_STEPS_PER_EPISODE,
                  success_threshold: float = 0.8,
                  curriculum_mode: str = "random",
+                 fixed_target_fret: int = 7,
                  use_simple_action_space: bool = False,
                  always_press: bool = True,
                  reward_mode: str = REWARD_MODE_FULL,
                  offline: bool = False,
                  success_recorder: Optional['SuccessRecorder'] = None,
-                 temperature: float = 1.5,
-                 shared_rolling_buffer=None,
-                 audio_device_id: Optional[int] = None):
+                 all_steps_recorder: Optional['SuccessRecorder'] = None,
+                 ref_dir=None,
+                 fret_to_pitch=None):
         """
         Initialize HarmonicEnv.
 
@@ -139,23 +144,23 @@ class HarmonicEnv(gym.Env):
             max_steps: Maximum steps per episode
             success_threshold: Harmonic probability threshold for success
             curriculum_mode: "random", "easy_to_hard", or "fixed_fret"
+            fixed_target_fret: Fret locked for "fixed_fret" curriculum (default 7).
+                               Must be in HARMONIC_FRETS [4, 5, 7].
             use_simple_action_space: If True, use 3D continuous space instead of 5D
             always_press: If True, remove press_decision from action space (always PRESS)
             reward_mode: 'full', 'no_filtration', or 'no_audio' (see reward.py)
             offline: If True, skip all robot/audio hardware. Reward comes from the
                      filtration layer only (fret + torque shaping). Use for fast
                      pre-training before deploying on the physical robot.
-            temperature: Temperature for logit scaling before softmax in the classifier
-                         (default 1.5). Values > 1 produce softer, less overconfident
-                         harmonic probabilities. Passed through to HarmonicRewardCalculator.
         """
         super().__init__()
 
         self.offline = offline
         self.success_recorder = success_recorder
-        # Silence-gate threshold as an instance variable so it can be overridden
-        # after construction (e.g. by --silence-rms auto calibration in train.py).
-        self.silence_rms_threshold = self.SILENCE_RMS_THRESHOLD
+        self.all_steps_recorder = all_steps_recorder
+        # Instance-level silence threshold — can be updated by train.py after
+        # construction (e.g. --silence-rms auto calibration).
+        self.silence_rms_threshold: float = self.SILENCE_RMS_THRESHOLD
         # Resolve string pool — validate every entry has a plucker
         if string_indices is not None:
             for s in string_indices:
@@ -170,8 +175,17 @@ class HarmonicEnv(gym.Env):
         # Active string for the current episode (set at reset)
         self.string_index = self.string_indices[0]
         self.max_steps = max_steps
-        self.success_threshold = success_threshold
+        # Use spectral-specific threshold unless caller explicitly overrode it
+        if reward_mode == REWARD_MODE_SPECTRAL and success_threshold == 0.8:
+            self.success_threshold = SPECTRAL_SUCCESS_THRESHOLD
+        else:
+            self.success_threshold = success_threshold
         self.curriculum_mode = curriculum_mode
+        if fixed_target_fret not in self.HARMONIC_FRETS:
+            raise ValueError(
+                f"fixed_target_fret={fixed_target_fret} is not in HARMONIC_FRETS {self.HARMONIC_FRETS}"
+            )
+        self.fixed_target_fret = fixed_target_fret
         self.use_simple_action_space = use_simple_action_space
         self.always_press = always_press
         
@@ -189,8 +203,11 @@ class HarmonicEnv(gym.Env):
                 "Reward = filtration layer only (fret + torque shaping)."
             )
         else:
-            if model_path is None:
-                raise ValueError("model_path is required when offline=False")
+            if model_path is None and reward_mode not in (REWARD_MODE_COSINE_SIM, REWARD_MODE_SPECTRAL):
+                raise ValueError(
+                    "model_path is required when offline=False "
+                    "(omit it only when reward_mode='cosine_sim' or 'spectral')"
+                )
             # Initialize OSC client
             self.osc_client = GuitarBotOSCClient(host=osc_host, port=osc_port)
             # Initialize reward calculator
@@ -199,9 +216,8 @@ class HarmonicEnv(gym.Env):
                 device_name=audio_device,
                 capture_duration=capture_duration,
                 reward_mode=reward_mode,
-                temperature=temperature,
-                shared_rolling_buffer=shared_rolling_buffer,
-                device_id=audio_device_id,
+                ref_dir=ref_dir,
+                fret_to_pitch=fret_to_pitch,
             )
         
         # Define action space dimensions
@@ -232,6 +248,7 @@ class HarmonicEnv(gym.Env):
         
         # Episode state
         self.current_step = 0
+        self._step_attempts = 0   # total step() calls this episode (filtered + unfiltered)
         self.target_fret = None
         self.current_fret = 0.0
         self.current_torque = 0.0
@@ -263,17 +280,21 @@ class HarmonicEnv(gym.Env):
     def _get_target_fret(self) -> int:
         """Select target fret based on curriculum mode."""
         if self.curriculum_mode == "random":
-            return np.random.choice(self.HARMONIC_FRETS)
+            return int(np.random.choice(self.HARMONIC_FRETS))
         elif self.curriculum_mode == "easy_to_hard":
-            # Fret 7 (easiest) -> Fret 5 -> Fret 4 (hardest)
+            # Fret 7 (easiest) -> Fret 5 -> Fret 4 (hardest).
+            # Progress is gated on robot_step_count (real OSC actions) rather
+            # than episode_count.  episode_count climbs instantly when the
+            # random policy generates all-filtered episodes, causing the
+            # curriculum to advance long before the agent has learned anything.
+            # 500 real robot actions ≈ 25 min at ~3 s/step per fret stage.
             curriculum_order = [7, 5, 4]
-            # Progress curriculum every 100 episodes
-            idx = min(self.episode_count // 100, len(curriculum_order) - 1)
+            idx = min(self.robot_step_count // 500, len(curriculum_order) - 1)
             return curriculum_order[idx]
         elif self.curriculum_mode == "fixed_fret":
-            return 7  # Always use fret 7 for initial training
+            return self.fixed_target_fret
         else:
-            return np.random.choice(self.HARMONIC_FRETS)
+            return int(np.random.choice(self.HARMONIC_FRETS))
     
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector (14-dim)."""
@@ -336,6 +357,7 @@ class HarmonicEnv(gym.Env):
         
         # Reset episode state
         self.current_step = 0
+        self._step_attempts = 0   # total step() calls this episode (filtered + unfiltered)
         self.current_fret = 0.0
         self.current_torque = 0.0
         self.fret_history = []
@@ -431,7 +453,10 @@ class HarmonicEnv(gym.Env):
 
             if not filt['passed']:
                 filter_reason = filt['reason']
-                reward = FILTRATION_PENALTY
+                # Fine-tune mode uses a stronger penalty scaled to its ±5 reward range.
+                reward = (-10.0 if (self.reward_calc is not None
+                                   and self.reward_calc.reward_mode == REWARD_MODE_COSINE_SIM)
+                          else FILTRATION_PENALTY)
                 reward_info = {
                     'total_reward':  reward,
                     'audio_reward':  0.0,
@@ -456,20 +481,27 @@ class HarmonicEnv(gym.Env):
                 # Action passed filtration — send to robot, capture audio, compute reward.
                 self.robot_step_count += 1
 
-                # Wait for any lingering harmonic from the previous step to decay.
+                # Wait for any harmonic bleed from the previous step to decay
+                # before committing the next action.  Proceeds immediately if
+                # already quiet or if no audio device is available.
                 self.reward_calc.wait_for_silence(
                     rms_threshold=self.silence_rms_threshold,
                     hold_duration=self.SILENCE_HOLD_DURATION,
                     timeout=self.SILENCE_TIMEOUT,
                 )
 
-                # Timestamp the action and fire the OSC command immediately.
-                t_action = time.monotonic()
                 self.osc_client.send_rlfret(rl_action)
 
-                # Onset-aligned capture: detects when the string actually rings and
-                # extracts a window anchored at the onset timestamp.
-                audio = self.reward_calc.capture_audio_from_buffer(t_action)
+                # Short pre-delay for the robot arm to physically move and pluck.
+                time.sleep(self.CAPTURE_PRE_DELAY)
+
+                # Capture audio now — the note is ringing.
+                audio = self.reward_calc.capture_audio()
+
+                # Wait out remaining ACTION_DURATION so total step time is unchanged.
+                remaining = self.ACTION_DURATION - self.CAPTURE_PRE_DELAY - self.reward_calc.capture_duration
+                if remaining > 0:
+                    time.sleep(remaining)
 
                 # Compute reward with the already-captured audio (no second capture).
                 reward_info = self.reward_calc.compute_reward(
@@ -497,16 +529,38 @@ class HarmonicEnv(gym.Env):
                         f"    reward={reward:+.3f}"
                     )
                 elif cls is not None:
-                    label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
-                    logger.info(
-                        f"\n  {step_header}\n"
-                        f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
-                        f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
-                        f"    reward={reward:+.3f}  "
-                        f"(audio={reward_info['audio_reward']:+.3f}  "
-                        f"fret={reward_info['fret_reward']:+.3f}  "
-                        f"torque={reward_info['torque_reward']:+.3f})"
-                    )
+                    assert isinstance(cls, dict)
+                    if 'cosine_sim' in reward_info:
+                        sim = reward_info['cosine_sim']
+                        result = 'harmonic' if reward > 0 else 'near-miss'
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    [{result}]  cosine_sim={sim:.4f}\n"
+                            f"    reward={reward:+.3f}"
+                        )
+                    elif self.reward_calc.reward_mode == REWARD_MODE_SPECTRAL:
+                        spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
+                        her  = cls.get('HER', 0.0)
+                        result = 'PASS' if spec >= self.success_threshold else 'fail'
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    [{result}]  spectral={spec:.3f}  HER={her:.3f}\n"
+                            f"    reward={reward:+.3f}  "
+                            f"(audio={reward_info['audio_reward']:+.3f}  "
+                            f"fret={reward_info['fret_reward']:+.3f}  "
+                            f"torque={reward_info['torque_reward']:+.3f})"
+                        )
+                    else:
+                        label = cls.get('predicted_label', f"class_{cls.get('predicted_class', '?')}")
+                        logger.info(
+                            f"\n  {step_header}\n"
+                            f"    class={label}  H={cls.get('harmonic_prob', 0):.3f}  "
+                            f"D={cls.get('dead_prob', 0):.3f}  G={cls.get('general_prob', 0):.3f}\n"
+                            f"    reward={reward:+.3f}  "
+                            f"(audio={reward_info['audio_reward']:+.3f}  "
+                            f"fret={reward_info['fret_reward']:+.3f}  "
+                            f"torque={reward_info['torque_reward']:+.3f})"
+                        )
                 else:
                     logger.info(
                         f"\n  {step_header}\n"
@@ -519,7 +573,11 @@ class HarmonicEnv(gym.Env):
         self.fret_history.append(fret_position)
         self.torque_history.append(torque)
         self.episode_rewards.append(reward)
-        self.current_step += 1
+        # Only real (unfiltered) robot steps count toward max_steps.
+        # Filtered steps are instant no-ops and should not consume the episode budget.
+        if not reward_info.get('filtered', False):
+            self.current_step += 1
+        self._step_attempts += 1
         
         # Check termination conditions
         terminated = False
@@ -528,12 +586,16 @@ class HarmonicEnv(gym.Env):
         # Success termination: only award bonus for unfiltered actions that actually
         # reached the classifier.  A filtered step (no OSC sent) cannot be a success.
         if not reward_info.get('filtered', False) and reward_info['classification'] is not None:
-            is_success = self.reward_calc.is_success(reward_info['classification'])
+            is_success = reward_info['classification']['harmonic_prob'] > self.success_threshold
             if is_success:
                 terminated = True
                 reward += 1.0  # Bonus for success
                 cls = reward_info['classification']
-                logger.info(f"Success! Harmonic prob: {cls['harmonic_prob']:.3f}")
+                if self.reward_calc.reward_mode == REWARD_MODE_SPECTRAL:
+                    spec = reward_info.get('spectral_score', cls.get('spectral_score', 0.0))
+                    logger.info(f"Success! Spectral score: {spec:.3f}")
+                else:
+                    logger.info(f"Success! Harmonic prob: {cls['harmonic_prob']:.3f}")
 
                 # Non-blocking: hand audio + metadata to the background writer.
                 if self.success_recorder is not None and self.last_audio is not None:
@@ -558,10 +620,60 @@ class HarmonicEnv(gym.Env):
                             'device_sr':      self.reward_calc.device_sr,
                         },
                     )
+
+        # Record every unfiltered step (success or not) when all_steps_recorder is set.
+        if (self.all_steps_recorder is not None
+                and not reward_info.get('filtered', False)
+                and self.last_audio is not None
+                and reward_info.get('classification') is not None):
+            _cls = reward_info['classification']
+            _is_success = _cls.get('harmonic_prob', 0.0) > self.success_threshold
+            self.all_steps_recorder.record(
+                audio=self.last_audio,
+                metadata={
+                    'episode':          self.episode_count,
+                    'step':             self.current_step,
+                    'string_index':     self.string_index,
+                    'target_fret':      self.target_fret,
+                    'fret_position':    fret_position,
+                    'torque':           torque,
+                    'outcome':          'success' if _is_success else _cls.get('predicted_label', 'unknown'),
+                    'is_success':       _is_success,
+                    'harmonic_prob':    _cls.get('harmonic_prob', 0.0),
+                    'dead_prob':        _cls.get('dead_prob', 0.0),
+                    'general_prob':     _cls.get('general_prob', 0.0),
+                    'spectral_score':   reward_info.get('spectral_score', _cls.get('spectral_score', None)),
+                    'cosine_sim':       reward_info.get('cosine_sim', None),
+                    'confidence':       _cls.get('confidence', 0.0),
+                    'predicted_label':  _cls.get('predicted_label', 'unknown'),
+                    'total_reward':     reward_info.get('total_reward', 0.0),
+                    'audio_reward':     reward_info.get('audio_reward', 0.0),
+                    'fret_reward':      reward_info.get('fret_reward', 0.0),
+                    'torque_reward':    reward_info.get('torque_reward', 0.0),
+                    'device_sr':        self.reward_calc.device_sr,
+                    'suggested_label':  'harmonic' if _is_success else _cls.get('predicted_label', 'unknown'),
+                    'reviewed':         False,
+                },
+            )
         
-        # Max steps truncation
+        # Max steps truncation (robot steps only)
         if self.current_step >= self.max_steps:
             truncated = True
+
+        # Safety cap: if the policy generates nothing but filtered actions the episode
+        # would loop forever because current_step never advances.  Force-truncate after
+        # max_steps * 200 total attempts so training/eval can always make progress.
+        # (At a 99.7% filter rate, 10 real steps need ~3333 attempts, well below 2000.
+        # This only fires when virtually every action is out of range.)
+        _max_attempts = self.max_steps * 200
+        if not truncated and not terminated and self._step_attempts >= _max_attempts:
+            truncated = True
+            logger.warning(
+                f"Episode {self.episode_count}: force-truncated after {self._step_attempts} "
+                f"attempts with only {self.current_step}/{self.max_steps} real robot steps "
+                f"(filter rate {100*(1 - self.current_step/max(self._step_attempts,1)):.1f}%). "
+                f"Policy may be stuck outside the filtration window."
+            )
         
         # Get next observation
         obs = self._get_observation()
@@ -583,10 +695,6 @@ class HarmonicEnv(gym.Env):
             'audio_rms': reward_info.get('audio_rms'),
             'step': self.current_step,
             'is_at_harmonic': rl_action.is_at_harmonic,
-            'latency_ema': (
-                self.reward_calc.latency_ema
-                if self.reward_calc is not None else None
-            ),
         }
         
         return obs, reward, terminated, truncated, info

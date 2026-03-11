@@ -1,7 +1,127 @@
 /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917
+python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef 0.3 --learning-starts 2000 --total-timesteps 10000 --pretrain
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
 python train.py --classifier svm --svm-model-path ../HarmonicsClassifier/models/svm --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --string-index 2 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history --override
 python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history
+python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history --silence-rms auto
 ./scripts/fix_audio.sh --reload
+
+python evaluate.py --model runs/good_run_2/best_model/best_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10
+
+python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/good_run_2 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --string-index 2 --curriculum fixed_fret --audio-history --silence-rms auto --fine-tune
+
+python image_analysis.py --rl  ./runs/fine_tuned/successes/ --top-n 10 --batch --rank-by cosine_sim
+
+### Retraining with -10 penalty for filter
+python train.py --model-path ../HarmonicsClassifier/models/best_model.pt --resume /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260224_140917 --ent-coef auto --learning-starts 50 --total-timesteps 10000 --record-successes --clear-buffer --string-index 2 --curriculum fixed_fret --audio-history --silence-rms auto --fine-tune
+
+### eval for ablation: just pretrained
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/pretrained/best_model/best_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_pretrained
+
+### eval for ablation: untuned model
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/classifier_no_fine_tune/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_untuned
+
+### eval: fine tuned model
+python evaluate.py --model /home/guitarbot/Documents/GitHub/guitarl/runs/fine_tuned/interrupted_model.zip --target-fret 7 --episodes 20 --image-analysis --top-n 10 --output-dir ./eval_results_fine_tuned
+
+
+# guitaRL training commands
+# Run from the guitaRL/ directory inside the guitaRL conda env.
+#
+# Recommended curriculum for fast convergence (multiplicative spectral reward):
+#   Phase 1 — teach torque (no_audio, fixed fret 7, ~5k steps)
+#   Phase 2 — activate spectral reward (fixed fret 7, ~20k steps)
+#   Phase 3 — unlock fret curriculum (easy_to_hard, ~50k steps)
+
+# ── Phase 1: torque shaping only, fixed fret 7 ───────────────────────────────
+python train.py \
+  --reward-mode no_audio \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 5000 \
+  --learning-starts 100 \
+  --osc-port 12000
+
+# ── Phase 2: spectral reward, fixed fret 7 ───────────────────────────────────
+python train.py \
+  --resume runs/harmonic_sac_20260224_140917 \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 20000 \
+  --learning-starts 50 \
+  --osc-port 12000 \
+  --record-successes
+
+
+
+python train.py \
+  --resume   /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260301_114227 \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 20000 \
+  --learning-starts 50 \
+  --osc-port 12000 \
+  --record-successes
+
+## report:
+=== Last 100 Episodes ===
+Success rate: 0.910
+Avg reward: 4.044
+Avg fret pos: 7.22
+Avg torque: 64
+episodes: 1,381
+
+python train.py \
+  --resume   /home/guitarbot/Documents/GitHub/guitarl/runs/harmonic_sac_20260301_114227 \
+  --reward-mode spectral \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 1500 \
+  --learning-starts 50 \
+  --osc-port 12000 \
+  --record-all
+# ── Phase 3: spectral, easy-to-hard fret curriculum ──────────────────────────
+python train.py \
+  --reward-mode spectral \
+  --curriculum easy_to_hard \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# ── String simulator variants (CABLE output) ──────────────────────────────────
+python train.py \
+  --reward-mode spectral \
+  --string-sim \
+  --curriculum fixed_fret \
+  --fixed-fret 7 \
+  --total-timesteps 20000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+python train.py \
+  --reward-mode spectral \
+  --string-sim \
+  --curriculum easy_to_hard \
+  --total-timesteps 50000 \
+  --learning-starts 200 \
+  --osc-port 12000
+
+# ── Analysis ──────────────────────────────────────────────────────────────────
+# Score all audio in the current runs/ directory
+python analyze_runs_audio.py
+
+# Verbose per-clip (ctrl+clickable paths)
+python analyze_runs_audio.py --run harmonic_sac --type success --verbose
+
+# Filter to fret-7 clips only
+python analyze_runs_audio.py --min-fret 6.5 --max-fret 7.5
+
+# Three-way correlation: CNN x cosine x spectral (reads from runs copy/)
+python correlate_scores.py --save-csv correlation_results.csv
+
+# Ground-truth spectral test on HarmonicsClassifier reference recordings
+python test_spectral_groundtruth.py

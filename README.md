@@ -1,15 +1,10 @@
 # guitaRL — Reinforcement Learning for Guitar Harmonics
 
 Real-robot RL system that trains a continuous-action policy to produce natural
-harmonics on [GuitarBot](../GuitarBot), a mechatronic guitar-playing robot.  A pretrained CNN
-harmonic classifier ([HarmonicsClassifier](../HarmonicsClassifier)) provides the audio reward signal.
+harmonics on [GuitarBot](../GuitarBot), a mechatronic guitar-playing robot.
+The audio reward signal is computed via **HER** (Harmonic Energy Ratio), a
+physics-based spectral analysis that measures energy at the expected harmonic partials.
 The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
-
-> **Terminology note**: The "torque" dimension in the action space controls the
-> *presser* encoder target — it is functionally a position setpoint for the
-> fretting mechanism, not directly a torque command.  The name is preserved
-> throughout the codebase for consistency with the GuitarBot firmware.
-
 ---
 
 ## Table of Contents
@@ -22,9 +17,9 @@ The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
   - [Target Harmonics](#target-harmonics)
 - [Reward Function — Two-Layer Architecture](#reward-function--two-layer-architecture)
   - [Layer 1: Filtration](#layer-1-filtration-physics-gate)
-  - [Layer 2: Audio](#layer-2-audio-classifier-reward)
+  - [Layer 2: Spectral (HER)](#layer-2-spectral-her)
 - [Multi-String Training & Motor Wear Distribution](#multi-string-training--motor-wear-distribution)
-- [Ablation Studies](#ablation-studies)
+- [Reward Modes](#reward-modes)
 - [Usage](#usage)
   - [Diagnostic Test Loop](#diagnostic-test-loop)
   - [Training](#training)
@@ -56,13 +51,13 @@ conda activate guitaRL
    - Pass `--audio-device <substring>` if your device name differs.
 
 3. **GuitarBot middleware**:
-   - Start `arm_list_recieverNN.py` (port 12000) on the GuitarBot machine before training.
+   - Start `OSC_Message_Receiver.py` (port 12000) on the GuitarBot machine before training.
    - All robot calls are serialised through a `threading.Lock()` — `/Reset` safely
      queues behind any active trajectory.
 
-4. **Classifier model**:
-   - Ensure a trained model exists at `../HarmonicsClassifier/models/best_model.pt`
-     (or pass an explicit `--model-path`).
+4. **Reward mode** (default: `spectral`):
+   - No external model required — HER computes rewards directly from audio FFT.
+   - For legacy CNN mode, see [HarmonicsClassifier](https://github.com/bakerbass/harmonicsclassifier) and pass `--reward-mode full --model-path ../HarmonicsClassifier/models/best_model.pt`. a
 
 ---
 
@@ -77,21 +72,18 @@ guitaRL/
 │   └── harmonic_env.py     # Gymnasium environment (HarmonicEnv)
 ├── utils/
 │   ├── __init__.py
-│   ├── reward.py           # All reward logic — single source of truth
-│   └── audio_reward.py     # Audio capture + classifier dispatch → reward.py
+│   ├── reward.py           # All reward logic & constants — single source of truth
+│   ├── audio_reward.py     # Audio capture + spectral/CNN dispatch → reward.py
+│   └── success_recorder.py # Async background writer for successful harmonic clips
 ├── scripts/
 │   ├── ablation_no_filtration.sh       # Ablation: bypass physics gate
-│   ├── ablation_no_audio.sh            # Ablation: no CNN, fret+torque shaping only
+│   ├── ablation_no_audio.sh            # Ablation: no audio, fret+torque shaping only
 │   ├── review_successes.py             # Interactive clip review / relabeling tool
 │   └── export_augmented_dataset.py    # Package augmented dataset zip for retraining
-├── utils/
-│   ├── __init__.py
-│   ├── reward.py           # All reward logic — single source of truth
-│   ├── audio_reward.py     # Audio capture + classifier dispatch → reward.py
-│   └── success_recorder.py # Async background writer for successful harmonic clips
 ├── train.py                # SAC training script (resume supported)
-├── test_rl_loop.py         # Diagnostic: manual action → OSC → audio → classify → reward
-├── evaluate.py             # Evaluation script
+├── test_rl_loop.py         # Diagnostic: manual action → OSC → audio → reward
+├── evaluate.py             # Evaluation script (spectral, cosine, CNN modes)
+├── image_analysis.py       # Mel spectrogram computation & cosine similarity
 ├── environment.yml         # Conda dependencies (env name: guitaRL)
 └── README.md
 ```
@@ -114,6 +106,12 @@ guitaRL/
 The string one-hot allows a **single shared policy** to learn string-specific
 fret/torque mappings, enabling multi-string training without separate models.
 
+
+> **Terminology note**: The "torque" dimension in the action space controls the
+> *presser* encoder target. It is functionally a position setpoint for the
+> fretting mechanism, not directly a torque command.  The name is preserved
+> throughout the codebase for consistency with the GuitarBot firmware.
+
 ### Action Space (5-dim, continuous, normalised to [−1, 1])
 
 | Dim | Maps to | Physical range |
@@ -130,12 +128,12 @@ gradient flow, but cannot accidentally command the wrong actuator.
 
 ### Target Harmonics
 
-| Fret | Position (mm) | Interval above open |
-|------|---------------|---------------------|
-| 4    | 112.0         | Major 17th (5th harmonic) |
-| 5    | 139.0         | Major 14th (4th harmonic) |
-| 7    | 187.0         | Perfect 12th (3rd harmonic) |
-| 9    | 211.0         | Major 10th |
+| Fret | Position (mm) | Harmonic number | Frequency (D-string) |
+|------|---------------|-----------------|----------------------|
+| 4    | 112.0         | 5th harmonic    | ~734 Hz |
+| 5    | 139.0         | 4th harmonic    | ~587 Hz |
+| 7    | 187.0         | 3rd harmonic    | ~440 Hz |
+| 9    | 211.0         | 4th harmonic (mirror) | ~587 Hz |
 
 ---
 
@@ -148,36 +146,45 @@ propagates everywhere automatically.
 
 ### Layer 1: Filtration (physics gate)
 
-A deterministic physics check runs before the CNN classifier.  If the action
+A deterministic physics check runs before spectral analysis.  If the action
 is mechanically implausible, the agent receives a flat penalty and the
-classifier is never invoked — saving inference time and giving a hard,
-unambiguous signal to avoid degenerate regions of the action space.
+audio is never analysed — saving compute and giving a hard, unambiguous
+signal to avoid degenerate regions of the action space.
 
 | Check | Threshold | Rationale |
 |-------|-----------|-----------|
-| Torque too high | > 350 | Harmonics require a light touch; heavy fretting damps the partial |
-| Torque too low | < 15 | Presser below the microcontroller's safety dead-zone |
-| Fret too far | > 3 frets from target | Outside any plausible harmonic neighbourhood |
+| Torque too high | > 120 | Harmonics require a light touch; heavy fretting damps the partial |
+| Torque too low | < 40 | Presser below the microcontroller's safety dead-zone |
+| Fret too far | > 0.3 frets from target | Outside any plausible harmonic neighbourhood |
 
-**Filtration penalty**: −1.0 (constant, independent of how far outside limits the action is).
+**Filtration penalty**: −10.0 (constant, independent of how far outside limits the action is).
 
-> **Note**: Silence detection via audio RMS was trialled but removed — onset
-> timing relative to capture windows was insufficiently reliable.
+### Layer 2: Spectral (HER)
 
-### Layer 2: Audio (classifier reward)
+Reached only when Layer 1 passes. HER (Harmonic Energy Ratio) is a physics-based
+spectral score that replaces the CNN classifier. Given a target fret, the exact
+harmonic frequencies are known — HER measures how much spectral energy is
+concentrated at those frequencies versus elsewhere.
 
-Reached only when Layer 1 passes.
+**Spectral score** (0.0 – 1.0) is a weighted sum of four components:
 
-$$r = 0.6 \cdot r_\text{audio} + 0.2 \cdot r_\text{fret} + 0.2 \cdot r_\text{torque}$$
+| Component | Weight | What it measures |
+|-----------|--------|------------------|
+| Harmonic Energy Ratio | 0.55 | Energy at expected partials (n×f0, 2n×f0, 3n×f0…) using Welch's PSD, ±3% bandwidth |
+| Open-string suppression | 0.15 | Penalises energy at 146.83 Hz (open D) — presser not touching string |
+| Fretted-note suppression | 0.15 | Penalises energy at the normal fretted pitch — presser pressing too hard |
+| Signal presence | 0.15 | Anti-silence gate — ramps 0→1 based on total energy |
 
-| Component | Formula | Range | Purpose |
-|-----------|---------|-------|---------|
-| $r_\text{audio}$ | `harmonic_prob` from CNN | [0, 1] | Does it *sound* like a harmonic? |
-| $r_\text{fret}$ | $\exp\!\left(-\dfrac{e_f^2}{2 \cdot 0.35^2}\right)$ | [0, 1] | Gaussian centred on target fret (σ = 0.35) |
-| $r_\text{torque}$ | $2\exp\!\left(-\dfrac{e_\tau^2}{2 \cdot 75^2}\right) - 1$ | [−1, 1] | Shifted Gaussian at optimal presser value 30 (σ = 75) |
+**Reward curve** (when Layer 1 passes):
 
-- Optimal presser target: **70** encoder units (light touch for harmonics)
-- **Success bonus**: +1.0 added when `harmonic_prob > 0.8`; episode terminates early
+| Condition | Reward | Notes |
+|-----------|--------|-------|
+| `spectral_score ≥ 0.75` | +3.0 × torque_factor | Success — episode terminates early |
+| `spectral_score < 0.75` | −3.0 × (1 − exp(−3 × (0.75 − score))) × torque_factor | Exponential decay toward floor |
+| Fret shaping bonus | +0.2 × Gaussian(fret_error, σ=0.35) × spectral_score | Small bonus for fret accuracy |
+
+**Torque factor**: Gaussian centred at optimal presser value 70 (σ = 50).
+At torque=70: 1.0, at torque=120: 0.57, at torque=177: 0.10.
 
 ---
 
@@ -197,18 +204,20 @@ fret/torque adjustments within a single set of network weights.
 
 ---
 
-## Ablation Studies
+## Reward Modes
 
-Three reward modes are available via `--reward-mode`:
+Five reward modes are available via `--reward-mode`:
 
-| Mode | Layer 1 | Layer 2 (CNN) | Audio captured | Purpose |
-|------|---------|---------------|----------------|---------|
-| `full` (default) | ✅ | ✅ | ✅ | Full two-layer reward |
-| `no_filtration` | ❌ bypassed | ✅ | ✅ | Isolate contribution of physics gate |
-| `no_audio` | ✅ | ❌ | ❌ | Isolate contribution of CNN; faster steps |
+| Mode | Layer 1 | Layer 2 | Audio captured | Purpose |
+|------|---------|---------|----------------|---------|
+| `spectral` (default) | ✅ | HER spectral | ✅ | Physics-based harmonic detection — no CNN required |
+| `full` | ✅ | CNN classifier | ✅ | Legacy: requires HarmonicsClassifier model |
+| `cosine_sim` | ✅ | Mel cosine similarity | ✅ | Compare against reference WAV spectrograms |
+| `no_filtration` | ❌ bypassed | CNN classifier | ✅ | Ablation: isolate contribution of physics gate |
+| `no_audio` | ✅ | ❌ | ❌ | Ablation: fret+torque shaping only; faster steps |
 
 In `no_audio` mode, fret and torque weights are rebalanced to 0.5 / 0.5.
-Ready-to-run scripts are in `scripts/`:
+Ready-to-run ablation scripts are in `scripts/`:
 
 ```bash
 ./scripts/ablation_no_filtration.sh
@@ -224,12 +233,11 @@ TOTAL_TIMESTEPS=100000 ./scripts/ablation_no_audio.sh --curriculum random
 
 ### Diagnostic Test Loop
 
-Runs the full action → OSC → audio → classify → reward pipeline manually,
+Runs the full action → OSC → audio → spectral score → reward pipeline manually,
 one note at a time, with per-note plots:
 
 ```bash
 conda run -n guitaRL python test_rl_loop.py \
-    --model ../HarmonicsClassifier/models/best_model.pt \
     --num-tests 5 \
     --target-harmonic
 ```
@@ -239,14 +247,14 @@ Pass `--no-plot` to suppress figures.
 ### Training
 
 ```bash
-# Single string
+# Single string (spectral reward — no model path needed)
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --string-index 2
 
 # Multi-string rotation (distributes motor wear across strings 0, 2, 4)
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --string-indices 0 2 4 \
     --curriculum easy_to_hard \
     --total-timesteps 50000
@@ -259,13 +267,13 @@ python train.py \
 
 ### Recording Successful Harmonics
 
-Pass `--record-successes` to save every success (classification `harmonic_prob > 0.8`) to
+Pass `--record-successes` to save every success (`spectral_score ≥ 0.75`) to
 disk as a WAV + JSON pair.  Clips are written asynchronously in a background
 thread — no impact on step latency.
 
 ```bash
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --record-successes
 ```
 
@@ -290,17 +298,12 @@ Each JSON sidecar contains the full metadata for the episode:
   "target_fret": 7,
   "fret": 7.03,
   "torque": 68,
-  "harmonic_prob": 0.93,
-  "dead_prob": 0.04,
-  "general_prob": 0.03,
-  "reward": 1.56,
+  "spectral_score": 0.82,
+  "reward": 2.45,
   "device_sr": 44100,
   "timestamp": "2026-02-18T14:32:01.412"
 }
 ```
-
-These clips feed directly into the HarmonicsClassifier retraining pipeline after
-review with `scripts/review_successes.py`.
 
 ---
 
@@ -320,12 +323,12 @@ To resume:
 ```bash
 # Auto-selects interrupted_model, or latest checkpoint in the source run
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --resume ./runs/harmonic_sac_20260218_134500
 
 # Resume from a specific checkpoint
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --resume ./runs/harmonic_sac_20260218_134500 \
     --resume-checkpoint ./runs/harmonic_sac_20260218_134500/checkpoints/harmonic_sac_5000_steps
 ```
@@ -336,7 +339,7 @@ python train.py \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model-path PATH` | *(required online)* | Path to the trained HarmonicsClassifier `.pt` file. Not required when `--pretrain` is set. |
+| `--model-path PATH` | *(unset)* | Path to HarmonicsClassifier `.pt` file. Only required for `--reward-mode full` or `no_filtration`. Not needed for `spectral`, `cosine_sim`, or `--pretrain`. |
 | `--string-index N` | `2` | Single string to train on. Must be `0`, `2`, or `4` (strings with pluckers). Ignored when `--string-indices` is provided. |
 | `--string-indices N …` | *(unset)* | One or more strings to rotate across episodes (e.g. `--string-indices 0 2 4`). At each `reset()` the active string is sampled uniformly — distributes motor wear while keeping the policy string-aware via a one-hot in the observation. Overrides `--string-index`. |
 | `--curriculum MODE` | `easy_to_hard` | Target fret schedule: `easy_to_hard` (fret 7 → 5 → 4, 100 episodes each), `random` (uniform), `fixed_fret` (always fret 7). |
@@ -384,9 +387,9 @@ python train.py \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--reset-on-exit` | on | Send `/Reset` to GuitarBot when training exits (normally or via Ctrl+C). The middleware serialises the reset behind any active trajectory, but avoid triggering this mid-motion on fragile mechanisms. |
-| `--reward-mode MODE` | `full` | Reward variant for ablation studies. `full`: both layers (default). `no_filtration`: bypass the physics gate — all actions reach the CNN. `no_audio`: skip CNN entirely, use fret + torque shaping only (weights 0.5 / 0.5). |
-| `--slow` | off | After every **episode**, pause training and display a waveform + mel spectrogram plot with classification results and reward breakdown. Close the window to continue. Use this to visually verify the classifier is hearing the note before committing to a long run. No-op with `--pretrain`. |
-| `--record-successes` | off | Save every successful harmonic (`harmonic_prob > 0.8`) to `<run-dir>/successes/` as a float32 WAV + JSON sidecar. Written asynchronously — no step latency penalty. Clips can be reviewed and relabeled with `scripts/review_successes.py` for HarmonicsClassifier retraining. No-op with `--pretrain`. |
+| `--reward-mode MODE` | `spectral` | Reward variant. `spectral`: HER-based spectral analysis (default, no CNN). `full`: CNN classifier (requires `--model-path`). `cosine_sim`: mel spectrogram cosine similarity. `no_filtration`: bypass physics gate. `no_audio`: fret+torque shaping only. |
+| `--slow` | off | After every **episode**, pause training and display a waveform + mel spectrogram plot with spectral score and reward breakdown. Close the window to continue. No-op with `--pretrain`. |
+| `--record-successes` | off | Save every successful harmonic (`spectral_score ≥ 0.75`) to `<run-dir>/successes/` as a float32 WAV + JSON sidecar. Written asynchronously — no step latency penalty. No-op with `--pretrain`. |
 | `--verbose` | off | Enable per-step `DEBUG` logging. Normally suppressed to keep the terminal readable, especially during `--pretrain` where steps are instant. |
 
 ---
@@ -407,11 +410,15 @@ python evaluate.py \
     --episodes 10
 ```
 
+Evaluation supports three success criteria:
+- **Spectral**: `spectral_score ≥ 0.75` (direct physics, no model needed)
+- **Cosine similarity**: `cosine_sim ≥ 0.85` (mel spectrogram comparison)
+- **CNN**: `harmonic_prob ≥ 0.8` (legacy, requires HarmonicsClassifier)
+
 ### Reviewing & Relabeling Clips
 
 `scripts/review_successes.py` is an interactive terminal tool for a researcher
-to listen to each saved clip and confirm or correct its label before
-retraining the classifier.
+to listen to each saved clip and confirm or correct its label.
 
 ```bash
 # Review all clips in a run's successes directory
@@ -449,32 +456,20 @@ Reviewing a clip sets `reviewed: true` in the JSON sidecar and updates
 `suggested_label` in-place — the WAV file is never modified.  A session
 summary with per-label counts is printed on exit.
 
-Reviewed clips (with accurate labels) can then be imported into the
-HarmonicsClassifier dataset for retraining:
-
-```bash
-# Copy reviewed clips into the HarmonicsClassifier data directory
-python ../HarmonicsClassifier/copy_harmonics_to_clips.py \
-    runs/harmonic_sac_TIMESTAMP/successes/ \
-    --reviewed-only
-```
-
 ---
 
 ### Exporting an Augmented Dataset
 
-`scripts/export_augmented_dataset.py` bundles the original HarmonicsClassifier
-`note_clips/` together with all reviewed RL clips into a single zip, ready to
-drop on a flash drive and retrain on another machine.
+`scripts/export_augmented_dataset.py` bundles reviewed RL clips into a single
+zip, ready to drop on a flash drive and retrain on another machine.
 
 ```bash
-# Default: uses ./runs and ../HarmonicsClassifier, writes zip to current directory
+# Default: uses ./runs, writes zip to current directory
 python scripts/export_augmented_dataset.py
 
 # Explicit paths and custom output location
 python scripts/export_augmented_dataset.py \
     --runs-dir ./runs \
-    --classifier-dir ../HarmonicsClassifier \
     --output-dir ~/Desktop
 
 # Include clips not yet reviewed (uses suggested_label as-is — use with caution)
@@ -485,23 +480,15 @@ python scripts/export_augmented_dataset.py --no-original
 ```
 
 The zip contains:
-- `note_clips/{harmonic,dead_note,general_note}/` — originals + new `RL_*` clips
-- `manifest.json` — per-run provenance, label counts, fret/torque/prob metadata
-
-**On the target machine:**
-```bash
-unzip harmonics_dataset_augmented_TIMESTAMP.zip
-# Move note_clips/ into HarmonicsClassifier/, then:
-python run_build_dataset.py
-python train_cnn.py
-```
+- `note_clips/{harmonic,dead_note,general_note}/` — new `RL_*` clips sorted by label
+- `manifest.json` — per-run provenance, label counts, fret/torque/spectral metadata
 
 ---
 
 ## Robot Safety
 
 - **`/Reset` on exit is on by default.** Pass `--reset-on-exit` to send it.
-- On the GuitarBot side, `arm_list_recieverNN.py` serialises all
+- On the GuitarBot side, `OSC_Message_Receiver.py` serialises all
   `RobotController.main()` calls through a `threading.Lock`, so a `/Reset`
   arriving during an active trajectory will block until the trajectory
   completes rather than corrupting the UDP stream.
@@ -518,8 +505,8 @@ tensorboard --logdir runs/harmonic_sac_TIMESTAMP/logs
 ```
 
 Per-step console output shows string index, target fret, commanded fret,
-presser value, classifier probabilities (H / D / G), reward decomposition,
-and filtration status when Layer 1 rejects an action.
+presser value, spectral score, reward decomposition, and filtration status
+when Layer 1 rejects an action.
 
 ---
 
@@ -619,7 +606,7 @@ and will bias the critic if kept.
 
 ```bash
 python train.py \
-    --model-path ../HarmonicsClassifier/models/best_model.pt \
+    --reward-mode spectral \
     --resume ./runs/harmonic_sac_TIMESTAMP \
     --clear-buffer \
     --ent-coef auto \
@@ -631,13 +618,13 @@ python train.py \
 |------|-----|
 | `--resume` | Loads pre-trained weights + (discarded) buffer |
 | `--clear-buffer` | Prevents offline (no-audio) transitions from biasing the online critic |
-| `--ent-coef auto` | Let SAC self-tune entropy once audio reward provides richer signal |
+| `--ent-coef auto` | Let SAC self-tune entropy once spectral reward provides richer signal |
 | `--total-timesteps` | Real-robot budget is scarcer; start small and extend if needed |
 
 > **`--clear-buffer` is a one-time flag for the offline → online transition only.**
-> Without it, the replay buffer is filled with transitions that have `audio_reward = 0`
-> by construction, which will suppress the agent's weight on audio even once the real
-> classifier starts providing signal.
+> Without it, the replay buffer is filled with transitions that have `spectral_score = 0`
+> by construction, which will suppress the agent's weight on audio even once HER
+> starts providing signal.
 > Once you are running on the robot, do **not** pass `--clear-buffer` on subsequent
 > resumes — those interruptions will have saved a buffer of real audio transitions
 > that are worth keeping.
@@ -654,10 +641,10 @@ python train.py \
    python query.py --model runs/.../best_model/best_model.zip --num-actions 10 --stochastic
 
 3. Deploy on robot — clear the offline buffer (one time only)
-   python train.py --model-path ../HarmonicsClassifier/models/best_model.pt \
+   python train.py --reward-mode spectral \
        --resume runs/harmonic_sac_PRETRAIN_TIMESTAMP --clear-buffer --ent-coef auto
 
 4. Resume an interrupted robot run — do NOT clear the buffer
-   python train.py --model-path ../HarmonicsClassifier/models/best_model.pt \
+   python train.py --reward-mode spectral \
        --resume runs/harmonic_sac_ROBOT_TIMESTAMP --ent-coef auto
 ```

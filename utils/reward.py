@@ -27,15 +27,9 @@ from typing import Dict, Optional
 HARMONIC_FRETS = [4, 5, 7, 9]
 TORQUE_OPTIMAL_HARMONIC = 70.0   # Light touch for harmonics
 TORQUE_MAX = 650.0
-TORQUE_SAFE_MIN = 60.0
+TORQUE_SAFE_MIN = 40.0
 
-FRET_TOLERANCE = 0.35             # legacy alias (= FRET_TOLERANCE_ABOVE)
-# Asymmetric fret Gaussian: being slightly above the target fret is more
-# acceptable than being below it (below = wrong side of the harmonic node).
-# σ_above is the same as the old symmetric FRET_TOLERANCE so existing
-# behaviour is preserved on the high side.
-FRET_TOLERANCE_ABOVE = 0.35   # generous — 7.1 is fine
-FRET_TOLERANCE_BELOW = 0.10   # tighter  — 6.9 is penalised more
+FRET_TOLERANCE = 0.35             # ~1/3 of a fret is acceptable
 TORQUE_TOLERANCE = 75.0          # Within 75 units of optimal
 
 # Classifier label order (must match train_cnn.py label_map)
@@ -44,13 +38,15 @@ HARMONIC_CLASS_IDX = 0
 
 SUCCESS_THRESHOLD = 0.8          # harmonic_prob above this = success
 
-# ── Filtration layer thresholds ───────────────────────────────────────
-TORQUE_HARD_MAX   = 300.0   # Anything above this is too aggressive for harmonics
-TORQUE_HARD_MIN   = 50.0    # Below this the presser barely touches the string or triggers a weird edge case
+# ── Filtration layer thresholds ─────────────────────────────────────
+# Expressed as normalized presser force [0.0, 1.0] to match the plugin's
+# formerly-normalized /fret input (force = torque / TORQUE_MAX).
+FORCE_HARD_MAX    = 120.0 / TORQUE_MAX   # raw 120 → ≈ 0.185  (data: best harmonics ≤60, nothing good >80)
+FORCE_HARD_MIN    = 40.0  / TORQUE_MAX   # raw 15  → ≈ 0.023
 FRET_MAX_ERROR    = 0.3     # More than  frets away? Not even trying
 RMS_SILENCE_THRESH = 0.005  # RETIRED — silence detection was inconsistent; kept for reference only
 
-FILTRATION_PENALTY = -1.0   # Flat penalty when filtration rejects an action
+FILTRATION_PENALTY = -10.0   # Flat penalty when filtration rejects an action
 
 # ── Layer 2 weights (audio layer) ─────────────────────────────────────
 REWARD_WEIGHT_AUDIO  = 0.45  # Classifier is the primary signal
@@ -68,40 +64,71 @@ ABLATION_NO_AUDIO_TORQUE_WEIGHT = 0.5
 # At σ=1.5  (pretrain): reward at 1 fret away ≈ 0.80
 #                        reward at 2 frets away ≈ 0.41
 #                        reward at 3 frets away ≈ 0.14 (filtration boundary)
-# The above/below asymmetry is scaled by the same ratio as online.
-PRETRAIN_FRET_TOLERANCE       = 1.5   # pretrain σ_above
-PRETRAIN_FRET_TOLERANCE_BELOW = round(
-    1.5 * FRET_TOLERANCE_BELOW / FRET_TOLERANCE_ABOVE, 4
-)  # ≈ 0.4286 — keeps the above/below ratio consistent with online mode
+# This ensures the agent always has a direction signal toward the harmonic node
+# even when exploring far from target.
+PRETRAIN_FRET_TOLERANCE = 1.5
 
 # Reward mode strings
 REWARD_MODE_FULL          = 'full'           # Layer 1 + Layer 2 (default)
 REWARD_MODE_NO_FILTRATION = 'no_filtration'  # Layer 2 only — bypass physics gate
 REWARD_MODE_NO_AUDIO      = 'no_audio'       # Layer 1 + fret/torque shaping only
+REWARD_MODE_COSINE_SIM    = 'cosine_sim'     # Layer 1 + onset-aligned mel cosine sim vs reference WAVs
+REWARD_MODE_SPECTRAL      = 'spectral'       # Layer 1 + direct spectral content analysis (HER)
 
+# ── Fine-tune (cosine_sim) reward curve ───────────────────────────────────────
+# cosine_sim >= threshold  →  +5.0 (success bonus)
+# cosine_sim <  threshold  →  -5.0 * (1 - exp(-k * (threshold - sim)))
+#   At 0.79: ≈ -0.15  (not too bad)
+#   At 0.50: ≈ -3.0   (pretty far negative)
+#   At 0.00: ≈ -4.55  (saturates near -5)
+COSINE_SIM_SUCCESS_THRESHOLD = 0.85
+COSINE_SIM_SUCCESS_REWARD    = 5.0
+COSINE_SIM_FLOOR             = -5.0   # minimum (asymptotic) reward
+COSINE_SIM_DECAY_K           = 3.0    # controls how fast reward drops below threshold
 
-# ── Shared helpers ───────────────────────────────────────────────────
+# ── Spectral content reward ─────────────────────────────────────────────
+# Physics-based: given a target fret we know the exact frequencies a natural
+# harmonic should produce.  The spectral score measures how much energy is
+# at those frequencies vs everywhere else.
 
+# D-string open frequency (Hz).  Other strings can be added later.
+D_STRING_OPEN_FREQ = 146.83  # D3, MIDI 50
 
-def _asymmetric_fret_reward(
-    fret_position: float,
-    target_fret: int,
-    sigma_above: float = FRET_TOLERANCE_ABOVE,
-    sigma_below: float = FRET_TOLERANCE_BELOW,
-) -> float:
-    """
-    Asymmetric Gaussian fret reward.
+# Which harmonic of the open string each fret produces.
+# Fret 7 = 1/3 node → 3rd harmonic, Fret 5 = 1/4 → 4th, Fret 4 = 1/5 → 5th.
+FRET_TO_HARMONIC_NUMBER = {
+    4: 5,   # 5 × 146.83 ≈ 734 Hz
+    5: 4,   # 4 × 146.83 ≈ 587 Hz
+    7: 3,   # 3 × 146.83 ≈ 440 Hz
+    9: 4,   # same node as fret 5 (mirror side)
+}
 
-    Uses σ_above when the agent overshoots the target fret (acceptable —
-    still on the harmonic node or approaching from the safe side) and σ_below
-    when it undershoots (penalised more — wrong side of the node).
+SPECTRAL_BANDWIDTH_RATIO           = 0.03   # ±3% around each partial (~50 cents)
+SPECTRAL_HER_WEIGHT                = 0.55   # Harmonic Energy Ratio
+SPECTRAL_FUND_SUPPRESS_WEIGHT      = 0.15   # Open-string fundamental suppression (presser not touching string)
+SPECTRAL_FRET_FUND_SUPPRESS_WEIGHT = 0.15   # Fretted-note fundamental suppression (presser pressing too hard)
+SPECTRAL_SIGNAL_WEIGHT             = 0.15   # Signal presence (anti-silence)
+SPECTRAL_SUCCESS_THRESHOLD         = 0.75   # spectral_score above this = success
+SPECTRAL_NOISE_FLOOR_HZ            = 80.0   # ignore energy below this
 
-        reward = exp(−signed_error² / 2σ²)
-        where σ = sigma_above if fret_pos ≥ target else sigma_below
-    """
-    signed_error = fret_position - float(target_fret)
-    sigma = sigma_above if signed_error >= 0.0 else sigma_below
-    return float(np.exp(-(signed_error ** 2) / (2.0 * sigma ** 2)))
+# Spectral reward coupling: torque factor sigma (tighter than TORQUE_TOLERANCE).
+# At σ=50: torque=70 → factor=1.0, torque=120 → factor=0.57, torque=177 → factor=0.10
+# Spectral and fret rewards are multiplied by this — bad torque collapses the total.
+SPECTRAL_TORQUE_SIGMA              = 50.0
+
+# Reward curve (when Layer 1 passes):
+#   spectral_score ≥ threshold  →  +SPECTRAL_SUCCESS_REWARD × torque_factor
+#   spectral_score <  threshold  →  SPECTRAL_FLOOR × (1 − exp(−k × (threshold − score)))
+#                                   scaled by torque_factor so bad torque also degrades
+#                                   the negative signal
+#   fret Gaussian bonus (±0.2) added in both cases as a shaping term
+#
+#   At score=threshold: total ≈ 0 + fret_bonus  (neutral)
+#   At score=1.0, opt. torque, exact fret: ≈ +3.2
+#   At score=0.0, opt. torque: ≈ −2.8
+SPECTRAL_SUCCESS_REWARD            = 3.0
+SPECTRAL_FLOOR                     = -3.0
+SPECTRAL_DECAY_K                   = 3.0
 
 
 # ── Layer 1: Filtration ───────────────────────────────────────────────
@@ -116,8 +143,13 @@ def compute_filtration(
     Physics-based gate.  Returns whether the action is sane enough to
     bother running the classifier on.
 
-    Checks: torque range, fret distance from target.
+    Checks: torque range (normalized to [0, 1]), fret distance from target.
     Silence detection (RMS) was removed — too inconsistent in practice.
+
+    The torque parameter is the raw RL torque [16..650]; it is normalized to
+    presser force [0, 1] (force = torque / TORQUE_MAX) before comparing against
+    the FORCE_HARD_MIN / FORCE_HARD_MAX thresholds, which live in the same
+    normalized space as the plugin's former /fret presserForce input.
 
     Returns:
         Dict with:
@@ -125,19 +157,22 @@ def compute_filtration(
             reason (str):   Why it was rejected (empty if passed)
             penalty (float): Reward to use when rejected
     """
-    # Check: excessive torque
-    if torque > TORQUE_HARD_MAX:
+    # Normalize raw torque to presser force [0, 1] — matches plugin's /fret scale
+    norm_force = torque / TORQUE_MAX
+
+    # Check: excessive force
+    if norm_force > FORCE_HARD_MAX:
         return {
             'passed': False,
-            'reason': f'torque_too_high ({torque:.0f} > {TORQUE_HARD_MAX:.0f})',
+            'reason': f'force_too_high ({norm_force:.3f} > {FORCE_HARD_MAX:.3f}, raw torque={torque:.0f})',
             'penalty': FILTRATION_PENALTY,
         }
 
-    # Check: torque too low (presser barely engaged)
-    if torque < TORQUE_HARD_MIN:
+    # Check: force too low (presser barely engaged)
+    if norm_force < FORCE_HARD_MIN:
         return {
             'passed': False,
-            'reason': f'torque_too_low ({torque:.0f} < {TORQUE_HARD_MIN:.0f})',
+            'reason': f'force_too_low ({norm_force:.3f} < {FORCE_HARD_MIN:.3f}, raw torque={torque:.0f})',
             'penalty': FILTRATION_PENALTY,
         }
 
@@ -180,11 +215,9 @@ def compute_audio_reward(
     # Audio reward: harmonic probability straight from classifier
     audio_reward = float(harmonic_prob)
 
-    # Fret shaping: asymmetric Gaussian centred on target fret
-    # σ_above=FRET_TOLERANCE_ABOVE on the high side (7.1 is fine)
-    # σ_below=FRET_TOLERANCE_BELOW on the low side (6.9 is penalised more)
-    fret_error  = abs(fret_position - float(target_fret))
-    fret_reward = _asymmetric_fret_reward(fret_position, target_fret)
+    # Fret shaping: Gaussian centred on target fret
+    fret_error = abs(fret_position - float(target_fret))
+    fret_reward = np.exp(-(fret_error ** 2) / (2 * FRET_TOLERANCE ** 2))
 
     # Torque shaping: shifted Gaussian, range [-1, +1]
     torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
@@ -323,10 +356,7 @@ def compute_reward_no_audio(
     if target_fret not in HARMONIC_FRETS:
         raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
 
-    _fret_tol = fret_tolerance if fret_tolerance is not None else FRET_TOLERANCE_ABOVE
-    # Scale the below-tolerance proportionally so the asymmetry ratio is
-    # preserved regardless of which tolerance (online vs pretrain) is active.
-    _fret_tol_below = _fret_tol * (FRET_TOLERANCE_BELOW / FRET_TOLERANCE_ABOVE)
+    _fret_tol = fret_tolerance if fret_tolerance is not None else FRET_TOLERANCE
 
     filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
     if not filt['passed']:
@@ -343,7 +373,7 @@ def compute_reward_no_audio(
         }
 
     fret_error    = abs(fret_position - float(target_fret))
-    fret_reward   = _asymmetric_fret_reward(fret_position, target_fret, _fret_tol, _fret_tol_below)
+    fret_reward   = np.exp(-(fret_error ** 2) / (2 * _fret_tol ** 2))
     torque_error  = abs(torque - TORQUE_OPTIMAL_HARMONIC)
     torque_reward = 2.0 * np.exp(-(torque_error ** 2) / (2 * TORQUE_TOLERANCE ** 2)) - 1.0
 
@@ -362,6 +392,156 @@ def compute_reward_no_audio(
         'target_fret':   target_fret,
         'filtered':      False,
         'filter_reason': '',
+    }
+
+
+def compute_reward_cosine_sim(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    cosine_sim: float,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Fine-tune reward: Layer 1 filtration + exponential cosine-similarity curve.
+
+    Layer 1 still runs first — physically nonsensical actions (bad torque /
+    fret way off target) get the flat -1.0 penalty before the audio signal is
+    ever consulted.
+
+    Reward curve (when Layer 1 passes):
+        cosine_sim >= 0.8  →  +5.0   (success)
+        cosine_sim <  0.8  →  -5.0 * (1 − exp(−3.0 × (0.8 − cosine_sim)))
+                               ≈ −0.15 at 0.79  (barely below threshold)
+                               ≈ −3.0  at 0.50  (fairly negative)
+                               ≈ −4.55 at 0.00  (saturates near −5)
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    # Layer 1 — use a stronger penalty in fine-tune mode to keep the agent
+    # near the harmonic node (reward range here is ±5, not ±1).
+    _FT_FILTRATION_PENALTY = -10.0
+
+    filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
+    if not filt['passed']:
+        return {
+            'total_reward':  _FT_FILTRATION_PENALTY,
+            'audio_reward':  0.0,
+            'fret_reward':   0.0,
+            'torque_reward': 0.0,
+            'fret_error':    abs(fret_position - float(target_fret)),
+            'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
+            'target_fret':   target_fret,
+            'filtered':      True,
+            'filter_reason': filt['reason'],
+            'cosine_sim':    cosine_sim,
+        }
+
+    # Layer 2: cosine-sim reward curve
+    if cosine_sim >= COSINE_SIM_SUCCESS_THRESHOLD:
+        total_reward = COSINE_SIM_SUCCESS_REWARD
+    else:
+        total_reward = COSINE_SIM_FLOOR * (
+            1.0 - np.exp(-COSINE_SIM_DECAY_K * (COSINE_SIM_SUCCESS_THRESHOLD - cosine_sim))
+        )
+
+    return {
+        'total_reward':  total_reward,
+        'audio_reward':  total_reward,  # cosine_sim is the audio signal in fine-tune mode
+        'fret_reward':   0.0,
+        'torque_reward': 0.0,
+        'fret_error':    abs(fret_position - float(target_fret)),
+        'torque_error':  abs(torque - TORQUE_OPTIMAL_HARMONIC),
+        'target_fret':   target_fret,
+        'filtered':      False,
+        'filter_reason': '',
+        'cosine_sim':    cosine_sim,
+    }
+
+
+def compute_reward_spectral(
+    fret_position: float,
+    torque: float,
+    target_fret: int,
+    spectral_score: float,
+    audio_rms: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Spectral content reward: Layer 1 filtration + signed exponential curve.
+
+    Reward is *signed* so the agent receives negative feedback for physically
+    permitted but acoustically poor actions — positive-only rewards do not
+    converge because the agent cannot distinguish "bad" from "do nothing".
+
+    Audio component (when Layer 1 passes):
+        score ≥ threshold  →  +SPECTRAL_SUCCESS_REWARD × torque_factor
+        score <  threshold  →  SPECTRAL_FLOOR × (1 − exp(−k × (threshold − score)))
+                                × torque_factor
+
+        torque_factor = exp(−torque_error² / (2 × SPECTRAL_TORQUE_SIGMA²))
+          collapses the signal (positive or negative) toward zero when the touch
+          is far from the optimal light-touch for harmonics.
+
+    Fret shaping (added to audio component, independent of torque):
+        0.20 × fret_Gaussian × spectral_score
+          → small positive signal pointing the agent toward the node;
+            zero when spectral_score is zero so there is no free fret credit.
+
+    Summary of approximate range (with optimal torque):
+        score = 1.0, exact fret  → ≈ +3.2
+        score = threshold, exact  → ≈ +0.1  (neutral)
+        score = 0.0              → ≈ −2.8
+        filtered                 → FILTRATION_PENALTY (−10.0)
+    """
+    if target_fret not in HARMONIC_FRETS:
+        raise ValueError(f"Invalid target fret: {target_fret}. Must be in {HARMONIC_FRETS}")
+
+    filt = compute_filtration(fret_position, torque, target_fret, audio_rms)
+    if not filt['passed']:
+        return {
+            'total_reward':    filt['penalty'],
+            'audio_reward':    0.0,
+            'fret_reward':     0.0,
+            'torque_reward':   0.0,
+            'fret_error':      abs(fret_position - float(target_fret)),
+            'torque_error':    abs(torque - TORQUE_OPTIMAL_HARMONIC),
+            'target_fret':     target_fret,
+            'filtered':        True,
+            'filter_reason':   filt['reason'],
+            'spectral_score':  spectral_score,
+        }
+
+    fret_error   = abs(fret_position - float(target_fret))
+    torque_error = abs(torque - TORQUE_OPTIMAL_HARMONIC)
+
+    # Torque factor: tight Gaussian [0, 1]; collapses audio signal when touch is heavy
+    torque_factor = float(np.exp(-(torque_error ** 2) / (2.0 * SPECTRAL_TORQUE_SIGMA ** 2)))
+
+    # Signed audio component — exponential curve centred on success threshold
+    if spectral_score >= SPECTRAL_SUCCESS_THRESHOLD:
+        audio_component = SPECTRAL_SUCCESS_REWARD * torque_factor
+    else:
+        gap = SPECTRAL_SUCCESS_THRESHOLD - spectral_score
+        audio_component = SPECTRAL_FLOOR * (1.0 - np.exp(-SPECTRAL_DECAY_K * gap)) * torque_factor
+
+    # Fret shaping: small positive signal toward the node (gated by spectral score)
+    fret_gaussian  = float(np.exp(-(fret_error ** 2) / (2.0 * FRET_TOLERANCE ** 2)))
+    fret_component = 0.20 * fret_gaussian * float(spectral_score)
+
+    total_reward = float(audio_component) + fret_component
+
+    return {
+        'total_reward':    total_reward,
+        'audio_reward':    float(audio_component),
+        'fret_reward':     fret_component,
+        'torque_reward':   torque_factor,   # expose factor for logging
+        'fret_error':      fret_error,
+        'torque_error':    torque_error,
+        'target_fret':     target_fret,
+        'filtered':        False,
+        'filter_reason':   '',
+        'spectral_score':  spectral_score,
     }
 
 

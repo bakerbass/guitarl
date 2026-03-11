@@ -501,6 +501,8 @@ def compare_pair(
 def batch_compare(
     rl_dir: Union[str, Path],
     ref_dir: Union[str, Path],
+    pitch_pattern: str = "pitches69",
+    rl_wavs: Optional[List[Path]] = None,
     top_n: int = 1,
     rank_by: str = "ssim",
     output_dir: Optional[Union[str, Path]] = None,
@@ -508,19 +510,23 @@ def batch_compare(
     baseline: bool = False,
     neg_ctrl_dir: Optional[Union[str, Path]] = None,
 ) -> List[Dict]:
-    """Compare all RL WAVs in rl_dir against all GB_NH pitch-69 reference WAVs.
+    """Compare RL WAVs against GB_NH reference WAVs matching pitch_pattern.
 
     Prints a ranked summary table, then plots (and optionally saves/plays) the top_n pairs.
 
     Args:
-        rl_dir:       Directory searched recursively for *.wav files.
-        ref_dir:      Directory searched for GB_NH*pitches69*.wav files.
-        top_n:        Number of best pairs to plot.
-        rank_by:      Metric used for ranking: cosine_sim | mse | ssim | pearson_r.
-        output_dir:   If given, saves each plotted figure as a PNG here.
-        play_audio:   If True, play RL then reference audio for each plotted pair.
-        baseline:     If True, compute ref-vs-ref similarity ceiling and report stats.
-        neg_ctrl_dir: If given, compare RL against dead-note clips as a negative control.
+        rl_dir:         Directory searched recursively for *.wav files (unused when rl_wavs provided).
+        ref_dir:        Directory searched for GB_NH*{pitch_pattern}*.wav files.
+        pitch_pattern:  Glob fragment used to select reference WAVs (e.g. "pitches69", "pitches78").
+                        Default "pitches69" matches the original D-string fret-7 harmonic.
+        rl_wavs:        If provided, use this list of WAV paths instead of rglob-ing rl_dir.
+                        Useful for filtering by target fret when multiple frets were evaluated.
+        top_n:          Number of best pairs to plot.
+        rank_by:        Metric used for ranking: cosine_sim | mse | ssim | pearson_r.
+        output_dir:     If given, saves each plotted figure as a PNG here.
+        play_audio:     If True, play RL then reference audio for each plotted pair.
+        baseline:       If True, compute ref-vs-ref similarity ceiling and report stats.
+        neg_ctrl_dir:   If given, compare RL against dead-note clips as a negative control.
 
     Returns:
         Sorted list of result dicts (best first).
@@ -528,14 +534,15 @@ def batch_compare(
     rl_dir = Path(rl_dir)
     ref_dir = Path(ref_dir)
 
-    rl_wavs = sorted(rl_dir.rglob("*.wav"))
-    ref_wavs = sorted(ref_dir.glob("GB_NH*pitches69*.wav"))
+    if rl_wavs is None:
+        rl_wavs = sorted(rl_dir.rglob("*.wav"))
+    ref_wavs = sorted(ref_dir.glob(f"GB_NH*{pitch_pattern}*.wav"))
 
     if not rl_wavs:
         print(f"No WAV files found under {rl_dir}")
         return []
     if not ref_wavs:
-        print(f"No GB_NH pitches69 WAVs found under {ref_dir}")
+        print(f"No GB_NH {pitch_pattern} WAVs found under {ref_dir}")
         return []
 
     print(f"Batch: {len(rl_wavs)} RL files × {len(ref_wavs)} reference files "
