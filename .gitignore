@@ -1,7 +1,9 @@
-__pycache__/*
-/utils/__pycache__/*
-runs/*
+__pycache__/
+runs/
+eval_results/
+eval_results_*/
+eval/eval_log.txt
 *.wav
 *.zip
 *.pyc
-.claude/*
+.claude/
