@@ -26,8 +26,10 @@ import time
 from pythonosc import udp_client
 import matplotlib.pyplot as plt
 
-# Add HarmonicsClassifier to path
-HARMONICS_CLASSIFIER_PATH = Path(__file__).parent.parent / "HarmonicsClassifier"
+# Add repo root and HarmonicsClassifier to path
+_REPO_ROOT = Path(__file__).parent.parent
+HARMONICS_CLASSIFIER_PATH = _REPO_ROOT.parent / "HarmonicsClassifier"
+sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(HARMONICS_CLASSIFIER_PATH))
 
 from osc_realtime_classifier import HarmonicsCNN

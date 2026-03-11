@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Optional
 import sys
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder

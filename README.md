@@ -57,7 +57,7 @@ conda activate guitaRL
 
 4. **Reward mode** (default: `spectral`):
    - No external model required — HER computes rewards directly from audio FFT.
-   - For legacy CNN mode, see [HarmonicsClassifier](https://github.com/bakerbass/harmonicsclassifier) and pass `--reward-mode full --model-path ../HarmonicsClassifier/models/best_model.pt`. a
+   - For legacy CNN mode, see [HarmonicsClassifier](https://github.com/bakerbass/harmonicsclassifier) and pass `--reward-mode full --model-path ../HarmonicsClassifier/models/best_model.pt`.
 
 ---
 
@@ -75,15 +75,24 @@ guitaRL/
 │   ├── reward.py           # All reward logic & constants — single source of truth
 │   ├── audio_reward.py     # Audio capture + spectral/CNN dispatch → reward.py
 │   └── success_recorder.py # Async background writer for successful harmonic clips
+├── eval/
+│   ├── evaluate.py         # Evaluation script (spectral, cosine, CNN modes)
+│   └── test_spectral_groundtruth.py  # Ground-truth spectral score validation
+├── analysis/
+│   ├── analyze_runs_audio.py         # Batch audio analysis across runs
+│   ├── correlate_scores.py           # Correlate spectral/cosine/CNN scores
+│   ├── inspect_runs.py               # Run inspection and summary tables
+│   └── image_analysis.py            # Mel spectrogram computation & cosine similarity
+├── tools/
+│   ├── query.py            # Ask a trained policy for a single action (no robot)
+│   └── test_rl_loop.py     # Diagnostic: manual action → OSC → audio → reward
 ├── scripts/
 │   ├── ablation_no_filtration.sh       # Ablation: bypass physics gate
 │   ├── ablation_no_audio.sh            # Ablation: no audio, fret+torque shaping only
 │   ├── review_successes.py             # Interactive clip review / relabeling tool
-│   └── export_augmented_dataset.py    # Package augmented dataset zip for retraining
+│   ├── export_augmented_dataset.py    # Package augmented dataset zip for retraining
+│   └── run_commands.txt               # Common training/eval command reference
 ├── train.py                # SAC training script (resume supported)
-├── test_rl_loop.py         # Diagnostic: manual action → OSC → audio → reward
-├── evaluate.py             # Evaluation script (spectral, cosine, CNN modes)
-├── image_analysis.py       # Mel spectrogram computation & cosine similarity
 ├── environment.yml         # Conda dependencies (env name: guitaRL)
 └── README.md
 ```
@@ -237,7 +246,7 @@ Runs the full action → OSC → audio → spectral score → reward pipeline ma
 one note at a time, with per-note plots:
 
 ```bash
-conda run -n guitaRL python test_rl_loop.py \
+conda run -n guitaRL python tools/test_rl_loop.py \
     --num-tests 5 \
     --target-harmonic
 ```
@@ -397,14 +406,14 @@ python train.py \
 ### Evaluation
 
 ```bash
-python evaluate.py \
+python eval/evaluate.py \
     --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
     --episodes 20 \
     --visualize \
     --deterministic
 
 # Test a specific fret
-python evaluate.py \
+python eval/evaluate.py \
     --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
     --target-fret 7 \
     --episodes 10
@@ -570,12 +579,12 @@ should vary across the expected fret neighbourhood.
 
 ```bash
 # Single deterministic action
-python query.py \
+python tools/query.py \
     --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
     --target-fret 7 --string 2
 
 # 10 stochastic samples — check variance across fret and torque
-python query.py \
+python tools/query.py \
     --model runs/harmonic_sac_TIMESTAMP/best_model/best_model.zip \
     --target-fret 7 --string 2 \
     --num-actions 10 --stochastic
@@ -638,7 +647,7 @@ python train.py \
    python train.py --pretrain --ent-coef 0.1 --curriculum easy_to_hard --total-timesteps 200000
 
 2. Verify policy quality
-   python query.py --model runs/.../best_model/best_model.zip --num-actions 10 --stochastic
+   python tools/query.py --model runs/.../best_model/best_model.zip --num-actions 10 --stochastic
 
 3. Deploy on robot — clear the offline buffer (one time only)
    python train.py --reward-mode spectral \

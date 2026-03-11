@@ -18,8 +18,8 @@ from pathlib import Path
 import numpy as np
 from stable_baselines3 import SAC
 
-# Make env/ and utils/ importable when run from repo root
-sys.path.insert(0, str(Path(__file__).parent))
+# Make env/ and utils/ importable when run from any subdirectory
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from env.action_space import (
     GuitarBotActionSpace,
