@@ -29,6 +29,10 @@ import torch
 from env.harmonic_env import HarmonicEnv
 from utils.success_recorder import SuccessRecorder
 
+# D-string (string_index=2) fret → MIDI note number mapping for fine-tune mode.
+# Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
+_D_STRING_FRET_TO_PITCH = {4: 78, 5: 74, 7: 69}
+
 
 # Setup logging
 logging.basicConfig(
@@ -36,45 +40,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Terminal helper
-# ---------------------------------------------------------------------------
-
-def _configure_stdin_single_char():
-    """
-    Configure stdin for single-character reads without full raw mode.
-
-    Disables ICANON (line-buffered input) and ECHO so keypresses are
-    delivered immediately without the user pressing Enter, but deliberately
-    leaves OPOST (output post-processing) untouched.  With OPOST on, the
-    kernel still inserts CR before every LF, so SB3's progress table and all
-    other stdout output prints correctly regardless of when the listener
-    thread runs.
-
-    tty.setraw() also clears OPOST, which is what causes the staircase
-    output: if any other thread writes to stdout while raw mode is active
-    (even briefly), every \\n lands without a preceding \\r.
-
-    Returns (fd, old_settings).  The caller must restore with::
-
-        termios.tcsetattr(fd, termios.TCSANOW, old_settings)
-
-    Raises if stdin is not a tty (pipes, CI runners, etc.).
-    """
-    import termios
-    fd  = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    new = termios.tcgetattr(fd)
-    # Index 3 is c_lflag — only clear ICANON and ECHO, leave everything else
-    # (especially OPOST in c_oflag / index 1) completely alone.
-    new[3] &= ~(termios.ICANON | termios.ECHO)
-    # c_cc: require 1 byte with no timeout so read() blocks until a byte arrives
-    new[6][termios.VMIN]  = 1
-    new[6][termios.VTIME] = 0
-    termios.tcsetattr(fd, termios.TCSANOW, new)
-    return fd, old
 
 
 class HarmonicProgressCallback(CallbackList):
@@ -141,7 +106,7 @@ class HarmonicProgressCallback(CallbackList):
 
 def _plot_episode_audio(audio: np.ndarray, reward_info: dict, rl_action,
                         episode_num: int, model_sr: int = 22050,
-                        capture_duration: float = 2.0) -> None:
+                        capture_duration: float = 4.0) -> None:
     """Plot waveform + mel spectrogram for one episode step (blocking)."""
     import matplotlib.pyplot as plt
     import librosa
@@ -323,13 +288,11 @@ class AudioHistoryCallback(BaseCallback):
                  output_dir: Path,
                  history_size: int = 10,
                  trigger_key: str = 'a',
-                 reward_override_cb: Optional['RewardOverrideCallback'] = None,
                  verbose: int = 0):
         super().__init__(verbose)
-        self.output_dir        = Path(output_dir)
-        self.history_size      = history_size
-        self.trigger_key       = trigger_key
-        self.reward_override_cb = reward_override_cb  # Optional: dispatch y/n here
+        self.output_dir    = Path(output_dir)
+        self.history_size  = history_size
+        self.trigger_key   = trigger_key
         self._buffer: deque = deque(maxlen=history_size)  # (audio, reward_info, rl_action)
         self._dump_event   = threading.Event()
         self._stop_event   = threading.Event()
@@ -343,24 +306,34 @@ class AudioHistoryCallback(BaseCallback):
     def _stdin_listener(self) -> None:
         """Daemon thread: poll stdin for the trigger key without blocking.
 
-        Single-char mode (ICANON+ECHO disabled, OPOST kept) is entered once
-        for the lifetime of this thread and restored in the finally block.
-        Keeping OPOST enabled means the kernel still inserts CR before every
-        LF, so SB3's progress table prints correctly at all times.
+        Raw mode is entered only for the instant a character is read, then
+        immediately restored.  This prevents tty.setraw() from holding the
+        terminal in raw mode while SB3 prints its progress table (raw mode
+        suppresses CR insertion, producing staircase output).
         """
         try:
+            import tty
             import termios
-            fd, old = _configure_stdin_single_char()
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
         except Exception:
             # No real tty (pipes, CI, etc.) — listener is a no-op
             return
 
-        try:
-          while not self._stop_event.is_set():
+        while not self._stop_event.is_set():
+            # Wait up to 100 ms for a keypress — terminal stays in cooked mode
             ready, _, _ = select.select([sys.stdin], [], [], 0.1)
             if not ready:
                 continue
-            ch = sys.stdin.read(1)
+            # Enter raw mode only for the single read, then restore immediately
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
 
             if ch == self.trigger_key:
                 if not self._dump_event.is_set():
@@ -370,25 +343,11 @@ class AudioHistoryCallback(BaseCallback):
                         f"{len(self._buffer)}/{self.history_size} clips queued.\n"
                     )
                     sys.stdout.flush()
-            # Dispatch override/skip keys to RewardOverrideCallback when it is
-            # active alongside --audio-history.  Handling them here avoids two
-            # threads racing on the same stdin file descriptor.
-            elif ch == RewardOverrideCallback.CONFIRM_KEY and self.reward_override_cb is not None:
-                self.reward_override_cb.request_override(self.reward_override_cb.confirm_reward)
-            elif ch == RewardOverrideCallback.REJECT_KEY and self.reward_override_cb is not None:
-                self.reward_override_cb.request_override(self.reward_override_cb.reject_reward)
-            elif ch in (' ', '\r', '\n') and self.reward_override_cb is not None:
-                self.reward_override_cb.release_step()
             elif ch in ('\x03', 'q'):   # Ctrl+C or q — let SB3 handle it
                 self._stop_event.set()
                 import signal, os
                 os.kill(os.getpid(), signal.SIGINT)
                 break
-        finally:
-            try:
-                termios.tcsetattr(fd, termios.TCSANOW, old)
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # SB3 callback hooks
@@ -400,16 +359,9 @@ class AudioHistoryCallback(BaseCallback):
             target=self._stdin_listener, daemon=True, name="audio-history-listener"
         )
         self._listener_thread.start()
-        keys_msg = f"'{self.trigger_key}' to dump audio"
-        if self.reward_override_cb is not None:
-            keys_msg += (
-                f", '{RewardOverrideCallback.CONFIRM_KEY}' to confirm reward "
-                f"({self.reward_override_cb.confirm_reward:+.1f}), "
-                f"'{RewardOverrideCallback.REJECT_KEY}' to reject "
-                f"({self.reward_override_cb.reject_reward:+.1f})"
-            )
         logger.info(
-            f"[audio-history] Listening on stdin — press {keys_msg}."
+            f"[audio-history] Listening on stdin — press '{self.trigger_key}' at any time "
+            f"to dump the last {self.history_size} robot audio captures to disk."
         )
 
     def _on_step(self) -> bool:
@@ -509,367 +461,12 @@ class AudioHistoryCallback(BaseCallback):
 
 
 # ---------------------------------------------------------------------------
-# Researcher reward override callback
-# ---------------------------------------------------------------------------
-
-# These values deliberately exceed the normal reward ceiling so a researcher's
-# override signal is unambiguous to the agent.  The normal per-step reward is
-# roughly in [-0.1, +2.0] (filtration penalty → full-success step + bonus).
-# Confirmed harmonics get +5.0; classifier false-positives get -3.0.
-OVERRIDE_REWARD_CONFIRM: float =  5.0
-OVERRIDE_REWARD_REJECT:  float = -3.0
-
-
-class RewardOverrideCallback(BaseCallback):
-    """
-    Lets a babysitting researcher inject a strong reward signal directly into
-    the SAC replay buffer, overriding whatever the classifier computed.
-
-    Two outcomes:
-        y  →  CONFIRM  (+5.0 by default)
-               Works for ANY step — not just classifier successes.
-               Use when:
-                 • The agent played a real harmonic the classifier missed
-                   (FALSE NEGATIVE — classifier said "not harmonic").
-                 • The classifier correctly flagged a success but you want
-                   to reinforce it more strongly.
-               On CONFIRM, the replay buffer transition is also marked as
-               terminal (done=True) regardless of what the classifier
-               decided.  This makes the Q-target purely the override reward
-               (+5.0) with no bootstrapping from the next state — giving
-               the agent an unambiguous terminal success signal even when
-               the episode would otherwise have continued.
-
-        n  →  REJECT   (-3.0 by default)
-               Use when the classifier fired a success on noise, a muted
-               string, or any false positive.  The existing done=True flag
-               in the buffer is preserved (episode correctly terminated),
-               only the reward is replaced with a strong negative.
-
-    The override is applied to the *most recently stored* replay buffer
-    transition, which is the step the researcher just observed (assuming the
-    keypress happens during or immediately after the ~3-second robot action).
-
-    Stdin integration:
-        If an AudioHistoryCallback instance is provided at construction,
-        'y'/'n' are dispatched through its existing stdin thread so the two
-        listeners don't race on the same file descriptor.  When running
-        without --audio-history, this callback starts its own stdin thread.
-    """
-
-    CONFIRM_KEY = 'y'
-    REJECT_KEY  = 'n'
-
-    def __init__(self,
-                 confirm_reward: float = OVERRIDE_REWARD_CONFIRM,
-                 reject_reward:  float = OVERRIDE_REWARD_REJECT,
-                 standalone: bool = True,
-                 verbose: int = 0):
-        """
-        Args:
-            confirm_reward: Reward injected on CONFIRM keypress (default +5.0).
-            reject_reward:  Reward injected on REJECT  keypress (default -3.0).
-            standalone:     True  → spin up own stdin listener thread.
-                            False → rely on an external caller (e.g.
-                                    AudioHistoryCallback) to call
-                                    request_override() directly.
-        """
-        super().__init__(verbose)
-        self.confirm_reward = confirm_reward
-        self.reject_reward  = reject_reward
-        self.standalone     = standalone
-        self._pending: Optional[float] = None
-        self._lock            = threading.Lock()
-        self._stop_event      = threading.Event()
-        # Gate that blocks _on_step after each real robot step until researcher
-        # presses y, n, or SPACE/ENTER.  Pre-set so filtered/instant steps
-        # that never hit the blocking path are unaffected.
-        self._step_gate       = threading.Event()
-        self._step_gate.set()
-        self._last_robot_step   = 0
-        # Buffer position pinned at the moment a robot step is detected.
-        # SB3 calls on_step() BEFORE _store_transition(), so the transition
-        # hasn't been written yet.  We save buf.pos (the slot it WILL occupy)
-        # and apply the override at the TOP of the NEXT on_step() call, by
-        # which time buf.add() has already run for that slot.
-        self._target_buf_pos: Optional[int] = None
-        # Classification / reward context saved at block-time so the apply
-        # log is accurate even though it runs a step later.
-        self._target_reward_info: dict = {}
-        self._listener_thread: Optional[threading.Thread] = None
-
-    # ------------------------------------------------------------------
-    # Public API (called from sibling callbacks or keyboard handler)
-    # ------------------------------------------------------------------
-
-    def request_override(self, value: float) -> None:
-        """Queue a reward override and release the step gate.
-
-        Only accepted while we are actively waiting (gate is clear).
-        Keypresses that arrive between steps are discarded to prevent
-        stale presses from being applied to the wrong replay buffer entry.
-        """
-        if self._step_gate.is_set():
-            # Gate is already open — no robot step is waiting for a response.
-            sys.stdout.write(
-                f'\n[override] Key ignored — no robot step is currently waiting.\n'
-                f'           Press y/n/SPACE only after the step prompt appears.\n'
-            )
-            sys.stdout.flush()
-            return
-        with self._lock:
-            self._pending = value
-        label = f'CONFIRM (+{value:.1f})' if value >= 0 else f'REJECT ({value:+.1f})'
-        sys.stdout.write(f'\n[override] {label} — unblocking.\n')
-        sys.stdout.flush()
-        self._step_gate.set()
-
-    def release_step(self) -> None:
-        """Pass this step without any override.
-
-        Only accepted while we are actively waiting (gate is clear).
-        """
-        if self._step_gate.is_set():
-            sys.stdout.write(
-                f'\n[override] Key ignored — no robot step is currently waiting.\n'
-            )
-            sys.stdout.flush()
-            return
-        sys.stdout.write('\n[override] pass — continuing.\n')
-        sys.stdout.flush()
-        self._step_gate.set()
-
-    # ------------------------------------------------------------------
-    # Standalone stdin listener (used when --audio-history is off)
-    # ------------------------------------------------------------------
-
-    def _stdin_listener(self) -> None:
-        """Daemon thread: poll stdin for 'y' / 'n' without blocking training.
-
-        Single-char mode (ICANON+ECHO disabled, OPOST kept) is entered once
-        for the lifetime of this thread and restored in the finally block.
-        """
-        try:
-            import termios
-            fd, old = _configure_stdin_single_char()
-        except Exception:
-            return  # No real tty (pipes, CI, etc.)
-
-        try:
-          while not self._stop_event.is_set():
-            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if not ready:
-                continue
-            ch = sys.stdin.read(1)
-
-            if ch == self.CONFIRM_KEY:
-                self.request_override(self.confirm_reward)
-            elif ch == self.REJECT_KEY:
-                self.request_override(self.reject_reward)
-            elif ch in (' ', '\r', '\n'):   # SPACE or ENTER — pass without override
-                self.release_step()
-            elif ch in ('\x03', 'q'):
-                self._stop_event.set()
-                import signal as _signal, os
-                os.kill(os.getpid(), _signal.SIGINT)
-                break
-        finally:
-            try:
-                termios.tcsetattr(fd, termios.TCSANOW, old)
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # SB3 callback hooks
-    # ------------------------------------------------------------------
-
-    def _get_base_env(self):
-        """Unwrap DummyVecEnv → Monitor → HarmonicEnv."""
-        try:
-            env = self.training_env.envs[0]
-            return getattr(env, 'env', env)
-        except (AttributeError, IndexError):
-            return None
-
-    def _on_training_start(self) -> None:
-        if self.standalone:
-            self._listener_thread = threading.Thread(
-                target=self._stdin_listener, daemon=True, name='reward-override-listener'
-            )
-            self._listener_thread.start()
-        logger.info(
-            f'[override] Researcher reward override ACTIVE\n'
-            f'           Training PAUSES after every real robot step until you respond.\n'
-            f'           "{self.CONFIRM_KEY}"          → CONFIRM as harmonic '
-            f'(inject {self.confirm_reward:+.1f}, mark terminal; fixes false negatives)\n'
-            f'           "{self.REJECT_KEY}"          → REJECT false-positive '
-            f'(inject {self.reject_reward:+.1f})\n'
-            f'           SPACE / ENTER  → pass, no override\n'
-            f'           Filtered steps (no robot action) are never blocked.'
-        )
-
-    def _on_step(self) -> bool:
-        base_env    = self._get_base_env()
-        reward_info = getattr(base_env, 'last_reward_info', None) or {}
-        buf         = getattr(self.model, 'replay_buffer', None)
-
-        # Read the per-step filtered flag directly from env.step()'s info dict
-        # (available in self.locals before _store_transition runs).
-        # This is the ground-truth signal for whether OSC was actually sent,
-        # avoids any robot_step_count counter drift, and works correctly across
-        # episode boundaries.
-        step_infos  = (self.locals or {}).get('infos') or [{}]
-        step_info   = step_infos[0] if step_infos else {}
-        is_filtered = step_info.get('filtered', True)   # default True = safe skip
-
-        # ── Apply any pending override from the previous blocked step ─────────
-        # SB3's ordering:  on_step()  →  _store_transition()  →  on_step() ...
-        # So by the time we arrive here, buf.add() has already written the
-        # transition that was pending from the last blocked call, and
-        # _target_buf_pos holds the exact slot it landed in.
-        target_pos = self._target_buf_pos
-        if target_pos is not None:
-            with self._lock:
-                val           = self._pending
-                self._pending = None
-            self._target_buf_pos   = None          # clear regardless of val
-            saved_info             = self._target_reward_info
-            self._target_reward_info = {}
-
-            if val is not None and buf is not None:
-                old_reward = float(buf.rewards[target_pos, 0])
-                old_done   = bool(buf.dones[target_pos, 0])
-
-                h_prob    = saved_info.get('h_prob')
-                cls_label = saved_info.get('cls_label', 'unknown')
-                filtered  = saved_info.get('filtered', False)
-
-                is_confirm = val > 0
-                success_threshold        = getattr(base_env, 'success_threshold', 0.8)
-                classifier_said_harmonic = (h_prob is not None
-                                            and h_prob >= success_threshold)
-                is_false_negative = (is_confirm
-                                     and not classifier_said_harmonic
-                                     and not filtered)
-
-                buf.rewards[target_pos, 0] = float(val)
-                # CONFIRM: mark terminal so Q-target = override reward only.
-                if is_confirm:
-                    buf.dones[target_pos, 0] = True
-
-                if h_prob is not None:
-                    ctx = f'classifier={cls_label}  H={h_prob:.3f}'
-                elif filtered:
-                    ctx = 'filtered step'
-                else:
-                    ctx = 'no classification'
-
-                tag        = 'CONFIRM ✓' if is_confirm else 'REJECT  ✗'
-                fn_note    = '  ← FALSE NEGATIVE CORRECTION' if is_false_negative else ''
-                done_patch = (f'{old_done} → True'
-                              if (is_confirm and not old_done) else str(old_done))
-
-                logger.info(
-                    f'\n{"=" * 60}\n'
-                    f'  [override] {tag}{fn_note}\n'
-                    f'  Buffer pos {target_pos}:\n'
-                    f'    reward: {old_reward:+.4f}  →  {val:+.4f}\n'
-                    f'    done:   {done_patch}\n'
-                    f'    context: {ctx}\n'
-                    f'{"=" * 60}\n'
-                )
-                fn_suffix = ' (false-negative correction)' if is_false_negative else ''
-                sys.stdout.write(
-                    f'  [override] {tag}{fn_suffix}  '
-                    f'reward {old_reward:+.3f} → {val:+.3f}  |  {ctx}\n'
-                )
-                sys.stdout.flush()
-
-        # ── Gate on new real robot steps ──────────────────────────────────────
-        # Block on every step where OSC was actually sent (not filtered).
-        # We use the per-step filtered flag from env.step()'s info dict
-        # (self.locals['infos'][0]['filtered']) rather than robot_step_count so
-        # there is no counter to drift or reset between episodes / resumes.
-        if not is_filtered:
-            try:
-
-                # Clear any stale pending left over from a previous pass.
-                with self._lock:
-                    self._pending = None
-
-                # Pin the slot where THIS transition WILL be stored.
-                # on_step() fires BEFORE _store_transition(), so buf.pos is the
-                # next-write pointer — exactly where this step's data will land.
-                if buf is not None:
-                    self._target_buf_pos = buf.pos % buf.buffer_size
-                else:
-                    self._target_buf_pos = None
-
-                # Capture classification context NOW (reward_info is stale in the
-                # next on_step() call where we actually apply the override).
-                cls       = reward_info.get('classification') or {}
-                h_prob    = cls.get('harmonic_prob')
-                cls_label = cls.get('predicted_label', 'unknown')
-                # Current reward comes from SB3's locals, NOT the buffer
-                # (the transition hasn't been stored there yet).
-                rewards_arr    = self.locals.get('rewards')
-                current_reward = (float(rewards_arr[0])
-                                  if rewards_arr is not None
-                                  else reward_info.get('total_reward', 0.0))
-                self._target_reward_info = {
-                    'h_prob'    : h_prob,
-                    'cls_label' : cls_label,
-                    'filtered'  : is_filtered,
-                }
-
-                if h_prob is not None:
-                    ctx = (f'classifier={cls_label}  H={h_prob:.3f}  '
-                           f'reward={current_reward:+.3f}  buf_pos={self._target_buf_pos}')
-                else:
-                    ctx = (f'no classification  '
-                           f'reward={current_reward:+.3f}  buf_pos={self._target_buf_pos}')
-
-                # Make sure the gate is in a clean state before we wait.
-                # Guard: if the previous wait released but the key was pressed
-                # in the tiny window before this clear, we clear it here so
-                # we don't skip this step.
-                self._step_gate.clear()
-                sys.stdout.write(
-                    f'\n[override] Robot step complete — {ctx}\n'
-                    f'           y=CONFIRM({self.confirm_reward:+.0f})  '
-                    f'n=REJECT({self.reject_reward:+.0f})  '
-                    f'SPACE/ENTER=pass\n'
-                )
-                sys.stdout.flush()
-
-                # Block until key pressed.  300 s timeout auto-passes so a dead
-                # terminal can't deadlock training indefinitely.
-                triggered = self._step_gate.wait(timeout=300)
-                if not triggered:
-                    sys.stdout.write('\n[override] 5-minute timeout — auto-pass.\n')
-                    sys.stdout.flush()
-                # Do NOT apply here — return now so _store_transition() can run.
-                # The apply happens at the top of the next _on_step() call.
-
-            except Exception as exc:  # pragma: no cover
-                logger.error(f'[override] Unexpected error in gate section: {exc}', exc_info=True)
-                # Ensure gate is open so training doesn't deadlock.
-                self._step_gate.set()
-
-        return True
-
-    def _on_training_end(self) -> None:
-        self._stop_event.set()
-        self._step_gate.set()   # unblock in case training ends while gate is held
-
-
-# ---------------------------------------------------------------------------
 
 def make_env(model_path, curriculum_mode: str, string_indices=None, string_index: int = 2,
              osc_port: int = 12000, audio_device: str = "Scarlett",
              reward_mode: str = 'full', offline: bool = False,
-             success_recorder=None, temperature: float = 1.5,
-             shared_rolling_buffer=None, audio_device_id: Optional[int] = None):
+             success_recorder=None, all_steps_recorder=None, fixed_target_fret: int = 7,
+             ref_dir=None, fret_to_pitch=None):
     """Create and wrap HarmonicEnv."""
     env = HarmonicEnv(
         model_path=model_path,
@@ -878,14 +475,15 @@ def make_env(model_path, curriculum_mode: str, string_indices=None, string_index
         osc_port=osc_port,
         audio_device=audio_device,
         curriculum_mode=curriculum_mode,
+        fixed_target_fret=fixed_target_fret,
         max_steps=10,
         success_threshold=0.8,
         reward_mode=reward_mode,
         offline=offline,
         success_recorder=success_recorder,
-        temperature=temperature,
-        shared_rolling_buffer=shared_rolling_buffer,
-        audio_device_id=audio_device_id,
+        all_steps_recorder=all_steps_recorder,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
     env = Monitor(env)
     return env
@@ -929,7 +527,6 @@ def train(args):
     logger.info(f"Model path: {args.model_path}")
     logger.info(f"Curriculum: {args.curriculum}")
     logger.info(f"Reward mode: {args.reward_mode}")
-    logger.info(f"Classifier temperature: {args.temperature}")
 
     if args.pretrain:
         logger.info(
@@ -953,6 +550,30 @@ def train(args):
     elif args.record_successes and args.pretrain:
         logger.warning("[record-successes] No-op in --pretrain mode (no audio captured).")
 
+    all_steps_recorder = None
+    if args.record_all and not args.pretrain:
+        all_steps_recorder = SuccessRecorder(output_dir / "all_steps")
+        logger.info("[record-all] Recording every unfiltered step to all_steps/")
+    elif args.record_all and args.pretrain:
+        logger.warning("[record-all] No-op in --pretrain mode (no audio captured).")
+
+    # Resolve fine-tune mode: cosine_sim reward + reference WAV loading
+    reward_mode = args.reward_mode
+    ref_dir = None
+    fret_to_pitch = None
+    if args.fine_tune:
+        reward_mode = 'cosine_sim'
+        ref_dir = Path(args.ref_dir)
+        if not ref_dir.exists():
+            logger.error(f"--ref-dir not found: {ref_dir}")
+            sys.exit(1)
+        # D-string mapping (string_index=2); extend here for other strings if needed
+        fret_to_pitch = _D_STRING_FRET_TO_PITCH
+        logger.info(
+            f"[fine-tune] cosine_sim mode active — ref dir: {ref_dir}, "
+            f"fret→pitch: {fret_to_pitch}"
+        )
+
     # Create environment
     logger.info("Creating environment...")
     env = make_env(
@@ -961,62 +582,53 @@ def train(args):
         string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device,
-        reward_mode=args.reward_mode,
+        reward_mode=reward_mode,
         offline=args.pretrain,
         success_recorder=success_recorder,
-        temperature=args.temperature,
-        audio_device_id=getattr(args, 'audio_device_id', None),
+        all_steps_recorder=all_steps_recorder,
+        fixed_target_fret=args.fixed_fret,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
 
-    # Create evaluation environment, sharing the training env's audio buffer
-    # so only one InputStream is opened on the hardware device.
-    train_rolling_buffer = None
-    if not args.pretrain:
-        train_base = env.unwrapped  # type: ignore[assignment]
-        if hasattr(train_base, 'reward_calc') and train_base.reward_calc is not None:
-            train_rolling_buffer = train_base.reward_calc._rolling_buffer
+    # Create evaluation environment
     eval_env = make_env(
         model_path=args.model_path,
         curriculum_mode="random",  # Evaluate on all frets
         string_indices=string_indices,
         osc_port=args.osc_port,
         audio_device=args.audio_device,
-        reward_mode=args.reward_mode,
+        reward_mode=reward_mode,
         offline=args.pretrain,
-        temperature=args.temperature,
-        shared_rolling_buffer=train_rolling_buffer,
+        fixed_target_fret=args.fixed_fret,
+        ref_dir=ref_dir,
+        fret_to_pitch=fret_to_pitch,
     )
 
-    # ── Silence-gate threshold calibration ────────────────────────────────────
-    # Resolve the --silence-rms value for both envs.  "auto" measures the
-    # ambient noise floor from the rolling buffer that was just started inside
-    # HarmonicRewardCalculator.__init__(); a numeric value is used as-is.
+    # ── Silence-gate threshold ─────────────────────────────────────────────────
+    # No-op in pretrain mode (no audio hardware).  In online mode, resolve
+    # --silence-rms: measure ambient noise floor ("auto") or use the given float.
     if not args.pretrain:
-        silence_rms_str = args.silence_rms
-        train_base: HarmonicEnv = env.unwrapped  # type: ignore[assignment]
-        eval_base:  HarmonicEnv = eval_env.unwrapped  # type: ignore[assignment]
-        if silence_rms_str.lower() == 'auto':
-            if train_base.reward_calc is not None:
-                logger.info("--silence-rms auto: calibrating from ambient noise floor...")
-                threshold = train_base.reward_calc.calibrate_silence_threshold(
-                    duration=2.0, multiplier=1.5
-                )
-                train_base.silence_rms_threshold = threshold
-                eval_base.silence_rms_threshold  = threshold
-                logger.info(f"Silence RMS threshold set to {threshold:.6f}")
-            else:
-                logger.warning("--silence-rms auto: no reward_calc found, using default.")
+        train_base: HarmonicEnv = env.unwrapped      # type: ignore[assignment]
+        eval_base:  HarmonicEnv = eval_env.unwrapped # type: ignore[assignment]
+        silence_rms_str = args.silence_rms.strip().lower()
+        if silence_rms_str == 'auto':
+            logger.info("--silence-rms auto: measuring ambient noise floor (2 s)...")
+            threshold = train_base.reward_calc.calibrate_silence_threshold(
+                duration=2.0, multiplier=3.0
+            )
         else:
             try:
                 threshold = float(silence_rms_str)
-                train_base.silence_rms_threshold = threshold
-                eval_base.silence_rms_threshold  = threshold
-                logger.info(f"Silence RMS threshold set to {threshold:.6f} (manual)")
+                logger.info(f"--silence-rms: using manual threshold {threshold:.6f}")
             except ValueError:
-                logger.error(
-                    f"--silence-rms '{silence_rms_str}' is not a valid float or 'auto'. "
-                    "Using default."
+                logger.warning(
+                    f"--silence-rms '{args.silence_rms}' is not a float or 'auto'; "
+                    "using default 0.005"
                 )
+                threshold = 0.005
+        train_base.silence_rms_threshold = threshold
+        eval_base.silence_rms_threshold  = threshold
 
     # Configure SAC agent
     logger.info("Configuring SAC agent...")
@@ -1124,33 +736,19 @@ def train(args):
         # value (see SAC constructor above).  RobotLearningStartCallback lowers
         # it to 0 once enough real robot actions have been collected.
         cb_list.append(RobotLearningStartCallback(args.learning_starts))
-    _audio_plot = args.slow or getattr(args, 'test_audio', False)
-    if _audio_plot and not args.pretrain:
+    if args.slow and not args.pretrain:
         cb_list.append(SlowModeCallback())
-        flag_name = '--test-audio' if getattr(args, 'test_audio', False) and not args.slow else '--slow'
         logger.info(
-            f'[slow] {flag_name} enabled: training will pause after every episode to plot audio. '
+            '[slow] Slow-mode enabled: training will pause after every episode to plot audio. '
             'Close the plot window to continue.'
         )
-    elif _audio_plot and args.pretrain:
-        logger.warning('[slow] --slow / --test-audio has no effect in --pretrain mode (no audio captured).')
+    elif args.slow and args.pretrain:
+        logger.warning('[slow] --slow has no effect in --pretrain mode (no audio captured).')
 
     if args.audio_history and not args.pretrain:
-        # Build the override callback first (may be None) so it can be wired
-        # into AudioHistoryCallback's stdin dispatcher to avoid stdin races.
-        override_cb: Optional[RewardOverrideCallback] = None
-        if args.override:
-            override_cb = RewardOverrideCallback(
-                confirm_reward=args.override_confirm_reward,
-                reject_reward=args.override_reject_reward,
-                standalone=False,   # AudioHistoryCallback owns the stdin thread
-            )
-            cb_list.append(override_cb)
-
         audio_history_cb = AudioHistoryCallback(
             output_dir=output_dir / 'audio_dumps',
             history_size=args.audio_history_size,
-            reward_override_cb=override_cb,
         )
         cb_list.append(audio_history_cb)
         logger.info(
@@ -1159,19 +757,6 @@ def train(args):
         )
     elif args.audio_history and args.pretrain:
         logger.warning('[audio-history] --audio-history has no effect in --pretrain mode (no audio captured).')
-        if args.override and args.pretrain:
-            logger.warning('[override] --override has no effect in --pretrain mode (no audio captured).')
-    else:
-        # No audio-history — wire standalone override if requested
-        if args.override and not args.pretrain:
-            override_cb = RewardOverrideCallback(
-                confirm_reward=args.override_confirm_reward,
-                reject_reward=args.override_reject_reward,
-                standalone=True,    # Owns its own stdin listener thread
-            )
-            cb_list.append(override_cb)
-        elif args.override and args.pretrain:
-            logger.warning('[override] --override has no effect in --pretrain mode (no audio captured).')
 
     callbacks = CallbackList(cb_list)
     
@@ -1205,7 +790,7 @@ def train(args):
         # mechanical malfunction (both threads call RobotController.main() at
         # the same time, corrupting the UDP stream).
         #
-        # The GuitarBot's arm_list_recieverNN.py now serialises all robot calls
+        # The GuitarBot's OSC_Message_Receiver.py now serialises all robot calls
         # through a robot_lock, so a /Reset sent after Ctrl+C will wait for the
         # current trajectory to finish before executing — but only send it if
         # you are confident the robot has finished its last action.
@@ -1214,6 +799,10 @@ def train(args):
         if success_recorder is not None:
             logger.info("[record-successes] Flushing pending writes...")
             success_recorder.close()
+
+        if all_steps_recorder is not None:
+            logger.info("[record-all] Flushing pending writes...")
+            all_steps_recorder.close()
 
         if args.pretrain:
             logger.info("Offline pre-training complete. No robot reset needed.")
@@ -1228,7 +817,7 @@ def train(args):
         else:
             logger.info(
                 "Robot holds its last position. "
-                "Send /Reset manually from arm_list_recieverNN.py when safe, "
+                "Send /Reset manually from OSC_Message_Receiver.py when safe, "
                 "or restart training with --reset-on-exit."
             )
         
@@ -1257,14 +846,16 @@ def main():
                         help='OSC port (default: 12000 for GuitarBot, 8000 for StringSim)')
     parser.add_argument('--audio-device', type=str, default='Scarlett',
                         help='Audio input device name substring (default: Scarlett)')
-    parser.add_argument('--audio-device-id', type=int, default=None,
-                        help='Force a specific sounddevice device index, bypassing name '
-                             'search (use arecord -l or python -m sounddevice to list IDs). '
-                             'Useful when the named hw: device conflicts with PipeWire; '
-                             'e.g. --audio-device-id 6 to use sysdefault/PipeWire bridge.')
+    parser.add_argument('--string-sim', action='store_true',
+                        help='Use VB-Audio CABLE output as audio device (string simulator mode). '
+                             'Sets --audio-device to "CABLE output" unless overridden explicitly.')
     parser.add_argument('--curriculum', type=str, default='easy_to_hard',
                         choices=['random', 'easy_to_hard', 'fixed_fret'],
                         help='Curriculum learning mode')
+    parser.add_argument('--fixed-fret', type=int, default=7,
+                        choices=[4, 5, 7],
+                        help='Target fret when --curriculum fixed_fret is used (default: 7). '
+                             'Must be one of the harmonic frets [4, 5, 7].')
     
     # Training arguments
     parser.add_argument('--total-timesteps', type=int, default=2000, help='Total training timesteps')
@@ -1324,15 +915,13 @@ def main():
                              'Default: ON (robot resets on exit).')    
     # Reward / ablation
     parser.add_argument('--reward-mode', type=str, default='full',
-                        choices=['full', 'no_filtration', 'no_audio'],
+                        choices=['full', 'no_filtration', 'no_audio', 'spectral'],
                         help='Reward function variant for ablation studies. '
                              '"full" (default): two-layer reward (filtration + CNN). '
                              '"no_filtration": skip physics gate, all actions reach the CNN. '
-                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights).')
-    parser.add_argument('--temperature', type=float, default=1.5,
-                        help='Temperature for classifier logit scaling before softmax (default: 1.5). '
-                             'Values > 1 produce softer, less overconfident harmonic probabilities. '
-                             'T=1.0 is equivalent to standard softmax.')
+                             '"no_audio": skip CNN entirely, use fret+torque shaping only (0.5/0.5 weights). '
+                             '"spectral": filtration + direct spectral content analysis (harmonic energy ratio). '
+                             'No CNN model required.')    
     # Device
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'],
@@ -1346,6 +935,11 @@ def main():
                              'Output: <run-dir>/successes/  — review with --slow or any audio '
                              'player, edit suggested_label in the JSON, then feed back into '
                              'HarmonicsClassifier retraining. No-op in --pretrain mode.')
+    parser.add_argument('--record-all', action='store_true', default=False,
+                        help='Record every unfiltered robot step (not just successes) as '
+                             'WAV + JSON to <run-dir>/all_steps/. Same format as successes/ '
+                             'but includes dead_note and general_note outcomes with '
+                             'outcome/is_success tags. No-op in --pretrain mode.')
 
     # Slow / debug
     parser.add_argument('--slow', action='store_true', default=False,
@@ -1354,12 +948,6 @@ def main():
                              'results and reward breakdown. Close the plot window to continue. '
                              'Use this to visually verify the classifier is hearing the note '
                              'before committing to a long run. No-op in --pretrain mode.')
-
-    parser.add_argument('--test-audio', action='store_true', default=False,
-                        help='Alias for --slow. After every episode plot the captured audio '
-                             'waveform + mel spectrogram to confirm the audio pipeline is '
-                             'working correctly. Identical behaviour to --slow: blocks training '
-                             'until the plot window is closed. No-op in --pretrain mode.')
 
     parser.add_argument('--audio-history', action='store_true', default=True,
                         help='Keep a rolling buffer of the last N real robot audio captures '
@@ -1372,38 +960,29 @@ def main():
                         help='Number of recent robot audio captures to keep in the rolling '
                              'buffer for --audio-history (default: 5).')
 
-    # Researcher reward override
-    parser.add_argument('--override', action='store_true', default=False,
-                        help='Enable researcher reward override during babysitting. '
-                             'Press "y" at any time during a robot action to CONFIRM the '
-                             'step as a real harmonic — this works on ANY step, including '
-                             'ones the classifier labelled as non-harmonic (false negatives). '
-                             'The transition is marked terminal and given '
-                             '--override-confirm-reward (default +5.0). '
-                             'Press "n" to REJECT a classifier false-positive '
-                             '(injects --override-reject-reward, default -3.0; keeps existing '
-                             'done flag). '
-                             'Both values far exceed the normal reward ceiling (~+2.0), so the '
-                             'override unambiguously dominates the agent\'s learning. '
-                             'The keypress is captured by the same stdin thread as '
-                             '--audio-history when both are active (no race condition). '
-                             'No-op in --pretrain mode.')
-    parser.add_argument('--override-confirm-reward', type=float, default=OVERRIDE_REWARD_CONFIRM,
-                        metavar='R',
-                        help=f'Reward injected when the researcher presses "y" (CONFIRM). '
-                             f'Should be >> the normal max reward (~+2.0). '
-                             f'Default: {OVERRIDE_REWARD_CONFIRM}')
-    parser.add_argument('--override-reject-reward', type=float, default=OVERRIDE_REWARD_REJECT,
-                        metavar='R',
-                        help=f'Reward injected when the researcher presses "n" (REJECT). '
-                             f'Should be a strong negative well below 0. '
-                             f'Default: {OVERRIDE_REWARD_REJECT}')
-    # Silence-gate threshold
+    # Fine-tune mode (cosine similarity reward)
+    parser.add_argument('--fine-tune', action='store_true', default=False,
+                        help='Fine-tune using cosine similarity against reference dataset WAVs '
+                             'instead of the CNN classifier.  The agent receives a reward equal '
+                             'to the best mel-spectrogram cosine similarity (0–1) between the '
+                             'captured audio and onset-aligned reference recordings in --ref-dir. '
+                             'cosine_sim >= 0.8 counts as success (same threshold as CNN). '
+                             'Requires --ref-dir.  --model-path becomes optional in this mode.')
+    parser.add_argument('--ref-dir', type=str,
+                        default='../HarmonicsClassifier/note_clips/harmonic',
+                        help='Reference WAV directory for --fine-tune mode. '
+                             'WAVs are matched by pitch pattern derived from the fret-to-pitch '
+                             'mapping for the D string (fret4=pitches78, fret5=pitches74, '
+                             'fret7=pitches69).  Default: %(default)s')
+
+    # Silence gate
     parser.add_argument('--silence-rms', type=str, default='auto', metavar='THRESHOLD',
-                        help='RMS threshold for the pre-step silence gate.  '
-                             'Pass a numeric value (e.g. 0.005) to use it directly, '
-                             'or "auto" (default) to measure the ambient noise floor '
-                             'at startup and set the threshold to 3× that value.')
+                        help='RMS threshold for the pre-step silence gate that waits for '
+                             'harmonic bleed to decay.  Pass a float (e.g. 0.005) to use '
+                             'it directly, or "auto" (default) to measure the ambient noise '
+                             'floor at startup and set the threshold to 3× that value.  '
+                             'No-op in --pretrain mode.')
+
     # Verbosity
     parser.add_argument('--verbose', action='store_true', default=False,
                         help='Enable per-step debug logging. In --pretrain mode steps are '
@@ -1412,18 +991,25 @@ def main():
 
     args = parser.parse_args()
 
+    if args.string_sim and args.audio_device == 'Scarlett':
+        args.audio_device = 'CABLE output'
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Validate model path (not required for offline pre-training)
-    if args.pretrain:
+    # Validate model path
+    # Not required for offline pre-training, fine-tune (cosine_sim), or spectral mode.
+    _no_cnn_modes = ('spectral',)
+    if args.pretrain or args.fine_tune or args.reward_mode in _no_cnn_modes:
         if args.model_path is not None and not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")
             sys.exit(1)
     else:
         if args.model_path is None:
             logger.error("--model-path is required for online training. "
-                         "Use --pretrain to run without a robot/audio setup.")
+                         "Use --pretrain to run without a robot/audio setup, "
+                         "--fine-tune to use cosine similarity, "
+                         "or --reward-mode spectral for direct spectral analysis.")
             sys.exit(1)
         if not Path(args.model_path).exists():
             logger.error(f"Model not found: {args.model_path}")

@@ -1,0 +1,22 @@
+{
+  "episode": 20,
+  "step": 2,
+  "string_index": 2,
+  "target_fret": 7,
+  "fret_position": 7.044918537139893,
+  "torque": 126.58320617675781,
+  "harmonic_prob": "0.90026546",
+  "dead_prob": "0.0006100677",
+  "general_prob": "0.09912442",
+  "confidence": 0.9002654552459717,
+  "predicted_label": "harmonic",
+  "total_reward": 0.7801039704294459,
+  "audio_reward": 0.9002654552459717,
+  "fret_reward": 0.9917984099975192,
+  "torque_reward": 0.504642381626442,
+  "device_sr": 44100,
+  "wav_file": "000019_20260227_131332_str2_fret7.04_torque127.wav",
+  "sample_rate": 44100,
+  "suggested_label": "harmonic",
+  "reviewed": false
+}

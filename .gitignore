@@ -1,4 +1,7 @@
 __pycache__/*
 /utils/__pycache__/*
 runs/*
+*.wav
+*.zip
 *.pyc
+.claude/*

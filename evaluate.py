@@ -12,32 +12,252 @@ from pathlib import Path
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Dict
+from typing import List, Dict, Optional
 import sys
 
 from stable_baselines3 import SAC
 from env.harmonic_env import HarmonicEnv
+from utils.success_recorder import SuccessRecorder
+from utils.reward import (
+    REWARD_MODE_FULL, REWARD_MODE_NO_FILTRATION,
+    REWARD_MODE_SPECTRAL, REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO,
+    COSINE_SIM_SUCCESS_THRESHOLD, SPECTRAL_SUCCESS_THRESHOLD,
+    D_STRING_OPEN_FREQ, FRET_TO_HARMONIC_NUMBER,
+    SPECTRAL_BANDWIDTH_RATIO, SPECTRAL_HER_WEIGHT,
+    SPECTRAL_FUND_SUPPRESS_WEIGHT, SPECTRAL_SIGNAL_WEIGHT,
+    SPECTRAL_NOISE_FLOOR_HZ,
+)
+
+# D-string (string_index=2) fret → MIDI note number mapping.
+# Source: GuitarBot/Recording/HARMONICS_RECORDING_README.md
+#   Harmonic #1 (4th fret)  → MNN 78
+#   Harmonic #2 (5th fret)  → MNN 74
+#   Harmonic #3 (7th fret)  → MNN 69
+_D_STRING_FRET_TO_PITCH: Dict[int, int] = {4: 78, 5: 74, 7: 69}
+_D_STRING_OPEN_MIDI: int = 50  # D3, open D string (~146.83 Hz)
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False):
+def _load_ref_mels(ref_dir: Path, fret_to_pitch: Dict[int, int]) -> Dict[int, list]:
+    """Pre-load and mel-encode reference WAVs, keyed by fret. Returns {} on import error."""
+    try:
+        import librosa
+        from image_analysis import compute_mel_db
+    except ImportError as exc:
+        logger.warning(f"[cosine-success] Cannot load reference mels: {exc}")
+        return {}
+
+    _SR = 22050
+    _HOP = 512
+    _MAX_ONSET_SAMPLES = _SR
+
+    def _norm01(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y):
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    ref_mels: Dict[int, list] = {}
+    for fret, pitch in fret_to_pitch.items():
+        wavs = sorted(ref_dir.glob(f"GB_NH*pitches{pitch}*.wav"))
+        mels = []
+        for wav in wavs:
+            try:
+                y, _ = librosa.load(str(wav), sr=_SR, mono=True)
+                y = _onset_align(y)
+                if len(y) >= int(0.5 * _SR):
+                    mels.append(_norm01(compute_mel_db(y, sr=_SR)))
+            except Exception as exc:
+                logger.warning(f"[cosine-success] Skipped ref {wav.name}: {exc}")
+        ref_mels[fret] = mels
+        logger.info(f"[cosine-success] Fret {fret} (pitch {pitch}): {len(mels)} reference spectrograms loaded")
+    return ref_mels
+
+
+def _cosine_sim_for_audio(audio: np.ndarray, fret: int, ref_mels: Dict[int, list],
+                           device_sr: int = 44100) -> float:
+    """Compute best cosine similarity between one audio capture and reference mels for a fret."""
+    try:
+        import librosa
+        from image_analysis import compute_mel_db, compute_similarity_metrics
+    except ImportError:
+        return 0.0
+
+    _SR = 22050
+    _HOP = 512
+    _MAX_ONSET_SAMPLES = _SR
+
+    def _norm01(arr):
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y):
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    refs = ref_mels.get(fret, [])
+    if not refs:
+        return 0.0
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+    y = _onset_align(y)
+    if len(y) < int(0.5 * _SR):
+        return 0.0
+
+    mel_rl = _norm01(compute_mel_db(y, sr=_SR))
+    best_cos = 0.0
+    for mel_ref in refs:
+        t = min(mel_rl.shape[1], mel_ref.shape[1])
+        m = compute_similarity_metrics(mel_rl[:, :t], mel_ref[:, :t])
+        if m['cosine_sim'] > best_cos:
+            best_cos = m['cosine_sim']
+    return float(np.clip(best_cos, 0.0, 1.0))
+
+
+def _detect_pitch_hz(audio: np.ndarray, device_sr: int = 44100) -> Optional[float]:
+    """Return median F0 (Hz) from voiced frames after onset alignment, or None if undetected."""
+    try:
+        import librosa
+    except ImportError:
+        return None
+
+    _SR = 22050
+    _HOP = 512
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+
+    frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+    onset = 0
+    if len(frames):
+        cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+        if cand <= _SR:  # ignore onsets > 1 s
+            onset = cand
+    y = y[onset:]
+
+    if len(y) < int(0.5 * _SR):
+        return None
+
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=float(librosa.note_to_hz('A1')),   # ~55 Hz — below open D3
+        fmax=float(librosa.note_to_hz('C6')),    # ~1047 Hz — above fret-4 harmonic
+        sr=_SR,
+        hop_length=_HOP,
+    )
+    voiced_f0 = f0[voiced_flag]
+    if len(voiced_f0) == 0:
+        return None
+    return float(np.median(voiced_f0))
+
+
+def _spectral_score_for_audio(audio: np.ndarray, fret: int,
+                               device_sr: int = 44100) -> float:
+    """Compute spectral score (HER) for one audio capture at the given target fret."""
+    try:
+        import librosa
+        from scipy.signal import welch as scipy_welch
+    except ImportError:
+        return 0.0
+
+    _SR = 22050
+    _HOP = 512
+
+    harmonic_n = FRET_TO_HARMONIC_NUMBER.get(fret)
+    if harmonic_n is None:
+        return 0.0
+
+    y = librosa.resample(audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR) \
+        if device_sr != _SR else audio.astype(np.float32)
+
+    # Onset-align
+    frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+    onset = 0
+    if len(frames):
+        cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+        if cand <= _SR:
+            onset = cand
+    y = y[onset:]
+
+    # Skip transient (300 ms), take up to 2 s of steady-state
+    skip = int(0.3 * _SR)
+    window = int(2.0 * _SR)
+    y = y[skip: skip + window]
+    if len(y) < int(0.25 * _SR):
+        return 0.0
+
+    nperseg = min(4096, len(y))
+    freqs, psd = scipy_welch(y, fs=_SR, nperseg=nperseg, noverlap=nperseg // 2)
+
+    f0 = D_STRING_OPEN_FREQ
+    harmonic_fund = harmonic_n * f0
+    bw = SPECTRAL_BANDWIDTH_RATIO
+
+    desired_energy = 0.0
+    partial = harmonic_fund
+    while partial < _SR / 2:
+        lo, hi = partial * (1 - bw), partial * (1 + bw)
+        mask = (freqs >= lo) & (freqs <= hi)
+        desired_energy += float(psd[mask].sum())
+        partial += harmonic_fund
+
+    f0_lo, f0_hi = f0 * (1 - bw), f0 * (1 + bw)
+    f0_energy = float(psd[(freqs >= f0_lo) & (freqs <= f0_hi)].sum())
+
+    total_energy = float(psd[freqs >= SPECTRAL_NOISE_FLOOR_HZ].sum()) + 1e-12
+
+    her = desired_energy / total_energy
+    fund_suppression = 1.0 - float(np.clip((f0_energy / total_energy) * 5.0, 0.0, 1.0))
+    signal_presence = float(np.clip(total_energy / 1e-4, 0.0, 1.0))
+
+    score = (SPECTRAL_HER_WEIGHT * her
+             + SPECTRAL_FUND_SUPPRESS_WEIGHT * fund_suppression
+             + SPECTRAL_SIGNAL_WEIGHT * signal_presence)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False,
+                    ref_mels: Optional[Dict[int, list]] = None, device_sr: int = 44100,
+                    spectral_success: bool = False):
     """
     Evaluate trained policy.
+
+    Filtered steps (actions rejected by the physics gate before reaching the
+    robot) do not count toward max_steps in the env, so each episode runs
+    until the requested number of real robot actions have been attempted.
+    Only unfiltered steps are included in reward / metric accounting.
 
     Returns:
         Dictionary with evaluation metrics, including per-fret and per-string breakdowns.
     """
     episode_rewards = []
     episode_successes = []
-    episode_steps = []
+    episode_step_success_rates = []   # per-episode fraction of robot steps that were harmonics
+    episode_steps = []          # robot (unfiltered) steps only
+    episode_attempts = []       # total step() calls including filtered
     episode_harmonic_probs = []
     episode_target_frets = []
     episode_string_indices = []
     episode_fret_positions = []
     episode_torques = []
+    episode_pitch_accuracies = []   # fraction of steps with pitch within ±50 cents of target
+    episode_open_string_rates = []  # fraction of steps where open string pitch detected
 
     all_trajectories = []
 
@@ -46,7 +266,6 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
         done = False
         truncated = False
         episode_reward = 0
-        step_count = 0
 
         trajectory = {
             'target_fret': info['target_fret'],
@@ -55,16 +274,32 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             'torques': [],
             'rewards': [],
             'harmonic_probs': [],
+            'cosine_sims': [],      # populated only in --cosine-success mode
+            'spectral_scores': [],  # populated only in --spectral-success mode
+            'step_successes': [],   # 1.0 per robot step where success criterion is met
+            'audios': [],           # raw numpy float32 captures at device_sr (for image analysis)
+            'detected_pitches': [], # median F0 in Hz (or None) per robot step
+            'pitch_corrects': [],   # 1.0 if within ±50 cents of target pitch
+            'open_string_flags': [],# 1.0 if within ±100 cents of open D string (~147 Hz)
         }
 
         last_info = info
+        robot_steps = 0
+        total_attempts = 0
+
         while not (done or truncated):
             action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, done, truncated, info = env.step(action)
-            last_info = info
+            total_attempts += 1
 
+            # Only score and record steps that actually reached the robot
+            if info.get('filtered', False):
+                last_info = info  # keep target_fret etc. up to date
+                continue
+
+            last_info = info
+            robot_steps += 1
             episode_reward += reward
-            step_count += 1
 
             # Record trajectory — use keys that harmonic_env.step() actually returns
             trajectory['positions'].append(info.get('slider_mm', info.get('fret_position', 0)))
@@ -74,6 +309,70 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             if info['classification'] is not None:
                 harmonic_prob = info['classification']['harmonic_prob']
                 trajectory['harmonic_probs'].append(harmonic_prob)
+            else:
+                harmonic_prob = 0.0
+
+            # Store raw audio for post-hoc image analysis
+            step_audio = getattr(env, 'last_audio', None)
+            trajectory['audios'].append(step_audio.copy() if step_audio is not None else None)
+
+            if ref_mels is not None:
+                fret = info.get('target_fret', trajectory['target_fret'])
+                cos_sim = _cosine_sim_for_audio(step_audio, fret, ref_mels, device_sr) \
+                    if step_audio is not None else 0.0
+
+                # Pitch detection
+                detected_hz = _detect_pitch_hz(step_audio, device_sr) \
+                    if step_audio is not None else None
+                target_midi = _D_STRING_FRET_TO_PITCH.get(fret, 69)
+                target_hz = 440.0 * 2 ** ((target_midi - 69) / 12.0)
+                open_hz = 440.0 * 2 ** ((_D_STRING_OPEN_MIDI - 69) / 12.0)
+                pitch_correct = False
+                open_string = False
+                if detected_hz is not None and detected_hz > 0:
+                    cents_from_target = abs(1200.0 * np.log2(detected_hz / target_hz))
+                    cents_from_open   = abs(1200.0 * np.log2(detected_hz / open_hz))
+                    pitch_correct = cents_from_target <= 50.0
+                    open_string   = cents_from_open   <= 100.0
+
+                trajectory['cosine_sims'].append(cos_sim)
+                trajectory['detected_pitches'].append(detected_hz)
+                trajectory['pitch_corrects'].append(float(pitch_correct))
+                trajectory['open_string_flags'].append(float(open_string))
+                step_success = cos_sim >= COSINE_SIM_SUCCESS_THRESHOLD
+                trajectory['step_successes'].append(float(step_success))
+
+                pitch_tag = (
+                    'OPEN_STRING' if open_string
+                    else ('pitch_ok' if pitch_correct else 'wrong_pitch')
+                )
+                pitch_str = f"{detected_hz:.1f}Hz" if detected_hz is not None else "---Hz"
+                logger.info(
+                    f"  Step {robot_steps}: pos={info.get('slider_mm', info.get('fret_position', 0)):.1f}  "
+                    f"torque={info.get('torque', 0):.0f}  "
+                    f"cos_sim={cos_sim:.4f}  h_prob={harmonic_prob:.3f}  "
+                    f"pitch={pitch_str} [{pitch_tag}]  "
+                    f"{'SUCCESS' if step_success else 'fail'}"
+                )
+                if step_success:
+                    break  # terminate episode on first cosine success
+            elif spectral_success:
+                fret = info.get('target_fret', trajectory['target_fret'])
+                spec_score = _spectral_score_for_audio(step_audio, fret, device_sr) \
+                    if step_audio is not None else 0.0
+                trajectory['spectral_scores'].append(spec_score)
+                step_success = spec_score >= SPECTRAL_SUCCESS_THRESHOLD
+                trajectory['step_successes'].append(float(step_success))
+                logger.info(
+                    f"  Step {robot_steps}: pos={info.get('slider_mm', info.get('fret_position', 0)):.1f}  "
+                    f"torque={info.get('torque', 0):.0f}  "
+                    f"spectral={spec_score:.4f}  h_prob={harmonic_prob:.3f}  "
+                    f"{'SUCCESS' if step_success else 'fail'}"
+                )
+                if step_success:
+                    break  # terminate episode on first spectral success
+            else:
+                trajectory['step_successes'].append(float(harmonic_prob > 0.8))
 
             if render:
                 env.render()
@@ -82,46 +381,87 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
         final_classification = last_info['classification']
         if final_classification is not None:
             final_harmonic_prob = final_classification['harmonic_prob']
-            success = final_harmonic_prob > 0.8
         else:
             final_harmonic_prob = 0.0
-            success = False
+
+        if ref_mels is not None:
+            # Cosine-success mode: episode succeeds if the final step met the cosine threshold
+            episode_succeeded = bool(trajectory['cosine_sims'] and
+                                     trajectory['cosine_sims'][-1] >= COSINE_SIM_SUCCESS_THRESHOLD)
+        elif spectral_success:
+            episode_succeeded = bool(trajectory['spectral_scores'] and
+                                     trajectory['spectral_scores'][-1] >= SPECTRAL_SUCCESS_THRESHOLD)
+        else:
+            episode_succeeded = final_harmonic_prob > 0.8
+
+        # Step-level: fraction of robot steps that were harmonics this episode
+        step_succs = trajectory['step_successes']
+        ep_step_success = float(np.mean(step_succs)) if step_succs else 0.0
 
         target_fret = last_info.get('target_fret', trajectory['target_fret'])
         string_index = last_info.get('string_index', trajectory['string_index'])
 
         episode_rewards.append(episode_reward)
-        episode_successes.append(float(success))
-        episode_steps.append(step_count)
+        episode_successes.append(float(episode_succeeded))
+        episode_steps.append(robot_steps)
+        episode_attempts.append(total_attempts)
         episode_harmonic_probs.append(final_harmonic_prob)
         episode_target_frets.append(target_fret)
         episode_string_indices.append(string_index)
         episode_fret_positions.append(np.mean(trajectory['positions']) if trajectory['positions'] else 0.0)
         episode_torques.append(np.mean(trajectory['torques']) if trajectory['torques'] else 0.0)
+        episode_step_success_rates.append(ep_step_success)
+
+        ep_pitch_acc  = float(np.mean(trajectory['pitch_corrects']))   if trajectory['pitch_corrects']    else 0.0
+        ep_open_rate  = float(np.mean(trajectory['open_string_flags'])) if trajectory['open_string_flags'] else 0.0
+        episode_pitch_accuracies.append(ep_pitch_acc)
+        episode_open_string_rates.append(ep_open_rate)
 
         all_trajectories.append(trajectory)
 
-        logger.info(
-            f"Episode {episode + 1}/{n_episodes}: "
-            f"Fret={target_fret}, String={string_index}, "
-            f"Reward={episode_reward:.3f}, "
-            f"Success={success}, "
-            f"Harmonic prob={final_harmonic_prob:.3f}, "
-            f"Steps={step_count}"
-        )
+        if ref_mels is not None:
+            final_cos_sim = trajectory['cosine_sims'][-1] if trajectory['cosine_sims'] else 0.0
+            mean_cos_sim = float(np.mean(trajectory['cosine_sims'])) if trajectory['cosine_sims'] else 0.0
+            logger.info(
+                f"Episode {episode + 1}/{n_episodes}: "
+                f"Fret={target_fret}, String={string_index}, "
+                f"Reward={episode_reward:.3f}, "
+                f"Episode success={episode_succeeded}, "
+                f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
+                f"cos_sim final={final_cos_sim:.4f}  mean={mean_cos_sim:.4f}, "
+                f"H-prob={final_harmonic_prob:.3f}, "
+                f"pitch_acc={ep_pitch_acc:.1%}  open_string={ep_open_rate:.1%}, "
+                f"Robot steps={robot_steps}/{total_attempts} attempts"
+            )
+        else:
+            logger.info(
+                f"Episode {episode + 1}/{n_episodes}: "
+                f"Fret={target_fret}, String={string_index}, "
+                f"Reward={episode_reward:.3f}, "
+                f"Episode success={episode_succeeded}, "
+                f"Step success={ep_step_success:.1%} ({sum(int(s) for s in step_succs)}/{robot_steps} steps), "
+                f"H-prob={final_harmonic_prob:.3f}, "
+                f"Robot steps={robot_steps}/{total_attempts} attempts"
+            )
 
     # ── Aggregate metrics ────────────────────────────────────────────
     results = {
         'mean_reward': float(np.mean(episode_rewards)),
         'std_reward': float(np.std(episode_rewards)),
-        'success_rate': float(np.mean(episode_successes)),
+        'episode_success_rate': float(np.mean(episode_successes)),
+        'step_success_rate': float(np.mean(episode_step_success_rates)),
         'mean_steps': float(np.mean(episode_steps)),
+        'mean_attempts': float(np.mean(episode_attempts)),
+        'filter_rate': float(1.0 - np.sum(episode_steps) / max(np.sum(episode_attempts), 1)),
         'mean_harmonic_prob': float(np.mean(episode_harmonic_probs)),
         'mean_position': float(np.mean(episode_fret_positions)),
         'mean_torque': float(np.mean(episode_torques)),
+        'mean_pitch_accuracy': float(np.mean(episode_pitch_accuracies)),
+        'mean_open_string_rate': float(np.mean(episode_open_string_rates)),
         'n_episodes': n_episodes,
         'episode_rewards': episode_rewards,
         'episode_successes': episode_successes,
+        'episode_step_success_rates': episode_step_success_rates,
         'episode_harmonic_probs': episode_harmonic_probs,
         'episode_target_frets': episode_target_frets,
         'episode_string_indices': episode_string_indices,
@@ -136,7 +476,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             continue
         results_by_fret[str(fret)] = {
             'n_episodes': len(mask),
-            'success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'episode_success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'step_success_rate': float(np.mean([episode_step_success_rates[i] for i in mask])),
             'mean_harmonic_prob': float(np.mean([episode_harmonic_probs[i] for i in mask])),
             'mean_reward': float(np.mean([episode_rewards[i] for i in mask])),
             'mean_steps': float(np.mean([episode_steps[i] for i in mask])),
@@ -151,7 +492,8 @@ def evaluate_policy(model, env, n_episodes=10, deterministic=True, render=False)
             continue
         results_by_string[str(string)] = {
             'n_episodes': len(mask),
-            'success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'episode_success_rate': float(np.mean([episode_successes[i] for i in mask])),
+            'step_success_rate': float(np.mean([episode_step_success_rates[i] for i in mask])),
             'mean_harmonic_prob': float(np.mean([episode_harmonic_probs[i] for i in mask])),
             'mean_reward': float(np.mean([episode_rewards[i] for i in mask])),
             'mean_steps': float(np.mean([episode_steps[i] for i in mask])),
@@ -283,29 +625,241 @@ def print_summary(results: Dict):
     print("=" * 60)
     print(f"Episodes:            {results['n_episodes']}")
     print(f"Mean Reward:         {results['mean_reward']:.3f} ± {results['std_reward']:.3f}")
-    print(f"Success Rate:        {results['success_rate']:.1%}")
+    print(f"Episode Success:     {results['episode_success_rate']:.1%}  (≥1 harmonic step per episode)")
+    print(f"Step Success:        {results['step_success_rate']:.1%}  (harmonic steps / total robot steps)")
     print(f"Mean Harmonic Prob:  {results['mean_harmonic_prob']:.3f}")
-    print(f"Mean Steps/Episode:  {results['mean_steps']:.1f}")
+    print(f"Mean Robot Steps:    {results['mean_steps']:.1f}  "
+          f"(attempts: {results.get('mean_attempts', results['mean_steps']):.1f}, "
+          f"filter rate: {results.get('filter_rate', 0.0):.1%})")
     print(f"Mean Position:       {results['mean_position']:.1f} mm")
     print(f"Mean Torque:         {results['mean_torque']:.1f}")
 
     if results.get('results_by_fret'):
         print("\n── Per-fret breakdown ──────────────────────────────────")
-        print(f"  {'Fret':>5}  {'N':>5}  {'Success':>8}  {'H-prob':>7}  {'Reward':>8}")
+        print(f"  {'Fret':>5}  {'N':>5}  {'Ep.Succ':>8}  {'StpSucc':>8}  {'H-prob':>7}  {'Reward':>8}")
         for fret, d in sorted(results['results_by_fret'].items(), key=lambda x: int(x[0])):
             print(f"  {fret:>5}  {d['n_episodes']:>5}  "
-                  f"{d['success_rate']:>8.1%}  {d['mean_harmonic_prob']:>7.3f}  "
-                  f"{d['mean_reward']:>8.3f}")
+                  f"{d['episode_success_rate']:>8.1%}  {d['step_success_rate']:>8.1%}  "
+                  f"{d['mean_harmonic_prob']:>7.3f}  {d['mean_reward']:>8.3f}")
 
     if results.get('results_by_string'):
         print("\n── Per-string breakdown ────────────────────────────────")
-        print(f"  {'String':>6}  {'N':>5}  {'Success':>8}  {'H-prob':>7}  {'Reward':>8}")
+        print(f"  {'String':>6}  {'N':>5}  {'Ep.Succ':>8}  {'StpSucc':>8}  {'H-prob':>7}  {'Reward':>8}")
         for string, d in sorted(results['results_by_string'].items(), key=lambda x: int(x[0])):
             print(f"  {string:>6}  {d['n_episodes']:>5}  "
-                  f"{d['success_rate']:>8.1%}  {d['mean_harmonic_prob']:>7.3f}  "
-                  f"{d['mean_reward']:>8.3f}")
+                  f"{d['episode_success_rate']:>8.1%}  {d['step_success_rate']:>8.1%}  "
+                  f"{d['mean_harmonic_prob']:>7.3f}  {d['mean_reward']:>8.3f}")
 
     print("=" * 60 + "\n")
+
+
+def _get_success_wavs_for_fret(successes_dir: Path, target_fret: int) -> List[Path]:
+    """Return WAV paths from successes_dir whose JSON sidecar matches target_fret."""
+    import json as _json
+    wavs = []
+    for json_path in sorted(successes_dir.glob("*.json")):
+        try:
+            data = _json.loads(json_path.read_text())
+            if data.get("target_fret") == target_fret:
+                wav_path = json_path.with_suffix(".wav")
+                if wav_path.exists():
+                    wavs.append(wav_path)
+        except Exception:
+            pass
+    return sorted(wavs)
+
+
+def run_step_image_analysis(
+    trajectories: List[Dict],
+    ref_dir: Path,
+    fret_to_pitch: Dict[int, int],
+    device_sr: int = 44100,
+) -> Dict:
+    """Compute cosine similarity and MSE between every captured robot-step audio and
+    the matching reference WAVs.  Operates fully in-memory — no disk writes needed.
+
+    Uses the same onset-alignment and mel-spectrogram parameters as image_analysis.py
+    so results are directly comparable to batch_compare() output.
+
+    Returns a summary dict (also printed to stdout).
+    """
+    from image_analysis import compute_mel_db, compute_similarity_metrics
+    import librosa
+
+    _SR     = 22050   # image_analysis.SR
+    _HOP    = 512     # image_analysis.HOP_LENGTH
+    _MAX_ONSET_SAMPLES = _SR   # MAX_ONSET_SEC = 1 second
+
+    def _norm01(arr: np.ndarray) -> np.ndarray:
+        lo, hi = arr.min(), arr.max()
+        return (arr - lo) / (hi - lo + 1e-8)
+
+    def _onset_align(y: np.ndarray) -> np.ndarray:
+        frames = librosa.onset.onset_detect(y=y, sr=_SR, hop_length=_HOP)
+        onset = 0
+        if len(frames):
+            cand = int(librosa.frames_to_samples(frames[0], hop_length=_HOP))
+            if cand <= _MAX_ONSET_SAMPLES:
+                onset = cand
+        return y[onset:]
+
+    # ── Pre-load reference mel spectrograms per fret ─────────────────
+    ref_mels: Dict[int, List[np.ndarray]] = {}
+    for fret, pitch in fret_to_pitch.items():
+        wavs = sorted(ref_dir.glob(f"GB_NH*pitches{pitch}*.wav"))
+        mels = []
+        for wav in wavs:
+            try:
+                y, _ = librosa.load(str(wav), sr=_SR, mono=True)
+                y = _onset_align(y)
+                if len(y) >= int(0.5 * _SR):
+                    mels.append(_norm01(compute_mel_db(y, sr=_SR)))
+            except Exception as exc:
+                logger.warning(f"[image-analysis] Skipped ref {wav.name}: {exc}")
+        ref_mels[fret] = mels
+        logger.info(
+            f"[image-analysis] Fret {fret} (pitch {pitch}): {len(mels)} reference spectrograms"
+        )
+
+    # ── Score every recorded robot step ──────────────────────────────
+    step_metrics: List[Dict] = []
+    for traj in trajectories:
+        fret = traj['target_fret']
+        refs = ref_mels.get(fret, [])
+        for audio in traj.get('audios', []):
+            if audio is None:
+                continue
+            # Resample → onset-align → mel
+            y = librosa.resample(
+                audio.astype(np.float32), orig_sr=device_sr, target_sr=_SR
+            ) if device_sr != _SR else audio.astype(np.float32)
+            y = _onset_align(y)
+            if len(y) < int(0.5 * _SR):
+                step_metrics.append({'fret': fret, 'cosine_sim': 0.0, 'mse': 1.0})
+                continue
+            if not refs:
+                step_metrics.append({'fret': fret, 'cosine_sim': 0.0, 'mse': 1.0})
+                continue
+            mel_rl = _norm01(compute_mel_db(y, sr=_SR))
+            best_cos, best_mse = -1.0, 1.0
+            for mel_ref in refs:
+                t = min(mel_rl.shape[1], mel_ref.shape[1])
+                m = compute_similarity_metrics(mel_rl[:, :t], mel_ref[:, :t])
+                if m['cosine_sim'] > best_cos:
+                    best_cos, best_mse = m['cosine_sim'], m['mse']
+            step_metrics.append({
+                'fret': fret,
+                'cosine_sim': float(np.clip(best_cos, 0.0, 1.0)),
+                'mse': float(best_mse),
+            })
+
+    if not step_metrics:
+        logger.warning('[image-analysis] No audio captured — nothing to analyze.')
+        return {}
+
+    cos_all = np.array([m['cosine_sim'] for m in step_metrics])
+    mse_all = np.array([m['mse']        for m in step_metrics])
+
+    per_fret: Dict[int, Dict] = {}
+    for fret in sorted({m['fret'] for m in step_metrics}):
+        fc = np.array([m['cosine_sim'] for m in step_metrics if m['fret'] == fret])
+        fm = np.array([m['mse']        for m in step_metrics if m['fret'] == fret])
+        per_fret[fret] = {
+            'n':              int(len(fc)),
+            'mean_cosine_sim': float(fc.mean()),
+            'std_cosine_sim':  float(fc.std(ddof=1) if len(fc) > 1 else 0.0),
+            'mean_mse':        float(fm.mean()),
+            'std_mse':         float(fm.std(ddof=1) if len(fm) > 1 else 0.0),
+        }
+
+    sep = "─" * 60
+    print(f"\n{sep}")
+    print("IMAGE ANALYSIS  (every robot step vs reference WAVs)")
+    print(sep)
+    print(f"  Total steps:  {len(step_metrics)}")
+    print(f"  Cosine sim:   {cos_all.mean():.4f} \u00b1 {cos_all.std(ddof=1):.4f}  "
+          f"(min {cos_all.min():.4f}  max {cos_all.max():.4f})")
+    print(f"  MSE:          {mse_all.mean():.4f} \u00b1 {mse_all.std(ddof=1):.4f}  "
+          f"(min {mse_all.min():.4f}  max {mse_all.max():.4f})")
+    if per_fret:
+        print(f"\n  {'Fret':>5}  {'N':>5}  {'CosSim':>8}  {'±':>7}  {'MSE':>8}  {'±':>7}")
+        for fret, d in sorted(per_fret.items()):
+            print(f"  {fret:>5}  {d['n']:>5}  {d['mean_cosine_sim']:>8.4f}  "
+                  f"{d['std_cosine_sim']:>7.4f}  {d['mean_mse']:>8.4f}  {d['std_mse']:>7.4f}")
+    print(sep + "\n")
+
+    return {
+        'mean_cosine_sim': float(cos_all.mean()),
+        'std_cosine_sim':  float(cos_all.std(ddof=1)),
+        'mean_mse':        float(mse_all.mean()),
+        'std_mse':         float(mse_all.std(ddof=1)),
+        'n_steps':         len(step_metrics),
+        'per_fret':        {str(k): v for k, v in per_fret.items()},
+        'step_metrics':    step_metrics,
+    }
+
+
+def run_image_analysis(
+    results: Dict,
+    output_dir: Path,
+    ref_dir: Path,
+    top_n: int = 1,
+    rank_by: str = "ssim",
+    baseline: bool = False,
+    neg_ctrl_dir: Optional[Path] = None,
+) -> None:
+    """Run image_analysis batch_compare for each fret present in evaluation results.
+
+    For each evaluated target fret, filters the success WAVs by fret (via JSON
+    sidecars), resolves the correct reference pitch for the D string, and calls
+    batch_compare() from image_analysis.py.
+
+    Results are saved to output_dir/image_analysis_fret{N}/.
+    """
+    from image_analysis import batch_compare
+
+    successes_dir = output_dir / "successes"
+    if not successes_dir.exists():
+        logger.warning(
+            f"No successes directory at {successes_dir} — "
+            "skipping image analysis (no success WAVs were recorded)"
+        )
+        return
+
+    evaluated_frets = sorted(set(results['episode_target_frets']))
+
+    for fret in evaluated_frets:
+        pitch = _D_STRING_FRET_TO_PITCH.get(fret)
+        if pitch is None:
+            logger.warning(
+                f"No D-string pitch mapping for fret {fret} — skipping image analysis for this fret"
+            )
+            continue
+
+        rl_wavs = _get_success_wavs_for_fret(successes_dir, fret)
+        if not rl_wavs:
+            logger.info(f"No success WAVs found for fret {fret} — skipping image analysis")
+            continue
+
+        pitch_pattern = f"pitches{pitch}"
+        img_output_dir = output_dir / f"image_analysis_fret{fret}"
+        logger.info(
+            f"Image analysis: fret={fret}, pitch={pitch}, "
+            f"{len(rl_wavs)} RL WAV(s), ref pattern={pitch_pattern}"
+        )
+
+        batch_compare(
+            rl_dir=successes_dir,
+            ref_dir=ref_dir,
+            pitch_pattern=pitch_pattern,
+            rl_wavs=rl_wavs,
+            top_n=top_n,
+            rank_by=rank_by,
+            output_dir=img_output_dir,
+            play_audio=False,
+            baseline=baseline,
+            neg_ctrl_dir=neg_ctrl_dir,
+        )
 
 
 def main():
@@ -313,7 +867,15 @@ def main():
     parser.add_argument('--model', required=True, help='Path to trained model (.zip)')
     parser.add_argument('--model-classifier',
                         default='../HarmonicsClassifier/models/best_model.pt',
-                        help='Path to HarmonicsClassifier model')
+                        help='Path to HarmonicsClassifier model (only needed for '
+                             'reward-mode full / no_audio)')
+    parser.add_argument('--reward-mode',
+                        default=REWARD_MODE_SPECTRAL,
+                        choices=[REWARD_MODE_FULL, REWARD_MODE_SPECTRAL,
+                                 REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO,
+                                 REWARD_MODE_NO_FILTRATION],
+                        help='Reward mode for the evaluation env (default: spectral). '
+                             'Spectral and cosine_sim modes do not require a CNN classifier.')
     parser.add_argument('--episodes', type=int, default=10, help='Number of evaluation episodes')
     parser.add_argument('--string-index', type=int, default=2, help='String to evaluate on')
     parser.add_argument('--string-indices', type=int, nargs='+', default=None,
@@ -324,6 +886,37 @@ def main():
     parser.add_argument('--visualize', action='store_true', help='Show visualization plots')
     parser.add_argument('--output-dir', type=str, default='./eval_results', help='Output directory')
 
+    # Image analysis
+    parser.add_argument('--image-analysis', action='store_true',
+                        help='Run image_analysis batch comparison after evaluation')
+    parser.add_argument('--ref-dir', type=str,
+                        default='../HarmonicsClassifier/note_clips/harmonic',
+                        help='Reference WAV directory for image analysis (default: %(default)s)')
+    parser.add_argument('--top-n', type=int, default=1,
+                        help='Number of top pairs to plot in image analysis (default: %(default)s)')
+    parser.add_argument('--rank-by', type=str, default='ssim',
+                        choices=['cosine_sim', 'mse', 'ssim', 'pearson_r'],
+                        help='Ranking metric for image analysis (default: %(default)s)')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Compute ref-vs-ref similarity ceiling in image analysis')
+    parser.add_argument('--neg-ctrl-dir', type=str, default=None, metavar='DIR',
+                        help='Dead-note WAVs directory for negative control in image analysis')
+
+    parser.add_argument('--cosine-success', action='store_true', default=False,
+                        help='Use cosine similarity >= 0.85 (vs reference WAVs in --ref-dir) as '
+                             'the success criterion instead of the CNN classifier harmonic '
+                             'probability. Requires --ref-dir. Applied per-step and per-episode.')
+    parser.add_argument('--spectral-success', action='store_true', default=False,
+                        help='Use spectral content analysis (harmonic energy ratio) as the '
+                             'success criterion instead of CNN classifier. No reference WAVs '
+                             'needed. Applied per-step and per-episode.')
+
+    parser.add_argument('--no-filtration', action='store_true', default=False,
+                        help='Disable the physics filtration gate (Layer 1) so that every action '
+                             'is sent to the robot regardless of torque/fret range.  Useful when '
+                             'evaluating a model trained with different filtration thresholds that '
+                             'would otherwise block all steps.')
+
     args = parser.parse_args()
 
     # Check paths
@@ -332,10 +925,15 @@ def main():
         logger.error(f"Model not found: {model_path}")
         sys.exit(1)
 
+    # Classifier is only needed for CNN-based reward modes
+    _classifier_free_modes = (REWARD_MODE_SPECTRAL, REWARD_MODE_COSINE_SIM, REWARD_MODE_NO_AUDIO)
     classifier_path = Path(args.model_classifier)
-    if not classifier_path.exists():
-        logger.error(f"Classifier model not found: {classifier_path}")
-        sys.exit(1)
+    if args.reward_mode not in _classifier_free_modes:
+        if not classifier_path.exists():
+            logger.error(f"Classifier model not found: {classifier_path}")
+            sys.exit(1)
+    else:
+        classifier_path = None
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -348,18 +946,60 @@ def main():
     # Resolve string pool
     string_indices = args.string_indices if args.string_indices else [args.string_index]
 
+    # Create success recorder — saves WAV + JSON for each successful step
+    success_recorder = SuccessRecorder(output_dir / "successes")
+
     # Create environment
     curriculum_mode = 'random' if args.target_fret is None else 'fixed_fret'
+    fixed_target_fret = args.target_fret if args.target_fret is not None else 7
+
+    # reward_mode: --no-filtration overrides to no_filtration regardless of --reward-mode
+    if args.no_filtration:
+        reward_mode = REWARD_MODE_NO_FILTRATION
+        logger.info('[eval] --no-filtration: physics gate disabled — all actions will be sent to the robot.')
+    else:
+        reward_mode = args.reward_mode
+        logger.info(f'[eval] reward_mode={reward_mode}')
+
+    # spectral_success: auto-enable when reward_mode is spectral, or if explicitly requested
+    spectral_success = args.spectral_success or (reward_mode == REWARD_MODE_SPECTRAL)
+    cosine_success   = args.cosine_success   or (reward_mode == REWARD_MODE_COSINE_SIM)
+    # max_steps=10 means 10 real robot steps per episode — filtered steps
+    # do not count (harmonic_env only increments current_step when unfiltered).
+    # In cosine-success mode the env must not self-terminate on harmonic_prob —
+    # episode termination is controlled entirely by the cosine threshold break
+    # in evaluate_policy. Set success_threshold=2.0 (unreachable) to disable it.
+    success_threshold = 2.0 if (cosine_success or spectral_success) else 0.8
     env = HarmonicEnv(
-        model_path=str(classifier_path),
+        model_path=str(classifier_path) if classifier_path else None,
         string_indices=string_indices,
         curriculum_mode=curriculum_mode,
+        fixed_target_fret=fixed_target_fret,
         max_steps=10,
+        success_threshold=success_threshold,
+        success_recorder=success_recorder,
+        reward_mode=reward_mode,
     )
 
-    # Override fret list if a specific fret was requested
-    if args.target_fret is not None:
-        env.HARMONIC_FRETS = [args.target_fret]
+    # Pre-load reference mels for cosine-success mode
+    ref_mels_for_eval: Optional[Dict[int, list]] = None
+    if cosine_success:
+        ref_dir_path = Path(args.ref_dir)
+        if not ref_dir_path.exists():
+            logger.error(f"--cosine-success requires --ref-dir, but {ref_dir_path} does not exist.")
+            sys.exit(1)
+        ref_mels_for_eval = _load_ref_mels(ref_dir_path, _D_STRING_FRET_TO_PITCH)
+        if not any(ref_mels_for_eval.values()):
+            logger.error("No reference spectrograms loaded — cannot use --cosine-success.")
+            sys.exit(1)
+        logger.info("[cosine-success] Success criterion: cosine_sim >= "
+                    f"{COSINE_SIM_SUCCESS_THRESHOLD} (vs reference WAVs)")
+
+    if spectral_success:
+        logger.info(f"[spectral-success] Success criterion: spectral_score >= "
+                    f"{SPECTRAL_SUCCESS_THRESHOLD}")
+
+    device_sr: int = getattr(getattr(env, 'reward_calc', None), 'device_sr', 44100)
 
     # Evaluate
     logger.info(f"Evaluating for {args.episodes} episodes "
@@ -369,6 +1009,9 @@ def main():
         env,
         n_episodes=args.episodes,
         deterministic=args.deterministic,
+        ref_mels=ref_mels_for_eval,
+        device_sr=device_sr,
+        spectral_success=spectral_success,
     )
 
     # Print summary
@@ -379,25 +1022,64 @@ def main():
         viz_path = output_dir / f"evaluation_{model_path.stem}.png"
         visualize_results(results, output_path=viz_path)
 
-    # Save results JSON
+    # Save results JSON (non-fatal — image analysis still runs if this fails)
     import json
     results_path = output_dir / f"results_{model_path.stem}.json"
 
-    # Strip non-serialisable fields
-    json_results = {
-        k: (v.tolist() if isinstance(v, np.ndarray) else
-            float(v) if isinstance(v, (np.float32, np.float64)) else
-            v)
-        for k, v in results.items()
-        if k != 'trajectories'  # too large for JSON
-    }
+    class _NumpyEncoder(json.JSONEncoder):
+        """Recursively coerce numpy scalars/arrays to native Python types."""
+        def default(self, obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, (np.bool_,)):
+                return bool(obj)
+            return super().default(obj)
 
-    with open(results_path, 'w') as f:
-        json.dump(json_results, f, indent=2)
+    json_results = {k: v for k, v in results.items() if k != 'trajectories'}
 
-    logger.info(f"Results saved to {results_path}")
+    def _save_json():
+        try:
+            with open(results_path, 'w') as f:
+                json.dump(json_results, f, indent=2, cls=_NumpyEncoder)
+            logger.info(f"Results saved to {results_path}")
+        except Exception as exc:
+            logger.error(f"Failed to save results JSON: {exc}")
+
+    _save_json()
 
     env.close()
+    success_recorder.close()  # drain queue — ensures all WAVs are written before image analysis
+
+    # Image analysis
+    if args.image_analysis:
+        ref_dir_path = Path(args.ref_dir)
+
+        # ── 1. Per-step inline metrics (cosine sim + MSE for every robot step) ──
+        img_stats = run_step_image_analysis(
+            trajectories=results['trajectories'],
+            ref_dir=ref_dir_path,
+            fret_to_pitch=_D_STRING_FRET_TO_PITCH,
+            device_sr=device_sr,
+        )
+        if img_stats:
+            results['image_analysis'] = img_stats
+            json_results['image_analysis'] = img_stats
+            _save_json()
+
+        # ── 2. Visual batch comparison against success WAVs (plots + stats table) ──
+        run_image_analysis(
+            results=results,
+            output_dir=output_dir,
+            ref_dir=ref_dir_path,
+            top_n=args.top_n,
+            rank_by=args.rank_by,
+            baseline=args.baseline,
+            neg_ctrl_dir=Path(args.neg_ctrl_dir) if args.neg_ctrl_dir else None,
+        )
 
 
 if __name__ == '__main__':
