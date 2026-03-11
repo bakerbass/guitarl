@@ -1,7 +1,7 @@
 # guitaRL — Reinforcement Learning for Guitar Harmonics
 
 Real-robot RL system that trains a continuous-action policy to produce natural
-harmonics on [GuitarBot](../GuitarBot), a mechatronic guitar-playing robot.
+harmonics on [GuitarBot](https://github.com/GuitarBotGatech/GuitarBot), a mechatronic guitar-playing robot.
 The audio reward signal is computed via **HER** (Harmonic Energy Ratio), a
 physics-based spectral analysis that measures energy at the expected harmonic partials.
 The algorithm is **SAC** (Soft Actor-Critic) implemented via Stable-Baselines3.
