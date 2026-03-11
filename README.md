@@ -57,7 +57,7 @@ conda activate guitaRL
 
 4. **Reward mode** (default: `spectral`):
    - No external model required — HER computes rewards directly from audio FFT.
-   - For legacy CNN mode, pass `--reward-mode full --model-path ../HarmonicsClassifier/models/best_model.pt`.
+   - For legacy CNN mode, see [HarmonicsClassifier](https://github.com/bakerbass/harmonicsclassifier) and pass `--reward-mode full --model-path ../HarmonicsClassifier/models/best_model.pt`. a
 
 ---
 
