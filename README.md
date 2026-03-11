@@ -56,7 +56,7 @@ conda activate guitaRL
    - Pass `--audio-device <substring>` if your device name differs.
 
 3. **GuitarBot middleware**:
-   - Start `arm_list_recieverNN.py` (port 12000) on the GuitarBot machine before training.
+   - Start `OSC_Message_Receiver.py` (port 12000) on the GuitarBot machine before training.
    - All robot calls are serialised through a `threading.Lock()` — `/Reset` safely
      queues behind any active trajectory.
 
@@ -501,7 +501,7 @@ python train_cnn.py
 ## Robot Safety
 
 - **`/Reset` on exit is on by default.** Pass `--reset-on-exit` to send it.
-- On the GuitarBot side, `arm_list_recieverNN.py` serialises all
+- On the GuitarBot side, `OSC_Message_Receiver.py` serialises all
   `RobotController.main()` calls through a `threading.Lock`, so a `/Reset`
   arriving during an active trajectory will block until the trajectory
   completes rather than corrupting the UDP stream.

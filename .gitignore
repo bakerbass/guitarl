@@ -4,3 +4,4 @@ runs/*
 *.wav
 *.zip
 *.pyc
+.claude/*

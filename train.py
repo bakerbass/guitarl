@@ -790,7 +790,7 @@ def train(args):
         # mechanical malfunction (both threads call RobotController.main() at
         # the same time, corrupting the UDP stream).
         #
-        # The GuitarBot's arm_list_recieverNN.py now serialises all robot calls
+        # The GuitarBot's OSC_Message_Receiver.py now serialises all robot calls
         # through a robot_lock, so a /Reset sent after Ctrl+C will wait for the
         # current trajectory to finish before executing — but only send it if
         # you are confident the robot has finished its last action.
@@ -817,7 +817,7 @@ def train(args):
         else:
             logger.info(
                 "Robot holds its last position. "
-                "Send /Reset manually from arm_list_recieverNN.py when safe, "
+                "Send /Reset manually from OSC_Message_Receiver.py when safe, "
                 "or restart training with --reset-on-exit."
             )
         
